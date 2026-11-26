@@ -1,0 +1,13 @@
+// Shared build configuration. Override any of these in Config/Local.xcconfig (git-ignored);
+// ./build.sh creates that file for you on first run.
+
+// Your Apple Developer Team ID (a free Apple ID works). Required: widgets must be signed.
+DEVELOPMENT_TEAM =
+
+// Reverse-DNS prefix for the app and widget bundle identifiers.
+BUNDLE_ID_PREFIX = io.github.badwasabeee
+
+// App Group shared by the app and widget. On macOS this must start with your Team ID.
+APP_GROUP_ID = $(DEVELOPMENT_TEAM).$(BUNDLE_ID_PREFIX).flightdesk
+
+#include? "Local.xcconfig"

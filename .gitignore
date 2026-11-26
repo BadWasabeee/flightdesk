@@ -1,0 +1,11 @@
+# Build output
+build/
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+
+# Local signing configuration (Team ID etc.)
+Config/Local.xcconfig
+
+.DS_Store
