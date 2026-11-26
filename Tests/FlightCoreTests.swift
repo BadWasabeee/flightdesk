@@ -79,6 +79,9 @@ final class FlightCoreTests: XCTestCase {
         XCTAssertEqual(o.distance(10), "18.5KM")
         XCTAssertEqual(o.speed(100), "185KMH")
         XCTAssertEqual(o.altitude(10_000), "3,048M")
+        o.style = .glass
+        XCTAssertEqual(o.altitude(10_000), "3,048 m")
+        XCTAssertEqual(o.speed(100), "185 km/h")
     }
 
     func testSettingsDecodeToleratesMissingAndUnknownKeys() throws {

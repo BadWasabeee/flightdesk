@@ -86,14 +86,20 @@ struct DisplayOptions: Codable, Equatable {
 
     private var metric: Bool { units == .metric }
     var isGlass: Bool { style == .glass }
+    /// LED board: compact "12,450FT". Liquid Glass: system style "12,450 ft".
+    private func unit(_ value: String, _ led: String, _ glass: String) -> String {
+        isGlass ? "\(value) \(glass)" : value + led
+    }
     func altitude(_ ft: Int) -> String {
-        metric ? "\(Int(Double(ft) * 0.3048).formatted())M" : "\(ft.formatted())FT"
+        metric ? unit(Int(Double(ft) * 0.3048).formatted(), "M", "m") : unit(ft.formatted(), "FT", "ft")
     }
-    func speed(_ kt: Double) -> String { metric ? "\(Int(kt * 1.852))KMH" : "\(Int(kt))KT" }
+    func speed(_ kt: Double) -> String { metric ? unit("\(Int(kt * 1.852))", "KMH", "km/h") : unit("\(Int(kt))", "KT", "kt") }
     func distance(_ nm: Double) -> String {
-        metric ? String(format: "%.1fKM", nm * 1.852) : String(format: "%.1fNM", nm)
+        metric ? unit(String(format: "%.1f", nm * 1.852), "KM", "km") : unit(String(format: "%.1f", nm), "NM", "nm")
     }
-    func radius(_ nm: Int) -> String { metric ? "\(Int((Double(nm) * 1.852).rounded()))KM" : "\(nm)NM" }
+    func radius(_ nm: Int) -> String {
+        metric ? unit("\(Int((Double(nm) * 1.852).rounded()))", "KM", "km") : unit("\(nm)", "NM", "nm")
+    }
 }
 
 extension DisplayOptions {

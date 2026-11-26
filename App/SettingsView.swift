@@ -109,6 +109,15 @@ struct DisplaySettings: View {
                     .environment(\.displayOptions, store.settings.display)
                     .frame(width: 460)
                     .modifier(PanelChrome(options: store.settings.display))
+                    .padding(store.settings.display.isGlass ? 16 : 0)
+                    .background {
+                        // Glass is see-through: preview it over a desktop-like backdrop.
+                        if store.settings.display.isGlass {
+                            LinearGradient(colors: [Color(red: 0.16, green: 0.32, blue: 0.55), Color(red: 0.45, green: 0.30, blue: 0.55)],
+                                           startPoint: .topLeading, endPoint: .bottomTrailing)
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                    }
                     .frame(maxWidth: .infinity)
                     .animation(.easeInOut(duration: 0.25), value: store.settings.display)
             }
@@ -118,7 +127,7 @@ struct DisplaySettings: View {
                     ForEach(BoardStyle.allCases, id: \.self) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented)
-                LabeledContent(store.settings.display.isGlass ? "Accent color" : "LED color") {
+                LabeledContent("LED color") {
                     HStack(spacing: 10) {
                         ForEach(LEDTheme.allCases, id: \.self) { t in
                             Button { store.settings.display.theme = t } label: {
@@ -131,6 +140,7 @@ struct DisplaySettings: View {
                         }
                     }
                 }
+                .disabled(store.settings.display.isGlass)
                 Toggle("LED glow", isOn: $store.settings.display.glow)
                     .disabled(store.settings.display.isGlass)
                 Toggle("Dot-matrix texture", isOn: $store.settings.display.dotMatrix)

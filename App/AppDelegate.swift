@@ -170,10 +170,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             ]
             for (name, layout, size) in sizes {
                 self.render(PanelContent(model: m, layout: layout, accessory: AnyView(Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 9, weight: .bold)).foregroundStyle(o.theme.color.opacity(0.55))))
+                        .font(.system(size: 9, weight: .bold)).foregroundStyle(o.isGlass ? Color.white.opacity(0.62) : o.theme.color.opacity(0.55))))
                     .frame(width: size.width, height: size.height)
                     .environment(\.displayOptions, o)
-                    .background(o.isGlass ? AnyView(WidgetGlassBackground().background(Color(white: 0.35))) : AnyView(PanelBackground()))
+                    .background(o.isGlass ? AnyView(LinearGradient(colors: [Color(red: 0.16, green: 0.32, blue: 0.55), Color(red: 0.55, green: 0.38, blue: 0.5)], startPoint: .topLeading, endPoint: .bottomTrailing)) : AnyView(PanelBackground()))
                     .environment(\.displayOptions, o)
                     .environment(\.colorScheme, o.isGlass ? .dark : .light)
                     .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous)), to: "\(dir)/\(name).png")

@@ -167,7 +167,7 @@ struct FlightWidgetView: View {
             .environment(\.colorScheme, o.isGlass ? .dark : colorScheme)
             .containerBackground(for: .widget) {
                 if o.isGlass {
-                    WidgetGlassBackground().environment(\.displayOptions, o)
+                    WidgetGlassBackground()
                 } else {
                     PanelBackground().environment(\.displayOptions, o)
                 }
@@ -178,7 +178,7 @@ struct FlightWidgetView: View {
         Button(intent: RefreshFlightsIntent()) {
             Image(systemName: "arrow.clockwise")
                 .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(o.isGlass ? Color.secondary : o.theme.color.opacity(0.55))
+                .foregroundStyle(o.isGlass ? Color.white.opacity(0.62) : o.theme.color.opacity(0.55))
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Refresh flights")

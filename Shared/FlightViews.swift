@@ -29,7 +29,7 @@ enum PanelLayout { case small, medium, large, extraLarge, panel }
 
 extension DisplayOptions {
     /// Hairline separators.
-    var ruleColor: Color { isGlass ? Color.secondary.opacity(0.35) : theme.color.opacity(0.18) }
+    var ruleColor: Color { isGlass ? Color.white.opacity(0.22) : theme.color.opacity(0.18) }
     var glowEnabled: Bool { glow && !isGlass }
 }
 
@@ -41,7 +41,7 @@ struct LEDText: View {
     var dim = false
     var weight: Font.Weight = .bold
     var lines = 1
-    /// Accent text (route codes) keeps the theme color in the Liquid Glass style.
+    /// Accent text (route codes) is drawn at full strength.
     var accent = false
     @Environment(\.displayOptions) private var o
 
@@ -50,17 +50,24 @@ struct LEDText: View {
     }
 
     private var color: Color {
-        if o.isGlass { return accent ? o.theme.color : (dim ? Color.secondary : Color.primary) }
+        // Liquid Glass: white text straight on the desktop, like the system widgets.
+        if o.isGlass { return dim ? Color.white.opacity(0.62) : Color.white }
         return dim ? o.theme.color.opacity(0.5) : o.theme.color
+    }
+
+    /// System widgets use lighter weights than the LED board.
+    private var glassWeight: Font.Weight {
+        switch weight { case .heavy, .black, .bold: .semibold; case .semibold: .medium; default: weight }
     }
 
     var body: some View {
         let c = color
-        Text(text)
-            .font(.system(size: size, weight: weight, design: o.isGlass ? .rounded : .monospaced))
+        Text(o.isGlass ? text : text.uppercased())
+            .font(.system(size: size, weight: o.isGlass ? glassWeight : weight, design: o.isGlass ? .default : .monospaced))
             .monospacedDigit()
             .foregroundStyle(c)
-            .shadow(color: o.glowEnabled ? c.opacity(0.65) : .clear, radius: size / 6)
+            .shadow(color: o.glowEnabled ? c.opacity(0.65) : (o.isGlass ? .black.opacity(0.18) : .clear),
+                    radius: o.isGlass ? 1.5 : size / 6, y: o.isGlass ? 0.5 : 0)
             .lineLimit(lines)
             .minimumScaleFactor(0.55)
             .widgetAccentable(!dim)
@@ -95,15 +102,9 @@ struct PanelBackground: View {
 
 /// Widget background for the Liquid Glass style: a translucent tinted platter that lets the
 /// desktop show through. (In the system's Clear/Tinted widget styles macOS supplies its own glass.)
+/// Liquid Glass widget background: clear, so the desktop shows through like the system widgets.
 struct WidgetGlassBackground: View {
-    @Environment(\.displayOptions) private var o
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.22)
-            LinearGradient(colors: [.white.opacity(0.16), .white.opacity(0.03)], startPoint: .top, endPoint: .bottom)
-            LinearGradient(colors: [o.theme.color.opacity(0.10), .clear], startPoint: .topLeading, endPoint: .bottomTrailing)
-        }
-    }
+    var body: some View { Color.clear }
 }
 
 /// Window chrome for the floating panel and the settings preview.
@@ -127,7 +128,7 @@ struct PanelChrome: ViewModifier {
     private func glass(_ content: Content, _ shape: RoundedRectangle) -> some View {
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
-            content.glassEffect(.regular.tint(options.theme.color.opacity(0.06)), in: shape)
+            content.glassEffect(.clear, in: shape)
         } else {
             content.background(.ultraThinMaterial, in: shape)
         }
@@ -140,13 +141,14 @@ struct PanelChrome: ViewModifier {
 struct RouteLine: View {
     var iconSize: CGFloat = 16
     @Environment(\.displayOptions) private var o
-    private var line: Color { o.isGlass ? Color.secondary.opacity(0.5) : o.theme.color.opacity(0.45) }
+    private var line: Color { o.isGlass ? Color.white.opacity(0.35) : o.theme.color.opacity(0.45) }
+    private var icon: Color { o.isGlass ? .white : o.theme.color }
     var body: some View {
         HStack(spacing: 4) {
             Rectangle().fill(line).frame(height: max(1, iconSize / 8))
             Image(systemName: "airplane")
                 .font(.system(size: iconSize, weight: .bold))
-                .foregroundStyle(o.theme.color)
+                .foregroundStyle(icon)
                 .shadow(color: o.glowEnabled ? o.theme.color.opacity(0.6) : .clear, radius: 3)
                 .widgetAccentable()
             Rectangle().fill(line).frame(height: max(1, iconSize / 8))
@@ -186,7 +188,7 @@ struct FeaturedView: View {
     private var small: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 4) {
-                LEDText(f.airlineName.isEmpty ? f.typeCode : f.airlineName.uppercased(), 9, dim: true)
+                LEDText(f.airlineName.isEmpty ? f.typeCode : f.airlineName, 9, dim: true)
                 Spacer(minLength: 2)
                 LEDText(f.displayNumber, 10)
             }
@@ -198,9 +200,9 @@ struct FeaturedView: View {
                 }
                 if o.showCities {
                     HStack(spacing: 4) {
-                        LEDText(r.from.city.uppercased(), 8, dim: true, weight: .semibold)
+                        LEDText(r.from.city, 8, dim: true, weight: .semibold)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                        LEDText(r.to.city.uppercased(), 8, dim: true, weight: .semibold)
+                        LEDText(r.to.city, 8, dim: true, weight: .semibold)
                             .frame(maxWidth: .infinity, alignment: .trailing)
                     }
                 }
@@ -209,7 +211,7 @@ struct FeaturedView: View {
                 LEDText(subtitle, 8, dim: true, weight: .semibold)
             }
             Spacer(minLength: 0)
-            LEDText((f.aircraft?.model ?? f.typeCode).uppercased(), 9)
+            LEDText((f.aircraft?.model ?? f.typeCode), 9)
             HStack {
                 LEDText(f.climbSymbol + o.altitude(f.altitude), 10)
                 Spacer(minLength: 2)
@@ -221,7 +223,7 @@ struct FeaturedView: View {
     private var regular: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                LEDText(f.airlineName.isEmpty ? "—" : f.airlineName.uppercased(), 13, dim: true)
+                LEDText(f.airlineName.isEmpty ? "—" : f.airlineName, 13, dim: true)
                 Spacer()
                 LEDText(f.displayNumber, 13)
             }
@@ -233,9 +235,9 @@ struct FeaturedView: View {
                 }
                 if o.showCities {
                     HStack {
-                        LEDText(r.from.city.uppercased(), 11, dim: true, weight: .semibold)
+                        LEDText(r.from.city, 11, dim: true, weight: .semibold)
                         Spacer()
-                        LEDText(r.to.city.uppercased(), 11, dim: true, weight: .semibold)
+                        LEDText(r.to.city, 11, dim: true, weight: .semibold)
                     }
                 }
             } else {
@@ -243,7 +245,7 @@ struct FeaturedView: View {
                 if o.showCities { LEDText(subtitle, 11, dim: true, weight: .semibold) }
             }
             HStack(spacing: 12) {
-                LEDText((f.aircraft?.model ?? f.typeCode).uppercased(), 12)
+                LEDText((f.aircraft?.model ?? f.typeCode), 12)
                 Spacer(minLength: 4)
                 LEDText(f.climbSymbol + o.altitude(f.altitude), 12).fixedSize()
                 LEDText(o.speed(f.speed), 12).fixedSize()
@@ -266,7 +268,7 @@ struct RowView: View {
             LEDText(f.displayNumber, 11).frame(width: 62, alignment: .leading)
             LEDText(f.route.map { "\($0.from.code)›\($0.to.code)" } ?? "—", 11, dim: true)
                 .frame(width: 66, alignment: .leading)
-            LEDText(wide ? (f.aircraft?.model ?? f.typeCode).uppercased() : f.typeCode, 11, dim: true)
+            LEDText(wide ? (f.aircraft?.model ?? f.typeCode) : f.typeCode, 11, dim: true)
                 .frame(maxWidth: wide ? .infinity : 40, alignment: .leading)
                 .layoutPriority(wide ? 1 : 0)
             if !wide { Spacer(minLength: 0) }
@@ -316,13 +318,13 @@ struct PanelContent: View {
     private var header: some View {
         HStack(spacing: 6) {
             if o.showHeader {
-                LEDText("✈ " + (model.placeName.isEmpty ? "OVERHEAD" : model.placeName.uppercased()), 10, dim: true)
+                LEDText("✈ " + (model.placeName.isEmpty ? "Overhead" : model.placeName), 10, dim: true)
                 Spacer(minLength: 4)
                 if layout != .small {
-                    LEDText("\(model.flights.count) IN \(o.radius(model.radiusNM))", 10, dim: true).fixedSize()
+                    LEDText("\(model.flights.count) in \(o.radius(model.radiusNM))", 10, dim: true).fixedSize()
                 }
                 if let u = model.updated, layout != .panel {
-                    LEDText(u.formatted(date: .omitted, time: .shortened).uppercased(), 10, dim: true).fixedSize()
+                    LEDText(u.formatted(date: .omitted, time: .shortened), 10, dim: true).fixedSize()
                 }
             } else {
                 Spacer()
@@ -336,7 +338,7 @@ struct PanelContent: View {
             FeaturedView(f: f, layout: layout).id(f.id).transition(.opacity)
                 .frame(height: layout == .panel ? 118 : nil, alignment: .top)
         } else {
-            LEDText((model.status.isEmpty ? "Loading…" : model.status).uppercased(),
+            LEDText((model.status.isEmpty ? "Loading…" : model.status),
                     layout == .small ? 10 : 12, lines: 3)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity, minHeight: layout == .small ? 90 : 110)
