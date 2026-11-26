@@ -46,6 +46,10 @@ mkdir -p ~/Applications
 pkill -x FlightDesk 2>/dev/null || true
 rm -rf ~/Applications/FlightDesk.app
 cp -R "$APP" ~/Applications/
-/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f ~/Applications/FlightDesk.app
+LSR=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+# Forget the copies in build/ so Finder, Spotlight and the widget gallery use the installed app (and its icon).
+for c in Debug Release; do [[ -d "build/Build/Products/$c/FlightDesk.app" ]] && "$LSR" -u "build/Build/Products/$c/FlightDesk.app" || true; done
+touch ~/Applications/FlightDesk.app
+"$LSR" -f ~/Applications/FlightDesk.app
 print "Installed ~/Applications/FlightDesk.app"
 [[ "${1:-}" == "--no-open" ]] || open ~/Applications/FlightDesk.app
