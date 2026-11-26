@@ -5,7 +5,14 @@ enum SettingsTab: Hashable { case general, display, widget }
 
 struct SettingsView: View {
     @ObservedObject var store: LiveStore
-    @Binding var tab: SettingsTab
+    @State private var tab: SettingsTab
+    private let onTabChange: (SettingsTab) -> Void
+
+    init(store: LiveStore, tab: SettingsTab, onTabChange: @escaping (SettingsTab) -> Void = { _ in }) {
+        self.store = store
+        _tab = State(initialValue: tab)
+        self.onTabChange = onTabChange
+    }
 
     var body: some View {
         TabView(selection: $tab) {
@@ -17,6 +24,7 @@ struct SettingsView: View {
                 .tabItem { Label("Widget", systemImage: "square.grid.2x2") }.tag(SettingsTab.widget)
         }
         .frame(width: 560, height: 640)
+        .onChange(of: tab) { _, t in onTabChange(t) }
     }
 }
 

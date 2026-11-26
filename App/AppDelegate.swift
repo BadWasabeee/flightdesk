@@ -134,20 +134,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func openSettings(tab: SettingsTab) {
         settingsTab = tab
-        if settingsWindow == nil {
-            let binding = Binding<SettingsTab>(get: { [weak self] in self?.settingsTab ?? .general },
-                                               set: { [weak self] in self?.settingsTab = $0 })
-            let w = NSWindow(contentViewController: NSHostingController(rootView: SettingsView(store: store, tab: binding)))
+        let root = SettingsView(store: store, tab: tab) { [weak self] in self?.settingsTab = $0 }
+        if let w = settingsWindow {
+            // Rebuild so the requested tab is selected.
+            w.contentViewController = NSHostingController(rootView: root)
+        } else {
+            let w = NSWindow(contentViewController: NSHostingController(rootView: root))
             w.title = "FlightDesk Settings"
             w.styleMask = [.titled, .closable]
             w.isReleasedWhenClosed = false
             w.delegate = self
             w.center()
             settingsWindow = w
-        } else {
-            // Rebuild so the selected tab updates.
-            settingsWindow?.contentViewController = NSHostingController(rootView: SettingsView(store: store, tab: Binding(
-                get: { [weak self] in self?.settingsTab ?? .general }, set: { [weak self] in self?.settingsTab = $0 })))
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
