@@ -1,6 +1,6 @@
 {
   "fill" : {
-    "automatic-gradient" : "srgb:0.12000,0.10000,0.08000,1.00000"
+    "automatic-gradient" : "srgb:0.03000,0.11000,0.22000,1.00000"
   },
   "groups" : [
     {
@@ -12,25 +12,38 @@
         }
       ],
       "shadow" : {
-        "kind" : "layer-color",
-        "opacity" : 0.6
+        "kind" : "neutral",
+        "opacity" : 0.55
       },
       "translucency" : {
         "enabled" : true,
-        "value" : 0.3
+        "value" : 0.15
       }
     },
     {
       "layers" : [
         {
-          "image-name" : "trail.svg",
-          "name" : "trail",
+          "image-name" : "sweep.svg",
+          "name" : "sweep",
           "glass" : true
         }
       ],
       "shadow" : {
-        "kind" : "neutral",
-        "opacity" : 0.4
+        "kind" : "layer-color",
+        "opacity" : 0.35
+      }
+    },
+    {
+      "layers" : [
+        {
+          "image-name" : "rings.svg",
+          "name" : "rings",
+          "glass" : false
+        }
+      ],
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0
       }
     }
   ],
