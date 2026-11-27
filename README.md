@@ -6,13 +6,13 @@
 
 <p align="center">
   A native macOS desktop widget that shows the aircraft flying over you right now.<br>
-  Choose a glowing LED flight board or Liquid Glass.
+  Choose a glowing LED flight board or a clean Standard look that follows Light and Dark Mode.
 </p>
 
 <p align="center">
   <img src="docs/led/medium.png" width="420" alt="LED board style">
   &nbsp;
-  <img src="docs/glass/medium.png" width="420" alt="Liquid Glass style">
+  <img src="docs/standard/medium-dark.png" width="420" alt="Standard style, Dark Mode">
 </p>
 
 ## Features
@@ -20,7 +20,9 @@
 - **Native desktop widget (WidgetKit).** Comes in Small, Medium, Large and Extra Large. It lives in *Edit Widgets* next to Apple's own widgets.
 - **Live data.** Aircraft positions come from real-time ADS-B/MLAT. Between fetches, the widget moves each aircraft along its live heading, speed and climb rate every 15 s.
 - **Verified routes.** Origin and destination come from a public database. Each route is checked against the aircraft's live position and heading, and routes that don't fit are hidden. This catches stale or reused callsigns.
-- **Two looks.** Choose an LED board (amber, green, red, blue, cyan or white, with optional glow and dot-matrix texture) or **Liquid Glass**. For a fully transparent glass widget, set **System Settings › Appearance › Icon & widget style** to *Clear* (or *Tinted*). FlightDesk renders white text on the system's Liquid Glass. The optional floating desktop panel always uses real Liquid Glass.
+- **Live progress.** The plane slides along the route line to show how far into the flight it is.
+- **Airline logos.** Downloaded once and cached (can be turned off in Settings).
+- **Two looks.** Choose an LED board (amber, green, red, blue, cyan or white, with optional glow and dot-matrix texture) or **Standard**, which uses system colours and follows Light and Dark Mode. Both work with the macOS *Clear* and *Tinted* widget styles.
 - **Configurable.** Set the location, radius (5–100 nm), units (ft/kt/nm or metric) and which details appear. Each widget can also override the location, radius, style, colour and units.
 - **Menu-bar app.** Includes a Settings window with a live preview and an optional floating panel that updates every 15 s.
 - **Private by design.** No accounts, no API keys and no analytics. See [Privacy](#privacy).
@@ -28,14 +30,14 @@
 <p align="center">
   <img src="docs/led/large.png" width="300" alt="Large widget, LED">
   &nbsp;
-  <img src="docs/glass/large.png" width="300" alt="Large widget, Liquid Glass">
+  <img src="docs/standard/large-light.png" width="300" alt="Large widget, Standard, Light Mode">
   &nbsp;
   <img src="docs/led/small.png" width="150" alt="Small widget">
 </p>
 
 ## Requirements
 
-- macOS 14 Sonoma or later (Liquid Glass needs macOS 26 or later)
+- macOS 14 Sonoma or later
 - Xcode 26 or later, plus [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
 - An Apple ID signed in to Xcode. A free account works, because widgets must be code-signed.
 
@@ -69,7 +71,7 @@ To work in Xcode, run `xcodegen generate` and open `FlightDesk.xcodeproj`.
 | Tab | Options |
 | --- | --- |
 | General | Location (this Mac's location, a city/airport, or `lat, lon`), radius, private/GA traffic, launch at login |
-| Display | Style (LED Board or Liquid Glass), colour, glow, dot-matrix texture, units, city names, flight list, header, rotation, floating panel |
+| Display | Style (LED Board or Standard), colour, glow, dot-matrix texture, units, city names, flight list, header, rotation, floating panel |
 | Widget | How often to fetch new data (15 s – 5 min), refresh now |
 
 **Per-widget overrides:** right-click a widget › *Edit "Flights Overhead"* to set its location, style, radius, colour and units. Everything else follows Settings.
@@ -100,6 +102,8 @@ Both are free community services. Please be kind to them, and consider supportin
 
 ## Privacy
 
+- Airline logos are fetched by airline code from Kiwi.com's public logo CDN (no location is sent). Turn off **Show airline logos** to disable this.
+
 - Your location stays on your Mac. Requests to adsb.lol include only a **rounded** position (about 1 km).
 - adsbdb receives only flight callsigns and aircraft hex codes.
 - There are no accounts, analytics or tracking. Settings live in the App Group container on your Mac.
@@ -110,7 +114,7 @@ Issues and pull requests are welcome. Please run `./build.sh --test` before open
 To render every widget size to PNG (handy for UI changes), run:
 
 ```sh
-FLIGHTDESK_SNAPSHOT_DIR=/tmp/shots FLIGHTDESK_SNAPSHOT_SAMPLE=1 FLIGHTDESK_SNAPSHOT_STYLE=glass \
+FLIGHTDESK_SNAPSHOT_DIR=/tmp/shots FLIGHTDESK_SNAPSHOT_SAMPLE=1 FLIGHTDESK_SNAPSHOT_STYLE=standard FLIGHTDESK_SNAPSHOT_SCHEME=dark \
   ~/Applications/FlightDesk.app/Contents/MacOS/FlightDesk
 ```
 

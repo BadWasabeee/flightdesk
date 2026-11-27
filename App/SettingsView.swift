@@ -109,15 +109,6 @@ struct DisplaySettings: View {
                     .environment(\.displayOptions, store.settings.display)
                     .frame(width: 460)
                     .modifier(PanelChrome(options: store.settings.display))
-                    .padding(store.settings.display.isGlass ? 16 : 0)
-                    .background {
-                        // Glass is see-through: preview it over a desktop-like backdrop.
-                        if store.settings.display.isGlass {
-                            LinearGradient(colors: [Color(red: 0.16, green: 0.32, blue: 0.55), Color(red: 0.45, green: 0.30, blue: 0.55)],
-                                           startPoint: .topLeading, endPoint: .bottomTrailing)
-                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                        }
-                    }
                     .frame(maxWidth: .infinity)
                     .animation(.easeInOut(duration: 0.25), value: store.settings.display)
             }
@@ -140,11 +131,11 @@ struct DisplaySettings: View {
                         }
                     }
                 }
-                .disabled(store.settings.display.isGlass)
+                .disabled(store.settings.display.isStandard)
                 Toggle("LED glow", isOn: $store.settings.display.glow)
-                    .disabled(store.settings.display.isGlass)
+                    .disabled(store.settings.display.isStandard)
                 Toggle("Dot-matrix texture", isOn: $store.settings.display.dotMatrix)
-                    .disabled(store.settings.display.isGlass)
+                    .disabled(store.settings.display.isStandard)
             }
 
             Section {
@@ -154,6 +145,7 @@ struct DisplaySettings: View {
                 }
                 .pickerStyle(.segmented)
                 Toggle("Show city names", isOn: $store.settings.display.showCities)
+                Toggle("Show airline logos", isOn: $store.settings.display.showLogos)
                 Toggle("Show flight list", isOn: $store.settings.display.showList)
                 Toggle("Show header", isOn: $store.settings.display.showHeader)
                 Toggle("Rotate featured flight", isOn: $store.settings.rotate)

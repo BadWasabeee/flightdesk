@@ -157,6 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     /// FLIGHTDESK_SNAPSHOT_DIR=/path renders every widget size + the panel to PNGs, then quits.
     private func runSnapshotIfRequested() {
         guard let dir = ProcessInfo.processInfo.environment["FLIGHTDESK_SNAPSHOT_DIR"] else { return }
+        Task { await AirlineLogos.prefetch(Set(PanelModel.sample.flights.compactMap(\.airlineCode))) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
             let env = ProcessInfo.processInfo.environment
             let m = (self.store.model.flights.isEmpty || env["FLIGHTDESK_SNAPSHOT_SAMPLE"] != nil) ? PanelModel.sample : self.store.model
@@ -170,12 +171,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             ]
             for (name, layout, size) in sizes {
                 self.render(PanelContent(model: m, layout: layout, accessory: AnyView(Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 9, weight: .bold)).foregroundStyle(o.isGlass ? Color.white.opacity(0.62) : o.theme.color.opacity(0.55))))
+                        .font(.system(size: 9, weight: .bold)).foregroundStyle(o.isStandard ? Color.secondary : o.theme.color.opacity(0.55))))
                     .frame(width: size.width, height: size.height)
                     .environment(\.displayOptions, o)
-                    .background(o.isGlass ? AnyView(Color(white: 0.12)) : AnyView(PanelBackground()))
+                    .background(o.isStandard ? AnyView(Color(nsColor: .windowBackgroundColor)) : AnyView(PanelBackground()))
                     .environment(\.displayOptions, o)
-                    .environment(\.colorScheme, o.isGlass ? .dark : .light)
+                    .environment(\.colorScheme, env["FLIGHTDESK_SNAPSHOT_SCHEME"] == "dark" ? .dark : .light)
                     .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous)), to: "\(dir)/\(name).png")
             }
             NSApp.terminate(nil)

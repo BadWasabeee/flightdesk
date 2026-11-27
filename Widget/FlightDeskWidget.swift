@@ -25,10 +25,10 @@ enum WidgetTheme: String, AppEnum {
 }
 
 enum WidgetStyle: String, AppEnum {
-    case app, led, glass
+    case app, led, standard
     static var typeDisplayRepresentation: TypeDisplayRepresentation = "Style"
     static var caseDisplayRepresentations: [WidgetStyle: DisplayRepresentation] = [
-        .app: "Same as FlightDesk Settings", .led: "LED Board", .glass: "Liquid Glass",
+        .app: "Same as FlightDesk Settings", .led: "LED Board", .standard: "Standard",
     ]
     func resolve(_ s: AppSettings) -> BoardStyle { BoardStyle(rawValue: rawValue) ?? s.display.style }
 }
@@ -146,7 +146,6 @@ struct FlightWidgetView: View {
     let entry: FlightEntry
     @Environment(\.widgetFamily) private var family
     @Environment(\.widgetRenderingMode) private var renderingMode
-    @Environment(\.colorScheme) private var colorScheme
 
     private var layout: PanelLayout {
         switch family {
@@ -160,16 +159,14 @@ struct FlightWidgetView: View {
     var body: some View {
         var o = entry.options
         // Clear / Tinted / Monochrome desktop widget styles: macOS renders the widget on its own
-        // (Liquid) glass and tints accentable content, so drop our glow and texture.
+        // backing and tints accentable content, so drop our glow and texture.
         if renderingMode != .fullColor { o.glow = false; o.dotMatrix = false }
         return PanelContent(model: entry.model, layout: layout, accessory: AnyView(refreshButton(o)))
             .environment(\.displayOptions, o)
-            .environment(\.colorScheme, o.isGlass ? .dark : colorScheme)
             .containerBackground(for: .widget) {
-                // Liquid Glass: no background of our own. macOS draws its standard widget backing,
-                // or real Liquid Glass when the system widget style is set to Clear or Tinted.
-                if o.isGlass {
-                    Color.clear
+                // Standard: the system background, light or dark to match the Mac's appearance.
+                if o.isStandard {
+                    Color(nsColor: .windowBackgroundColor)
                 } else {
                     PanelBackground().environment(\.displayOptions, o)
                 }
@@ -180,7 +177,7 @@ struct FlightWidgetView: View {
         Button(intent: RefreshFlightsIntent()) {
             Image(systemName: "arrow.clockwise")
                 .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(o.isGlass ? Color.white.opacity(0.62) : o.theme.color.opacity(0.55))
+                .foregroundStyle(o.isStandard ? Color.secondary : o.theme.color.opacity(0.55))
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Refresh flights")
@@ -193,7 +190,7 @@ struct FlightDeskWidget: Widget {
             FlightWidgetView(entry: $0)
         }
         .configurationDisplayName("Flights Overhead")
-        .description("Live aircraft near you, as an LED flight board or Liquid Glass.")
+        .description("Live aircraft near you, as an LED flight board or a clean system look.")
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge, .systemExtraLarge])
         .contentMarginsDisabled()
     }

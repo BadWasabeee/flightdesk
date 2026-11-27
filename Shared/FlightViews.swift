@@ -1,7 +1,8 @@
 // Flight-board views shared by the desktop widget and the app's live panel / preview.
-// Two looks: a glowing LED board, and Liquid Glass (system glass on macOS 26+).
+// Two looks: a glowing LED board, and a Standard system look that follows Light/Dark Mode.
 
 import SwiftUI
+import AppKit
 import WidgetKit
 
 extension LEDTheme {
@@ -29,8 +30,8 @@ enum PanelLayout { case small, medium, large, extraLarge, panel }
 
 extension DisplayOptions {
     /// Hairline separators.
-    var ruleColor: Color { isGlass ? Color.white.opacity(0.22) : theme.color.opacity(0.18) }
-    var glowEnabled: Bool { glow && !isGlass }
+    var ruleColor: Color { isStandard ? Color.primary.opacity(0.15) : theme.color.opacity(0.18) }
+    var glowEnabled: Bool { glow && !isStandard }
 }
 
 // MARK: - Primitives
@@ -50,24 +51,23 @@ struct LEDText: View {
     }
 
     private var color: Color {
-        // Liquid Glass: white text straight on the desktop, like the system widgets.
-        if o.isGlass { return dim ? Color.white.opacity(0.62) : Color.white }
+        // Standard: system label colors, so it follows Light and Dark Mode.
+        if o.isStandard { return dim ? Color.secondary : Color.primary }
         return dim ? o.theme.color.opacity(0.5) : o.theme.color
     }
 
     /// System widgets use lighter weights than the LED board.
-    private var glassWeight: Font.Weight {
+    private var standardWeight: Font.Weight {
         switch weight { case .heavy, .black, .bold: .semibold; case .semibold: .medium; default: weight }
     }
 
     var body: some View {
         let c = color
-        Text(o.isGlass ? text : text.uppercased())
-            .font(.system(size: size, weight: o.isGlass ? glassWeight : weight, design: o.isGlass ? .default : .monospaced))
+        Text(o.isStandard ? text : text.uppercased())
+            .font(.system(size: size, weight: o.isStandard ? standardWeight : weight, design: o.isStandard ? .default : .monospaced))
             .monospacedDigit()
             .foregroundStyle(c)
-            .shadow(color: o.glowEnabled ? c.opacity(0.65) : (o.isGlass ? .black.opacity(0.18) : .clear),
-                    radius: o.isGlass ? 1.5 : size / 6, y: o.isGlass ? 0.5 : 0)
+            .shadow(color: o.glowEnabled ? c.opacity(0.65) : .clear, radius: size / 6)
             .lineLimit(lines)
             .minimumScaleFactor(0.55)
             .widgetAccentable(!dim)
@@ -107,8 +107,10 @@ struct PanelChrome: ViewModifier {
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-        if options.isGlass {
-            glass(content, shape)
+        if options.isStandard {
+            content
+                .background(Color(nsColor: .windowBackgroundColor), in: shape)
+                .overlay(shape.stroke(Color.primary.opacity(0.1), lineWidth: 1))
         } else {
             content
                 .background(PanelBackground().environment(\.displayOptions, options))
@@ -116,35 +118,75 @@ struct PanelChrome: ViewModifier {
                 .overlay(shape.stroke(Color.white.opacity(0.08), lineWidth: 1))
         }
     }
+}
 
-    @ViewBuilder
-    private func glass(_ content: Content, _ shape: RoundedRectangle) -> some View {
-        #if compiler(>=6.2)
-        if #available(macOS 26.0, *) {
-            content.glassEffect(.clear, in: shape)
+/// Origin → destination line. With `progress` the plane sits at the aircraft's live position:
+/// the flown part is solid, the part still to fly is faint.
+struct RouteLine: View {
+    var iconSize: CGFloat = 16
+    var progress: Double? = nil
+    @Environment(\.displayOptions) private var o
+    private var line: Color { o.isStandard ? Color.secondary.opacity(0.5) : o.theme.color.opacity(0.45) }
+    private var flown: Color { o.isStandard ? Color.primary.opacity(0.75) : o.theme.color.opacity(0.85) }
+    private var ahead: Color { o.isStandard ? Color.secondary.opacity(0.3) : o.theme.color.opacity(0.22) }
+    private var icon: Color { o.isStandard ? .primary : o.theme.color }
+
+    var body: some View {
+        if let p = progress {
+            GeometryReader { geo in
+                let h = max(1, iconSize / 8), w = geo.size.width
+                let x = iconSize / 2 + (w - iconSize) * p
+                ZStack(alignment: .leading) {
+                    Capsule().fill(ahead).frame(height: h)
+                    Capsule().fill(flown).frame(width: max(0, x), height: h)
+                    plane.position(x: x, y: geo.size.height / 2)
+                }
+                .frame(height: geo.size.height)
+            }
+            .frame(height: iconSize * 1.3)
+            .accessibilityLabel("\(Int((p * 100).rounded())) percent of the way")
         } else {
-            content.background(.ultraThinMaterial, in: shape)
+            HStack(spacing: 4) {
+                Rectangle().fill(line).frame(height: max(1, iconSize / 8))
+                plane
+                Rectangle().fill(line).frame(height: max(1, iconSize / 8))
+            }
         }
-        #else
-        content.background(.ultraThinMaterial, in: shape)
-        #endif
+    }
+
+    private var plane: some View {
+        Image(systemName: "airplane")
+            .font(.system(size: iconSize, weight: .bold))
+            .foregroundStyle(icon)
+            .shadow(color: o.glowEnabled ? o.theme.color.opacity(0.6) : .clear, radius: 3)
+            .widgetAccentable()
     }
 }
 
-struct RouteLine: View {
-    var iconSize: CGFloat = 16
+/// Airline logo from the shared cache. Draws nothing until the logo has been downloaded.
+struct AirlineLogo: View {
+    let code: String?
+    var size: CGFloat
+    /// Keep the space even without a logo, so list columns stay aligned.
+    var reserve = false
     @Environment(\.displayOptions) private var o
-    private var line: Color { o.isGlass ? Color.white.opacity(0.35) : o.theme.color.opacity(0.45) }
-    private var icon: Color { o.isGlass ? .white : o.theme.color }
+
     var body: some View {
-        HStack(spacing: 4) {
-            Rectangle().fill(line).frame(height: max(1, iconSize / 8))
-            Image(systemName: "airplane")
-                .font(.system(size: iconSize, weight: .bold))
-                .foregroundStyle(icon)
-                .shadow(color: o.glowEnabled ? o.theme.color.opacity(0.6) : .clear, radius: 3)
-                .widgetAccentable()
-            Rectangle().fill(line).frame(height: max(1, iconSize / 8))
+        if o.showLogos, let u = AirlineLogos.file(for: code), let img = NSImage(contentsOf: u) {
+            logo(Image(nsImage: img).resizable().interpolation(.high))
+                .frame(width: size, height: size)
+                .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+        } else if reserve && o.showLogos {
+            Color.clear.frame(width: size, height: size)
+        }
+    }
+
+    @ViewBuilder
+    private func logo(_ i: Image) -> some View {
+        if #available(macOS 15.0, *) {
+            i.widgetAccentedRenderingMode(.fullColor)
+        } else {
+            i
         }
     }
 }
@@ -181,6 +223,7 @@ struct FeaturedView: View {
     private var small: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 4) {
+                AirlineLogo(code: f.airlineCode, size: 12)
                 LEDText(f.airlineName.isEmpty ? f.typeCode : f.airlineName, 9, dim: true)
                 Spacer(minLength: 2)
                 LEDText(f.displayNumber, 10)
@@ -188,7 +231,7 @@ struct FeaturedView: View {
             if let r = f.route {
                 HStack(spacing: 5) {
                     LEDText(r.from.code, codeSize, accent: true)
-                    RouteLine(iconSize: 11)
+                    RouteLine(iconSize: 11, progress: f.progress)
                     LEDText(r.to.code, codeSize, accent: true)
                 }
                 if o.showCities {
@@ -215,7 +258,8 @@ struct FeaturedView: View {
 
     private var regular: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack {
+            HStack(spacing: 6) {
+                AirlineLogo(code: f.airlineCode, size: layout == .medium ? 13 : 16)
                 LEDText(f.airlineName.isEmpty ? "—" : f.airlineName, 13, dim: true)
                 Spacer()
                 LEDText(f.displayNumber, 13)
@@ -223,7 +267,7 @@ struct FeaturedView: View {
             if let r = f.route {
                 HStack(spacing: 10) {
                     LEDText(r.from.code, codeSize, accent: true).fixedSize()
-                    RouteLine()
+                    RouteLine(progress: f.progress)
                     LEDText(r.to.code, codeSize, accent: true).fixedSize()
                 }
                 if o.showCities {
@@ -258,14 +302,18 @@ struct RowView: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            LEDText(f.displayNumber, 11).frame(width: 62, alignment: .leading)
+            HStack(spacing: 4) {
+                AirlineLogo(code: f.airlineCode, size: 12, reserve: true)
+                LEDText(f.displayNumber, 11)
+            }
+            .frame(width: o.showLogos ? 76 : 62, alignment: .leading)
             LEDText(f.route.map { "\($0.from.code)›\($0.to.code)" } ?? "—", 11, dim: true)
-                .frame(width: 66, alignment: .leading)
+                .frame(width: o.showLogos ? 60 : 66, alignment: .leading)
             LEDText(wide ? (f.aircraft?.model ?? f.typeCode) : f.typeCode, 11, dim: true)
                 .frame(maxWidth: wide ? .infinity : 40, alignment: .leading)
                 .layoutPriority(wide ? 1 : 0)
             if !wide { Spacer(minLength: 0) }
-            LEDText(o.altitude(f.altitude), 11, dim: true).frame(width: 70, alignment: .trailing)
+            LEDText(o.altitude(f.altitude), 11, dim: true).frame(width: o.showLogos ? 64 : 70, alignment: .trailing)
             LEDText(o.distance(f.distance), 11).frame(width: 56, alignment: .trailing)
         }
     }

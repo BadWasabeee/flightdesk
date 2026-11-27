@@ -36,6 +36,16 @@ final class FlightCoreTests: XCTestCase {
         XCTAssertFalse(FlightService.isPlausible(RouteInfo(from: rsw, to: msp), for: f))
     }
 
+    func testProgressAlongRoute() throws {
+        var f = flight(lat: 36.0, lon: -88.2, track: 330)
+        XCTAssertNil(f.progress)
+        f.route = RouteInfo(from: rsw, to: msp)
+        let p = try XCTUnwrap(f.progress)
+        XCTAssertGreaterThan(p, 0.4); XCTAssertLessThan(p, 0.75)   // Tennessee is past halfway RSW→MSP
+        f.lat = rsw.lat; f.lon = rsw.lon
+        XCTAssertEqual(try XCTUnwrap(f.progress), 0, accuracy: 0.01)
+    }
+
     func testAcceptsAnythingNearAirport() {
         let f = flight(lat: 44.80, lon: -93.10, track: 90, alt: 3000)  // manoeuvring near MSP
         XCTAssertTrue(FlightService.isPlausible(RouteInfo(from: rsw, to: msp), for: f))
@@ -79,7 +89,7 @@ final class FlightCoreTests: XCTestCase {
         XCTAssertEqual(o.distance(10), "18.5KM")
         XCTAssertEqual(o.speed(100), "185KMH")
         XCTAssertEqual(o.altitude(10_000), "3,048M")
-        o.style = .glass
+        o.style = .standard
         XCTAssertEqual(o.altitude(10_000), "3,048 m")
         XCTAssertEqual(o.speed(100), "185 km/h")
     }
@@ -91,5 +101,10 @@ final class FlightCoreTests: XCTestCase {
         XCTAssertEqual(s.display.theme, .green)
         XCTAssertEqual(s.display.style, .led)
         XCTAssertEqual(s.widgetRefreshSeconds, 30)
+    }
+
+    func testLegacyGlassStyleLoadsAsStandard() throws {
+        let s = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"display":{"style":"glass"}}"#.utf8))
+        XCTAssertEqual(s.display.style, .standard)
     }
 }

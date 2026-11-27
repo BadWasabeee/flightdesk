@@ -5,6 +5,7 @@ import Foundation
 import CoreLocation
 import AppIntents
 import os
+import CryptoKit
 
 let fdLog = Logger(subsystem: Bundle.main.bundleIdentifier ?? "flightdesk", category: "data")
 
@@ -63,8 +64,16 @@ enum SearchRadius: String, AppEnum, CaseIterable, Codable {
 }
 
 enum BoardStyle: String, Codable, CaseIterable {
-    case led, glass
-    var title: String { self == .led ? "LED Board" : "Liquid Glass" }
+    /// Glowing dot-matrix flight board.
+    case led
+    /// Clean system look that follows Light and Dark Mode.
+    case standard
+    var title: String { self == .led ? "LED Board" : "Standard" }
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = BoardStyle(rawValue: raw) ?? (raw == "glass" ? .standard : .led)   // "glass" = 1.0 name
+    }
 }
 
 extension KeyedDecodingContainer {
@@ -83,12 +92,13 @@ struct DisplayOptions: Codable, Equatable {
     var glow = true
     var dotMatrix = true
     var showHeader = true
+    var showLogos = true
 
     private var metric: Bool { units == .metric }
-    var isGlass: Bool { style == .glass }
-    /// LED board: compact "12,450FT". Liquid Glass: system style "12,450 ft".
-    private func unit(_ value: String, _ led: String, _ glass: String) -> String {
-        isGlass ? "\(value) \(glass)" : value + led
+    var isStandard: Bool { style == .standard }
+    /// LED board: compact "12,450FT". Standard: "12,450 ft".
+    private func unit(_ value: String, _ led: String, _ standard: String) -> String {
+        isStandard ? "\(value) \(standard)" : value + led
     }
     func altitude(_ ft: Int) -> String {
         metric ? unit(Int(Double(ft) * 0.3048).formatted(), "M", "m") : unit(ft.formatted(), "FT", "ft")
@@ -109,7 +119,7 @@ extension DisplayOptions {
         self.init(style: c.value(.style, d.style), theme: c.value(.theme, d.theme), units: c.value(.units, d.units),
                   showCities: c.value(.showCities, d.showCities), showList: c.value(.showList, d.showList),
                   glow: c.value(.glow, d.glow), dotMatrix: c.value(.dotMatrix, d.dotMatrix),
-                  showHeader: c.value(.showHeader, d.showHeader))
+                  showHeader: c.value(.showHeader, d.showHeader), showLogos: c.value(.showLogos, d.showLogos))
     }
 }
 
@@ -157,6 +167,8 @@ struct Airport: Codable, Equatable {
 struct RouteInfo: Codable, Equatable {
     var airline: String?
     var flightNo: String?
+    /// IATA airline designator (e.g. "DL"), used for the logo. Absent in older cache entries.
+    var airlineCode: String? = nil
     var from: Airport
     var to: Airport
 }
@@ -183,6 +195,16 @@ struct Flight: Identifiable, Equatable, Codable {
     var aircraft: AircraftInfo?
 
     var airlineName: String { route?.airline ?? aircraft?.owner ?? "" }
+    var airlineCode: String? { route?.airlineCode }
+
+    /// How far along its route the aircraft is (0 = origin, 1 = destination), from its live position.
+    var progress: Double? {
+        guard let r = route else { return nil }
+        let flown = FlightService.gcDistance(r.from.lat, r.from.lon, lat, lon)
+        let left = FlightService.gcDistance(lat, lon, r.to.lat, r.to.lon)
+        guard flown + left > 1 else { return nil }
+        return min(1, max(0, flown / (flown + left)))
+    }
     var displayNumber: String { route?.flightNo ?? (callsign.isEmpty ? reg : callsign) }
     var looksLikeAirline: Bool {
         let c = Array(callsign)
@@ -276,7 +298,7 @@ private struct DBRouteResponse: Decodable { let response: Inner
         let origin: DBAirport
         let destination: DBAirport
     }
-    struct Airline: Decodable { let name: String }
+    struct Airline: Decodable { let name: String; let iata: String? }
 }
 private struct DBAirport: Decodable {
     let iata_code: String?; let icao_code: String; let municipality: String?
@@ -324,6 +346,7 @@ enum FlightService {
             for await (i, r, a) in group { list[i].route = r; list[i].aircraft = a }
         }
         await LookupCache.shared.save()
+        await AirlineLogos.prefetch(Set(list.compactMap(\.airlineCode)))
         fdLog.info("Fetched \(list.count) flights within \(radiusNM) nm")
         return list
     }
@@ -372,7 +395,7 @@ enum FlightService {
         guard let r = try? JSONDecoder().decode(DBRouteResponse.self, from: data).response.flightroute else {
             return (nil, code == 200 || code == 404)
         }
-        return (RouteInfo(airline: r.airline?.name, flightNo: r.callsign_iata,
+        return (RouteInfo(airline: r.airline?.name, flightNo: r.callsign_iata, airlineCode: r.airline?.iata,
                           from: r.origin.airport, to: r.destination.airport), true)
     }
 
@@ -489,14 +512,73 @@ extension PanelModel {
         let bos = Airport(code: "BOS", city: "Boston", lat: 42.4, lon: -71.0)
         return PanelModel(flights: [
             f("a1b2c3", "DAL1342", "A321", 12_450, 1800, 312, 4.2, 95,
-              RouteInfo(airline: "Delta Air Lines", flightNo: "DL1342", from: sea, to: jfk), "Airbus A321-211"),
+              RouteInfo(airline: "Delta Air Lines", flightNo: "DL1342", airlineCode: "DL", from: sea, to: jfk), "Airbus A321-211"),
             f("a2b3c4", "UAL960", "B789", 36_000, 0, 488, 11.8, 40,
-              RouteInfo(airline: "United Airlines", flightNo: "UA960", from: ord, to: lhr), "Boeing 787 9"),
+              RouteInfo(airline: "United Airlines", flightNo: "UA960", airlineCode: "UA", from: ord, to: lhr), "Boeing 787 9"),
             f("a3b4c5", "SWA2210", "B38M", 7_200, -1400, 260, 14.5, 160,
-              RouteInfo(airline: "Southwest Airlines", flightNo: "WN2210", from: den, to: ord), "Boeing 737 MAX 8"),
+              RouteInfo(airline: "Southwest Airlines", flightNo: "WN2210", airlineCode: "WN", from: den, to: ord), "Boeing 737 MAX 8"),
             f("a4b5c6", "JBU488", "A220", 24_100, 900, 401, 19.3, 300,
-              RouteInfo(airline: "JetBlue", flightNo: "B6488", from: bos, to: den), "Airbus A220-300"),
+              RouteInfo(airline: "JetBlue", flightNo: "B6488", airlineCode: "B6", from: bos, to: den), "Airbus A220-300"),
             f("a5b6c7", "N172SP", "C172", 3_500, 0, 105, 21.0, 220, nil, "Cessna 172S"),
         ], placeName: "Denver", radiusNM: 25, updated: Date())
     }()
+}
+
+
+// MARK: - Airline logos
+
+/// Square airline logos, downloaded once into the shared container so the widget can draw them
+/// synchronously. Source: Kiwi.com's public airline logo CDN, keyed by IATA code.
+enum AirlineLogos {
+    private static var dir: URL { Shared.containerURL.appendingPathComponent("logos", isDirectory: true) }
+    private static let maxAge: TimeInterval = 30 * 86_400
+    private static let missAge: TimeInterval = 7 * 86_400
+    /// The CDN answers unknown airlines with a generic image instead of a 404.
+    private static let placeholders: Set<String> = [
+        "53545c0ed6a76040fb5afe0af343ff29feb7545fceae2caaa0680c711c95657b",   // grey plane
+        "1fe23e6d0b1ae8e9a8b8102f7dde086e9e3dd4de6a82f5ee73fa4616fd820855",   // "K" badge
+    ]
+
+    private static func valid(_ code: String) -> Bool {
+        (2...3).contains(code.count) && code.allSatisfy { $0.isLetter || $0.isNumber }
+    }
+
+    /// Local file for an airline's logo, if one has been downloaded.
+    static func file(for code: String?) -> URL? {
+        guard let code = code?.uppercased(), valid(code) else { return nil }
+        let u = dir.appendingPathComponent("\(code).png")
+        return FileManager.default.fileExists(atPath: u.path) ? u : nil
+    }
+
+    static func prefetch(_ codes: Set<String>) async {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        await withTaskGroup(of: Void.self) { g in
+            for code in codes.map({ $0.uppercased() }) where valid(code) {
+                g.addTask { await fetch(code) }
+            }
+        }
+    }
+
+    private static func age(_ u: URL) -> TimeInterval? {
+        (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate).map { -$0.timeIntervalSinceNow }
+    }
+
+    private static func fetch(_ code: String) async {
+        let png = dir.appendingPathComponent("\(code).png"), miss = dir.appendingPathComponent("\(code).none")
+        if let a = age(png), a < maxAge { return }
+        if let a = age(miss), a < missAge { return }
+        guard let url = URL(string: "https://images.kiwi.com/airlines/128x128/\(code).png"),
+              let (data, resp) = try? await FlightService.session.data(from: url),
+              (resp as? HTTPURLResponse)?.statusCode == 200 else { return }
+        if data.count < 1_000 || !data.starts(with: [0x89, 0x50, 0x4E, 0x47])
+            || placeholders.contains(SHA256.hash(data: data).hex) {
+            try? Data().write(to: miss)
+        } else {
+            try? data.write(to: png, options: .atomic)
+        }
+    }
+}
+
+private extension Digest {
+    var hex: String { map { String(format: "%02x", $0) }.joined() }
 }
