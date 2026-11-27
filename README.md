@@ -25,8 +25,8 @@
 - **Airline logos.** Downloaded once and cached (can be turned off in Settings).
 - **Two looks.** Choose an LED board (amber, green, red, blue, cyan or white, with optional glow and dot-matrix texture) or **Standard**, which uses system colours and follows Light and Dark Mode. Both work with the macOS *Clear* and *Tinted* widget styles.
 - **Configurable.** Set the location, radius (5–100 nm), units (ft/kt/nm or metric) and which details appear. Each widget can also override the location, radius, style, colour and units.
-- **Live radar window.** Open FlightDesk from the Dock, Launchpad or Spotlight to get a map of your area with every aircraft in your search radius, drawn to its heading and size and moving in real time. A sidebar lists them with logos, routes, altitude and distance. You can search it by callsign, registration, type, airline or airport, and sort it by distance or altitude. Select a flight to see it in the inspector, and double-click it (or click **Open Details**) for the full detail window.
-- **Menu bar and desktop panel.** A ✈ menu bar item gives quick access to the window, Settings (with a live preview) and an optional floating panel that updates every 15 s. Closing the window keeps the menu bar item, panel and widgets running.
+- **Live radar window.** Open FlightDesk from the Dock, Launchpad or Spotlight to get a map of your area with every aircraft in your search radius, drawn to its heading and size and moving in real time. A sidebar lists them with logos, routes, altitude and distance. You can search it by callsign, registration, type, airline or airport, and sort it by distance or altitude. Select a flight to see it in the inspector and on the map with its flown path, the dashed route still to go and its origin and destination airports. Double-click it (or click **Open Details**) for the full detail.
+- **Menu bar and desktop panel.** A ✈ menu bar item gives quick access to the window, Settings and an optional floating panel that updates every 15 s. Closing the window keeps the menu bar item, panel and widgets running.
 - **Your own receiver.** Running a Raspberry Pi feeder? FlightDesk can read positions straight from it over your local network: no rate limits, no internet needed, your own coverage. See [Use your own ADS-B receiver](#use-your-own-ads-b-receiver).
 - **Private by design.** No accounts, no API keys and no analytics. See [Privacy](#privacy).
 
@@ -69,13 +69,17 @@ To work in Xcode, run `xcodegen generate` and open `FlightDesk.xcodeproj`.
 
 ## Configuration
 
-**FlightDesk Settings** (**FlightDesk › Settings…** or ⌘, in the app, or ✈ in the menu bar) controls every widget, the panel and the main window:
+**Settings** opens inside the main window (**FlightDesk › Settings…** or ⌘, in the app, or **Settings…** in the ✈ menu). Its tabs replace the flight list in the sidebar; **Back** (the toolbar chevron, ⌘[ or Esc) returns to the map or flight you were looking at. Settings controls every widget, the panel and the main window:
 
 | Tab | Options |
 | --- | --- |
-| General | Location (this Mac's location, a city/airport, or `lat, lon`), radius, private/GA traffic, your own ADS-B receiver, launch at login |
-| Display | Style (LED Board or Standard), colour, glow, dot-matrix texture, units, city names, flight list, header, rotation, floating panel |
-| Widget | How often to fetch new data (15 s – 5 min), refresh now |
+| General | Location (this Mac's location, a city/airport, or `lat, lon`), radius, private/GA traffic, menu bar readout, floating panel, launch at login |
+| Display | Live preview, style (LED Board or Standard), colour, glow, dot-matrix texture, units, header, flight list, city names, logos, rotation |
+| Widget | How to add the widget, how often to update it (15 s – 5 min), refresh now |
+| Alerts | Notifications for emergency squawks, your watchlist, interesting (military, government) aircraft, heavies and aircraft passing close by; quiet hours |
+| Sources | Your own ADS-B receiver, the data sources in use |
+
+Links of the form `flightdesk://settings/<general|display|widget|alerts|sources>` open a tab directly.
 
 **Per-widget overrides:** right-click a widget › *Edit "Flights Overhead"* to set its location, style, radius, colour and units. Everything else follows Settings.
 
@@ -85,7 +89,7 @@ macOS decides when a widget actually redraws. While FlightDesk is running it ask
 
 ### Use your own ADS-B receiver
 
-If you run dump1090-fa (PiAware / SkyAware), readsb, tar1090 or ultrafeeder, open **Settings › General › Data**, turn on **Use my ADS-B receiver** and enter the address of its map page, for example `http://raspberrypi.local/tar1090`, `http://piaware.local/skyaware` or `http://192.168.1.50:8080`. **Test Connection** finds the receiver's `aircraft.json` (it tries `data/aircraft.json`, `aircraft.json` and the usual `tar1090/`, `skyaware/`, `dump1090-fa/` and `dump1090/` sub-paths) and shows how many aircraft it sees.
+If you run dump1090-fa (PiAware / SkyAware), readsb, tar1090 or ultrafeeder, open **Settings › Sources**, turn on **Use my ADS-B receiver** and enter the address of its map page, for example `http://raspberrypi.local/tar1090`, `http://piaware.local/skyaware` or `http://192.168.1.50:8080`. **Test Connection** finds the receiver's `aircraft.json` (it tries `data/aircraft.json`, `aircraft.json` and the usual `tar1090/`, `skyaware/`, `dump1090-fa/` and `dump1090/` sub-paths) and shows how many aircraft it sees.
 
 FlightDesk then asks your receiver first and computes distances itself. If the receiver can't be reached it falls back to the internet feeds and retries the receiver a minute later. Turn on **Only use my receiver** to never use the internet feeds. macOS asks once for permission to access your local network; you can change this in System Settings › Privacy & Security › Local Network. Plain `http://` works for IP addresses and `.local` names.
 

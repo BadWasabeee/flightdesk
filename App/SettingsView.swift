@@ -43,95 +43,14 @@ extension SettingsTab {
 
 /// Shared layout constants and copy helpers for the Settings panes.
 enum SettingsMetrics {
-    /// Every pane has the same width so the toolbar doesn't jump between tabs; heights fit the content.
-    static let width: CGFloat = 540
+    /// The widest a pane grows in the main window, so its forms don't stretch.
+    static let width: CGFloat = 600
     /// Leading inset for options that depend on the row above.
     static let indent: CGFloat = 18
 
     /// "15 seconds", "1 minute", "2 minutes".
     static func interval(_ seconds: Int) -> String {
         Duration.seconds(seconds).formatted(.units(allowed: [.minutes, .seconds], width: .wide))
-    }
-}
-
-// MARK: - Window
-
-/// The Settings window: toolbar tabs with icons, the window title follows the selected tab, and the
-/// window animates to each pane's height (scrolling only when a pane is taller than the screen).
-@MainActor
-final class SettingsWindowController: NSWindowController {
-    private let tabs = SettingsTabController()
-
-    init(store: LiveStore, onTabChange: @escaping (SettingsTab) -> Void) {
-        tabs.tabStyle = .toolbar
-        for tab in SettingsTab.allCases {
-            let pane = SettingsPane(rootView: Self.view(for: tab, store: store))
-            pane.sizingOptions = [.preferredContentSize]
-            pane.title = tab.title
-            let item = NSTabViewItem(viewController: pane)
-            item.identifier = tab.rawValue
-            item.label = tab.title
-            item.image = NSImage(systemSymbolName: tab.symbol, accessibilityDescription: tab.title)
-            tabs.addTabViewItem(item)
-        }
-        tabs.onSelect = onTabChange
-
-        let window = NSWindow(contentViewController: tabs)
-        window.styleMask = [.titled, .closable]
-        window.toolbarStyle = .preference
-        window.isReleasedWhenClosed = false
-        window.title = SettingsTab.general.title
-        window.tabbingMode = .disallowed
-        super.init(window: window)
-        window.center()
-    }
-
-    @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
-
-    func show(_ tab: SettingsTab) {
-        if let i = SettingsTab.allCases.firstIndex(of: tab), tabs.selectedTabViewItemIndex != i {
-            tabs.selectedTabViewItemIndex = i
-        }
-        window?.title = tab.title
-        NSApp.activate(ignoringOtherApps: true)
-        showWindow(nil)
-        window?.makeKeyAndOrderFront(nil)
-        // Don't drop the cursor into the first text field; Tab moves into the pane.
-        DispatchQueue.main.async { [weak self] in self?.window?.makeFirstResponder(nil) }
-    }
-
-    private static func view(for tab: SettingsTab, store: LiveStore) -> AnyView {
-        switch tab {
-        case .general: AnyView(GeneralSettings(store: store))
-        case .display: AnyView(DisplaySettings(store: store))
-        case .widget: AnyView(WidgetSettings(store: store))
-        case .alerts: AnyView(SpotterSettingsView(store: store))
-        case .sources: AnyView(SourcesSettings(store: store))
-        }
-    }
-}
-
-private final class SettingsTabController: NSTabViewController {
-    var onSelect: ((SettingsTab) -> Void)?
-
-    override func tabView(_ tabView: NSTabView, didSelect item: NSTabViewItem?) {
-        super.tabView(tabView, didSelect: item)
-        guard let id = item?.identifier as? String, let tab = SettingsTab(rawValue: id) else { return }
-        view.window?.title = tab.title
-        onSelect?(tab)
-        DispatchQueue.main.async { [weak self] in self?.view.window?.makeFirstResponder(nil) }
-    }
-}
-
-/// A pane whose preferred height (which the tab controller sizes the window to) is capped to the screen.
-private final class SettingsPane: NSHostingController<AnyView> {
-    override var preferredContentSize: NSSize {
-        get {
-            let size = super.preferredContentSize
-            let screen = (view.window?.screen ?? NSScreen.main)?.visibleFrame.height ?? 900
-            return NSSize(width: size.width, height: min(size.height, max(360, screen - 140)))
-        }
-        set { super.preferredContentSize = newValue }
     }
 }
 
@@ -290,7 +209,6 @@ struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: SettingsMetrics.width)
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             loginEnabled = SMAppService.mainApp.status == .enabled
             loginNeedsApproval = SMAppService.mainApp.status == .requiresApproval
@@ -375,7 +293,6 @@ struct DisplaySettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: SettingsMetrics.width)
     }
 
     private func swatch(_ t: LEDTheme) -> some View {
@@ -434,7 +351,6 @@ struct WidgetSettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: SettingsMetrics.width)
     }
 
     private func step(_ n: Int, _ text: LocalizedStringKey) -> some View {
@@ -504,7 +420,6 @@ struct SourcesSettings: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: SettingsMetrics.width)
         .task {
             while !Task.isCancelled {
                 served = await FeedHealth.shared.lastServed

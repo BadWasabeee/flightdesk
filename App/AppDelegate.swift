@@ -31,16 +31,13 @@ struct PanelRoot: View {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     let store = LiveStore()
     var panel: NSWindow!
-    private var settingsController: SettingsWindowController?
-    var settingsWindow: NSWindow? { settingsController?.window }
-    var settingsTab = SettingsTab.general
     private var welcomeWindow: NSWindow?
     var statusItem: NSStatusItem!
     let menu = NSMenu()
     lazy var mainWindow = MainWindowController(store: store)
     /// A window opened by a reopen or launch, held briefly so a deep link arriving
     /// around the same time (widget click) can cancel it.
-    private var pendingSettings: DispatchWorkItem?
+    private var pendingWindow: DispatchWorkItem?
     /// When the last `flightdesk://` link was handled.
     private var lastLinkOpen = Date.distantPast
     /// Links delivered before launch finished.
@@ -80,7 +77,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         store.onSettingsChange = { [weak self] in self?.applyPanelSettings() }
         store.wantsLive = { [weak self] in
             guard let self else { return false }
-            return self.panel.isVisible || (self.settingsWindow?.isVisible ?? false) || self.mainWindow.isVisible
+            // The main window covers Settings, whose Display preview shows the live board.
+            return self.panel.isVisible || self.mainWindow.isVisible
         }
         applyPanelSettings()
         installSpotterAlerts()
@@ -95,7 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         // (`launchIsDefaultUserInfoKey` isn't reliable here; a deep link arriving during launch
         // cancels this scheduled window instead.)
         if !loginLaunch, !openedFromLink {
-            scheduleSettings {
+            scheduleWindow {
                 $0.showMainWindow()
                 guard !UserDefaults.standard.bool(forKey: "onboarded.v2") else { return }
                 UserDefaults.standard.set(true, forKey: "onboarded.v2")
@@ -110,7 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         guard Date().timeIntervalSince(lastLinkOpen) > 1 else { return true }
         if !NSApp.windows.contains(where: { $0.isVisible && $0.styleMask.contains(.titled) }) {
-            scheduleSettings { $0.showMainWindow() }
+            scheduleWindow { $0.showMainWindow() }
         }
         return true
     }
@@ -122,19 +120,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     /// `flightdesk://flight/<hex>` from the widget opens that aircraft's detail window.
     func application(_ application: NSApplication, open urls: [URL]) {
-        // flightdesk://settings/<general|display|widget|alerts|sources> opens that Settings tab.
+        // flightdesk://settings/<general|display|widget|alerts|sources> opens that Settings tab in the main window.
         if let tab = urls.lazy.compactMap(SettingsTab.init(url:)).first {
             lastLinkOpen = Date()
             openedFromLink = true
-            pendingSettings?.cancel()
-            pendingSettings = nil
+            pendingWindow?.cancel()
+            pendingWindow = nil
             openSettings(tab: tab)
         }
         let hexes = urls.compactMap(FlightLink.hex(from:))
         guard !hexes.isEmpty else { return }
         lastLinkOpen = Date()
-        pendingSettings?.cancel()
-        pendingSettings = nil
+        pendingWindow?.cancel()
+        pendingWindow = nil
         openedFromLink = true
         if didLaunch { hexes.forEach(showFlight(hex:)) } else { pendingLinks += hexes }
     }
@@ -145,16 +143,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     /// Opens a window after a short grace period, unless a deep link cancels it first.
     /// The system's reopen and open-URL events for one widget click can arrive in either order.
-    private func scheduleSettings(_ open: @escaping @MainActor (AppDelegate) -> Void) {
-        pendingSettings?.cancel()
+    private func scheduleWindow(_ open: @escaping @MainActor (AppDelegate) -> Void) {
+        pendingWindow?.cancel()
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                self.pendingSettings = nil
+                self.pendingWindow = nil
                 open(self)
             }
         }
-        pendingSettings = work
+        pendingWindow = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
@@ -279,19 +277,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     @objc func openGitHub() { NSWorkspace.shared.open(URL(string: "https://github.com/BadWasabeee/flightdesk")!) }
-    @objc func showSettings() { openSettings(tab: settingsTab) }
+    /// ⌘, and the status menu: Settings in the main window, at the tab last shown.
+    @objc func showSettings() {
+        mainWindow.showSettings()
+        Task { await store.refresh() }
+    }
     @objc func refreshWidgets() { store.reloadWidgets(); Task { await store.refresh() } }
     @objc func togglePanel() { store.settings.showPanel.toggle() }
     @objc func quit() { NSApp.terminate(nil) }
 
-    // MARK: Settings window
+    // MARK: Settings
 
+    /// Opens the main window on Settings at `tab` (deep links, location prompts, the welcome window).
     func openSettings(tab: SettingsTab) {
-        settingsTab = tab
-        // Built once and kept, so the toolbar and title stay put; deep links just select the tab.
-        let controller = settingsController ?? SettingsWindowController(store: store) { [weak self] in self?.settingsTab = $0 }
-        settingsController = controller
-        controller.show(tab)
+        mainWindow.showSettings(tab)
         Task { await store.refresh() }
     }
 

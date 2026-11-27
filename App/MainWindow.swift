@@ -19,7 +19,7 @@ enum RadarFeedState: Equatable {
 
 /// Live data for the main window: every aircraft in the search radius, refetched every 12 s
 /// while the window is on screen and dead-reckoned along its heading in between. Also owns the
-/// flight detail shown in place of the map.
+/// window's navigation: the flight detail shown in place of the map, and Settings above either.
 @MainActor
 final class RadarModel: ObservableObject {
     /// All aircraft in the radius, at their estimated current positions.
@@ -35,6 +35,9 @@ final class RadarModel: ObservableObject {
     @Published private(set) var selected: Flight?
     /// Live positions of the selected aircraft since it was selected, oldest first.
     @Published private(set) var trail: [GeoPoint] = []
+    /// Recorded tracks by hex, oldest point first. Only the selected aircraft's is fetched (the
+    /// OpenSky anonymous quota is small), at most once per selection.
+    @Published private(set) var tracks: [String: [GeoPoint]] = [:]
     @Published var query = ""
     @Published var sort: FlightSort {
         didSet { UserDefaults.standard.set(sort.rawValue, forKey: Self.sortKey) }
@@ -46,6 +49,8 @@ final class RadarModel: ObservableObject {
     @Published private(set) var detailFlight: Flight?
     /// Bumped to ask the map to frame the search radius again.
     @Published private(set) var recenterRequests = 0
+    /// The Settings pane shown in place of the map or detail, if any.
+    @Published private(set) var settingsTab: SettingsTab?
 
     /// The map's last camera region, kept so the map comes back where it was after a detail.
     var mapRegion: MKCoordinateRegion?
@@ -64,6 +69,9 @@ final class RadarModel: ObservableObject {
     private var poll: Task<Void, Never>?
     private var subscriptions: Set<AnyCancellable> = []
     private var detailSubscription: AnyCancellable?
+    /// Sidebar visibility before Settings opened (Settings always shows its sidebar), restored on leaving.
+    private var sidebarBeforeSettings: NavigationSplitViewVisibility?
+    private var trackTask: Task<Void, Never>?
 
     private static let fetchEvery = 4
     private static let tick: Duration = .seconds(3)
@@ -103,7 +111,7 @@ final class RadarModel: ObservableObject {
             detail?.stop()
             return
         }
-        detail?.start()
+        if settingsTab == nil { detail?.start() }
         poll = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -114,6 +122,7 @@ final class RadarModel: ObservableObject {
                 }
             }
         }
+        loadSelectedTrack()
     }
 
     /// Fetches now. A request made while one is in flight runs again once it finishes, so a
@@ -149,6 +158,7 @@ final class RadarModel: ObservableObject {
             let ids = Set(fresh.map(\.id))
             known = known.filter { ids.contains($0.key) }
             lookedUp.formIntersection(ids)
+            tracks = tracks.filter { ids.contains($0.key) || $0.key == selection }
             updated = Date()
             feed = fresh.isEmpty ? .empty : .live
             if let id = selection, let f = fresh.first(where: { $0.id == id }), trail.last != f.geoPoint {
@@ -172,6 +182,22 @@ final class RadarModel: ObservableObject {
         // Picking another aircraft in the list while a detail is open switches the detail to it.
         if let id = selection, detail != nil, id != detail?.hex { showDetail(hex: id, snapshot: nil) }
         lookUpSelection()
+        trackTask?.cancel()
+        trackTask = nil
+        loadSelectedTrack()
+    }
+
+    /// Fetches the selected aircraft's recorded track for the map's flown path, unless it's cached,
+    /// already loading, or the map isn't showing (the detail fetches its own).
+    private func loadSelectedTrack() {
+        guard isActive, let f = selected, tracks[f.id] == nil, trackTask == nil, detail == nil, settingsTab == nil else { return }
+        let id = f.id
+        trackTask = Task { [weak self] in
+            let track = await FlightDetailService.track(hex: id, current: f.geoPoint)
+            guard let self, !Task.isCancelled else { return }
+            self.trackTask = nil
+            if let track, self.selection == id { self.tracks[id] = track.points.map(\.point) }
+        }
     }
 
     /// Looks up route and aircraft details for a newly selected aircraft the store hasn't enriched.
@@ -203,10 +229,10 @@ final class RadarModel: ObservableObject {
 
     // MARK: Detail
 
-    /// Shows the detail for the aircraft with `hex` in place of the map, and selects it.
+    /// Shows the detail for the aircraft with `hex` in place of the map (leaving Settings), and selects it.
     func showDetail(hex: String, snapshot: Flight?) {
         let id = flights.first { $0.id.caseInsensitiveCompare(hex) == .orderedSame }?.id ?? hex
-        guard detail?.hex != id else { return }
+        guard detail?.hex != id else { closeSettings(); return }
         let snap = snapshot ?? flights.first { $0.id == id } ?? detail?.nearby.first { $0.id == id }
         detail?.stop()
         let model = FlightDetailModel(hex: id, snapshot: snap, nearby: flights)
@@ -216,8 +242,9 @@ final class RadarModel: ObservableObject {
             self?.detailFlight = f
             if let self, self.selection == id, !self.flights.contains(where: { $0.id == id }) { self.selected = f }
         }
-        if isActive { model.start() }
         if selection != id { selection = id }
+        closeSettings()
+        if isActive { model.start() }
     }
 
     /// Back to the map, keeping the selection.
@@ -227,25 +254,61 @@ final class RadarModel: ObservableObject {
         detailSubscription = nil
         self.detail = nil
         detailFlight = nil
+        loadSelectedTrack()
     }
 
-    /// The Esc key: back from a detail, else clear the selection, else clear the search.
+    // MARK: Settings
+
+    /// Shows Settings at `tab` above whatever the window was showing; the detail underneath pauses.
+    func showSettings(_ tab: SettingsTab) {
+        if settingsTab == nil {
+            detail?.stop()
+            sidebarBeforeSettings = sidebar
+            sidebar = .all
+        }
+        settingsTab = tab
+    }
+
+    /// Back from Settings to the map or detail it was opened over.
+    func closeSettings() {
+        guard settingsTab != nil else { return }
+        settingsTab = nil
+        if let previous = sidebarBeforeSettings { sidebar = previous }
+        sidebarBeforeSettings = nil
+        if isActive { detail?.start() }
+        loadSelectedTrack()
+    }
+
+    /// The back action (toolbar chevron, ⌘[): Settings first, then a detail. Returns false when
+    /// there was nowhere to go back to.
+    @discardableResult
+    func goBack() -> Bool {
+        if settingsTab != nil { closeSettings() } else if detail != nil { closeDetail() } else { return false }
+        return true
+    }
+
+    /// The Esc key: back from Settings or a detail, else clear the selection, else clear the search.
     /// Returns false when there was nothing to cancel.
     @discardableResult
     func cancel() -> Bool {
-        if detail != nil { closeDetail() } else if selection != nil { selection = nil } else if !query.isEmpty { query = "" } else { return false }
+        if goBack() { return true }
+        if selection != nil { selection = nil } else if !query.isEmpty { query = "" } else { return false }
         return true
     }
 }
 
 /// The app's main window: nearby aircraft in a sidebar, a live map and an inspector, or the full
-/// detail of one flight in place of the map. The window is created when first shown and released
-/// when closed (its frame is autosaved). Flight details opened anywhere in the app come here.
+/// detail of one flight in place of the map, or Settings. The window is created when first shown
+/// and released when closed (its frame is autosaved). Flight details and Settings opened anywhere
+/// in the app come here.
 @MainActor
 final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     private let store: LiveStore
     private(set) var window: NSWindow?
     private var radar: RadarModel?
+    /// The Settings tab last shown, reopened by ⌘, (kept across window closes).
+    private var lastSettingsTab = SettingsTab.general
+    private var tabSubscription: AnyCancellable?
     private static let autosaveName = "FlightDeskMainWindow"
 
     init(store: LiveStore) {
@@ -268,6 +331,17 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidati
         showWindow(nil)
         let snap = snapshot ?? store.model.flights.first { $0.id.caseInsensitiveCompare(hex) == .orderedSame }
         withAnimation(Self.motion) { radar?.showDetail(hex: hex, snapshot: snap) }
+    }
+
+    /// Opens the main window on Settings at `tab`, or at the tab last shown.
+    func showSettings(_ tab: SettingsTab? = nil) {
+        showWindow(nil)
+        guard let radar else { return }
+        let tab = tab ?? lastSettingsTab
+        let entering = radar.settingsTab == nil
+        withAnimation(Self.motion) { radar.showSettings(tab) }
+        // Don't drop the cursor into the pane's first text field; Tab moves into it.
+        if entering { DispatchQueue.main.async { [weak self] in self?.window?.makeFirstResponder(nil) } }
     }
 
     /// The window's view transitions, or none with Reduce Motion.
@@ -300,9 +374,9 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidati
         FlightDetail.showInNewWindow(hex: id, snapshot: radar.detail == nil ? radar.selected : radar.detailFlight)
     }
 
-    /// View › Back (⌘[): from a detail back to the map.
+    /// View › Back (⌘[): from Settings to the map or detail, or from a detail to the map.
     @objc func goBack(_ sender: Any?) {
-        withAnimation(Self.motion) { radar?.closeDetail() }
+        withAnimation(Self.motion) { _ = radar?.goBack() }
     }
 
     /// Esc, when nothing in the window handled it.
@@ -317,7 +391,8 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidati
             guard let window, let field = Self.searchField(in: window.contentView?.superview ?? window.contentView) else { return }
             window.makeFirstResponder(field)
         }
-        if radar.sidebar == .detailOnly {
+        if radar.settingsTab != nil || radar.sidebar == .detailOnly {
+            withAnimation(Self.motion) { radar.closeSettings() }
             radar.sidebar = .all
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(300))
@@ -340,7 +415,10 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidati
     /// View › Center on My Location (⌘L).
     @objc func recenter(_ sender: Any?) {
         guard let radar else { return }
-        withAnimation(Self.motion) { radar.closeDetail() }
+        withAnimation(Self.motion) {
+            radar.closeSettings()
+            radar.closeDetail()
+        }
         radar.recenter()
     }
 
@@ -355,7 +433,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidati
         case #selector(openSelectedInNewWindow(_:)):
             return key && (radar?.detail != nil || radar?.selection != nil)
         case #selector(goBack(_:)):
-            return key && radar?.detail != nil
+            return key && (radar?.detail != nil || radar?.settingsTab != nil)
         case #selector(focusSearch(_:)):
             return key
         case #selector(setSort(_:)):
@@ -401,6 +479,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidati
         w.setFrameAutosaveName(Self.autosaveName)
         window = w
         self.radar = radar
+        tabSubscription = radar.$settingsTab.compactMap { $0 }.sink { [weak self] in self?.lastSettingsTab = $0 }
     }
 
     func windowDidChangeOcclusionState(_ notification: Notification) {

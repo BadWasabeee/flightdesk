@@ -23,7 +23,6 @@ struct SpotterSettingsView: View {
             quietHoursSection
         }
         .formStyle(.grouped)
-        .frame(width: SettingsMetrics.width)
         .task { await alerts.refreshAuthorization() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await alerts.refreshAuthorization() }

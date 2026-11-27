@@ -13,9 +13,9 @@ final class FlightDetailModel: ObservableObject {
 
     @Published private(set) var flight: Flight? { didSet { updatePaths() } }
     @Published private(set) var squawk: String?
-    @Published private(set) var onGround = false
+    @Published private(set) var onGround = false { didSet { if onGround != oldValue { updatePaths() } } }
     /// True while the latest poll returned a fresh position.
-    @Published private(set) var isLive = false
+    @Published private(set) var isLive = false { didSet { if isLive != oldValue { updatePaths() } } }
     /// When the most recent position was received, once a poll has returned one.
     @Published private(set) var lastSeen: Date?
     /// Positions observed while the view has been showing this aircraft, oldest first.
@@ -41,6 +41,11 @@ final class FlightDetailModel: ObservableObject {
     private(set) var plannedPath: [GeoPoint] = []
     /// Flown track (cached): the recorded track plus live positions since.
     private(set) var flownPath: [GeoPoint] = []
+    /// What's drawn, split at the antimeridian: the flown track, the planned route still ahead
+    /// of the aircraft, and (when the route is unknown) a short vector along its heading.
+    private(set) var flownLines: [[GeoPoint]] = []
+    private(set) var remainingLines: [[GeoPoint]] = []
+    private(set) var headingLines: [[GeoPoint]] = []
 
     /// Progress of the airframe photo lookup.
     enum PhotoState {
@@ -278,6 +283,19 @@ final class FlightDetailModel: ObservableObject {
             points = FlightMath.greatCircle(from: r.from.geoPoint, to: first).dropLast() + points
         }
         flownPath = FlightMath.removingRepeats(points)
+        flownLines = RouteGeometry.antimeridianSafe(flownPath)
+
+        // The flown part of the route is shown by the track, so only what's ahead is dashed.
+        if let f = flight, r != nil {
+            remainingLines = RouteGeometry.antimeridianSafe(RouteGeometry.split(plannedPath, at: f.geoPoint).remaining)
+        } else {
+            remainingLines = []
+        }
+        if let f = flight, r == nil, isLive, !onGround, let track = f.track {
+            headingLines = RouteGeometry.antimeridianSafe(RouteGeometry.headingVector(from: f.geoPoint, track: track, speedKT: f.speed))
+        } else {
+            headingLines = []
+        }
     }
 
     var adsbLolURL: URL? { URL(string: "https://adsb.lol/?icao=\(hex)") }
@@ -314,10 +332,15 @@ struct FlightDetailView: View {
     @ObservedObject var model: FlightDetailModel
     @State private var camera: MapCameraPosition = .automatic
     @State private var latitudeSpan: Double = 180
+    /// The map's camera as last reported, so a switch can keep the user's zoom level.
+    @State private var visibleCamera: MapCamera?
+    /// The aircraft the camera last centred on by itself (nil until the opening view is set).
+    @State private var centredHex: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 0) {
-            FlightDetailMap(model: model, camera: $camera, latitudeSpan: $latitudeSpan)
+            FlightDetailMap(model: model, camera: $camera, latitudeSpan: $latitudeSpan, visibleCamera: $visibleCamera)
                 .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(alignment: .topTrailing) { mapControls.padding(10) }
             Divider()
@@ -332,15 +355,9 @@ struct FlightDetailView: View {
         }
         .environment(\.displayOptions, model.display)
         .frame(minWidth: 620, minHeight: 420)
-        .onChange(of: framingKey) { if !camera.positionedByUser { frameFlight() } }
-        // A different aircraft always reframes, even if the user had moved the map.
-        .onChange(of: model.hex, initial: true) { frameFlight() }
-    }
-
-    /// Changes when the set of things worth framing changes (first data, route found, track loaded).
-    private var framingKey: String {
-        let r = model.flight?.route
-        return "\(model.flight != nil)|\(r?.from.code ?? "")|\(r?.to.code ?? "")|\(model.history.isEmpty)"
+        // The camera follows the aircraft, never the route: a route or track loading doesn't move it.
+        .onChange(of: model.hex, initial: true) { centreOnAircraft() }
+        .onChange(of: model.flight != nil) { if centredHex != model.hex { centreOnAircraft() } }
     }
 
     /// Map framing controls, styled like MapKit's own zoom control.
@@ -375,6 +392,25 @@ struct FlightDetailView: View {
 
     // MARK: Framing
 
+    /// Opens on a local view around the aircraft (about the search area across). After that, a
+    /// different aircraft keeps the current zoom and the map pans to it. Showing the whole flight
+    /// is left to the "Show Whole Flight" button, so long-haul routes never zoom the map out.
+    private func centreOnAircraft() {
+        guard let f = model.flight else {
+            // No position yet: show the user's area until it arrives.
+            if centredHex == nil, let observer = observerPoint() {
+                move(to: DetailCamera.localRegion(around: observer, radiusNM: model.radiusNM))
+            }
+            return
+        }
+        if centredHex != nil, let current = visibleCamera {
+            setCamera(.camera(MapCamera(centerCoordinate: f.geoPoint.coordinate, distance: current.distance)))
+        } else {
+            move(to: DetailCamera.localRegion(around: f.geoPoint, radiusNM: model.radiusNM))
+        }
+        centredHex = model.hex
+    }
+
     /// Fits origin, destination (including the arc between them), the recorded track and the
     /// aircraft, or the aircraft and the observer when the route is unknown.
     private func frameFlight() {
@@ -392,8 +428,7 @@ struct FlightDetailView: View {
             points.append(observer)
         }
         guard let fr = DetailFormat.framing(points) else { return }
-        move(to: MKCoordinateRegion(center: fr.center.coordinate,
-                                    span: MKCoordinateSpan(latitudeDelta: fr.latitudeDelta, longitudeDelta: fr.longitudeDelta)))
+        move(to: fr)
     }
 
     /// Centres on the aircraft, about 60 nm across.
@@ -412,8 +447,20 @@ struct FlightDetailView: View {
                                     span: MKCoordinateSpan(latitudeDelta: d * 2, longitudeDelta: d * 2 / max(0.2, cos(observer.lat * .pi / 180)))))
     }
 
-    private func move(to region: MKCoordinateRegion) {
-        withAnimation(.easeInOut(duration: 0.6)) { camera = .region(region) }
+    private func move(to fr: DetailFormat.Framing) {
+        move(to: MKCoordinateRegion(center: fr.center.coordinate,
+                                    span: MKCoordinateSpan(latitudeDelta: fr.latitudeDelta, longitudeDelta: fr.longitudeDelta)))
+    }
+
+    private func move(to region: MKCoordinateRegion) { setCamera(.region(region)) }
+
+    /// Glides to `position`, or jumps there with Reduce Motion on.
+    private func setCamera(_ position: MapCameraPosition) {
+        if reduceMotion {
+            camera = position
+        } else {
+            withAnimation(.easeInOut(duration: 0.6)) { camera = position }
+        }
     }
 }
 
@@ -423,6 +470,7 @@ private struct FlightDetailMap: View {
     @ObservedObject var model: FlightDetailModel
     @Binding var camera: MapCameraPosition
     @Binding var latitudeSpan: Double
+    @Binding var visibleCamera: MapCamera?
     @Environment(\.openFlightDetail) private var openFlight
     private let observer = observerPoint()
     /// The visible region and map size, for label placement.
@@ -455,15 +503,25 @@ private struct FlightDetailMap: View {
                     .annotationTitles(.hidden)
                 }
             }
-            if model.plannedPath.count > 1 {
-                MapPolyline(coordinates: model.plannedPath.map(\.coordinate))
-                    .stroke(Color.primary.opacity(0.45), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, dash: [5, 5]))
+            // The route still to fly: bold accent dashes over a solid dark casing, so it reads on
+            // any map style. Lighter when the destination is only an estimate.
+            ForEach(Array(model.remainingLines.enumerated()), id: \.offset) { _, line in
+                MapPolyline(coordinates: line.map(\.coordinate))
+                    .stroke(Color.black.opacity(0.4), style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round))
+                MapPolyline(coordinates: line.map(\.coordinate))
+                    .stroke(Color.accentColor.opacity(model.destinationEstimated ? 0.65 : 1),
+                            style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round, dash: [6, 8]))
             }
-            if model.flownPath.count > 1 {
-                // A dark casing under the line keeps it legible over any terrain.
-                MapPolyline(coordinates: model.flownPath.map(\.coordinate))
+            // Route unknown: a thin dotted vector along the current heading (about 10 minutes ahead).
+            ForEach(Array(model.headingLines.enumerated()), id: \.offset) { _, line in
+                MapPolyline(coordinates: line.map(\.coordinate))
+                    .stroke(Color.accentColor.opacity(0.9), style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [0.5, 5]))
+            }
+            // A dark casing under the flown track keeps it legible over any terrain.
+            ForEach(Array(model.flownLines.enumerated()), id: \.offset) { _, line in
+                MapPolyline(coordinates: line.map(\.coordinate))
                     .stroke(Color.black.opacity(0.25), style: StrokeStyle(lineWidth: 5.5, lineCap: .round, lineJoin: .round))
-                MapPolyline(coordinates: model.flownPath.map(\.coordinate))
+                MapPolyline(coordinates: line.map(\.coordinate))
                     .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
             }
             if let r = model.flight?.route {
@@ -512,6 +570,7 @@ private struct FlightDetailMap: View {
         .onMapCameraChange(frequency: .onEnd) { context in
             region = context.region
             latitudeSpan = context.region.span.latitudeDelta
+            visibleCamera = context.camera
             relabel()
         }
         .background {

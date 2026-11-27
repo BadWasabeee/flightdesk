@@ -2,7 +2,8 @@ import SwiftUI
 import MapKit
 
 /// Main window content: a searchable aircraft list beside either the live radar map (with an
-/// inspector for the selection) or the full detail of one flight.
+/// inspector for the selection) or the full detail of one flight. Settings replaces both: its
+/// tabs fill the sidebar and the selected pane the content area, with Back returning to either.
 struct MainWindowView: View {
     @ObservedObject var store: LiveStore
     @ObservedObject var radar: RadarModel
@@ -16,23 +17,37 @@ struct MainWindowView: View {
 
     var body: some View {
         NavigationSplitView(columnVisibility: $radar.sidebar) {
-            FlightList(radar: radar,
-                       flights: FlightListFilter.apply(radar.flights, query: radar.query, sort: radar.sort),
-                       total: radar.flights.count,
-                       feed: radar.feed,
-                       radius: store.settings.radius,
-                       includeGA: store.settings.includeGA,
-                       hasLocation: !store.placeName.isEmpty || Shared.location != nil,
-                       locationStatus: store.locationStatus)
-                .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 420)
+            Group {
+                if radar.settingsTab != nil {
+                    SettingsSidebar(radar: radar)
+                } else {
+                    FlightList(radar: radar,
+                               flights: FlightListFilter.apply(radar.flights, query: radar.query, sort: radar.sort),
+                               total: radar.flights.count,
+                               feed: radar.feed,
+                               radius: store.settings.radius,
+                               includeGA: store.settings.includeGA,
+                               hasLocation: !store.placeName.isEmpty || Shared.location != nil,
+                               locationStatus: store.locationStatus)
+                        // On the list, not the split view, so Settings' sidebar has no search field.
+                        .searchable(text: $radar.query, placement: .sidebar, prompt: "Callsign, reg, type, airport")
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 420)
         } detail: {
             content
         }
-        .searchable(text: $radar.query, placement: .sidebar, prompt: "Callsign, reg, type, airport")
         .navigationTitle(title)
         .navigationSubtitle(subtitle)
         .toolbar { toolbar }
-        .onExitCommand { withAnimation(MainWindowController.motion) { _ = radar.cancel() } }
+        .onExitCommand {
+            // Esc while typing just ends editing; it only navigates back from outside a text field.
+            if let window = NSApp.keyWindow, let editor = window.firstResponder as? NSTextView, editor.isFieldEditor {
+                window.makeFirstResponder(nil)
+                return
+            }
+            withAnimation(MainWindowController.motion) { _ = radar.cancel() }
+        }
         .environment(\.displayOptions, display)
         .frame(minWidth: 900, minHeight: 600)
     }
@@ -42,7 +57,10 @@ struct MainWindowView: View {
     @ViewBuilder
     private var content: some View {
         ZStack {
-            if let detail = radar.detail {
+            if let tab = radar.settingsTab {
+                SettingsPane(tab: tab, store: store)
+                    .transition(.opacity)
+            } else if let detail = radar.detail {
                 FlightDetailView(model: detail)
                     .id(detail.hex)
                     .environment(\.openFlightDetail) { [radar] f in
@@ -68,12 +86,19 @@ struct MainWindowView: View {
     // MARK: Title
 
     private var title: String {
-        guard let detail = radar.detail else { return "FlightDesk" }
+        if radar.settingsTab != nil { return "Settings" }
+        return detailTitle ?? "FlightDesk"
+    }
+
+    /// The shown flight's number (or hex while loading), nil on the map.
+    private var detailTitle: String? {
+        guard let detail = radar.detail else { return nil }
         let number = radar.detailFlight?.displayNumber ?? ""
         return number.isEmpty ? detail.hex.uppercased() : number
     }
 
     private var subtitle: String {
+        if let tab = radar.settingsTab { return tab.title }
         if radar.detail != nil {
             guard let f = radar.detailFlight else { return "Loading…" }
             if let r = f.route { return "\(r.from.city.isEmpty ? r.from.code : r.from.city) → \(r.to.city.isEmpty ? r.to.code : r.to.city)" }
@@ -99,14 +124,28 @@ struct MainWindowView: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        if radar.detail != nil {
+        if radar.settingsTab != nil || radar.detail != nil {
             ToolbarItem(placement: .navigation) {
-                Button { withAnimation(MainWindowController.motion) { radar.closeDetail() } } label: {
+                Button { withAnimation(MainWindowController.motion) { _ = radar.goBack() } } label: {
                     Label("Back", systemImage: "chevron.backward")
                 }
-                .help("Back to the map (⌘[)")
+                .help(backHelp)
             }
         }
+        if radar.settingsTab == nil {
+            radarActions
+        }
+    }
+
+    /// Where Back goes: from Settings to the flight or map underneath, from a flight to the map.
+    private var backHelp: String {
+        if radar.settingsTab != nil, let flight = detailTitle { return "Back to \(flight) (⌘[)" }
+        return "Back to the map (⌘[)"
+    }
+
+    /// Radius, Airlines Only and Refresh (hidden in Settings, which has its own radius control).
+    @ToolbarContentBuilder
+    private var radarActions: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
             Picker("Radius", selection: $store.settings.radius) {
                 ForEach(SearchRadius.allCases, id: \.self) { Text(display.radius($0.nm)).tag($0) }
@@ -248,6 +287,45 @@ private struct FlightList: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Settings
+
+/// The Settings tabs, in the sidebar while Settings is shown.
+private struct SettingsSidebar: View {
+    @ObservedObject var radar: RadarModel
+
+    var body: some View {
+        List(selection: Binding(get: { radar.settingsTab }, set: { if let tab = $0 { radar.showSettings(tab) } })) {
+            ForEach(SettingsTab.allCases, id: \.self) { tab in
+                Label(tab.title, systemImage: tab.symbol).tag(tab)
+            }
+        }
+        .accessibilityLabel("Settings")
+    }
+}
+
+/// One Settings tab's form, centred at a readable width over a full-bleed background.
+private struct SettingsPane: View {
+    let tab: SettingsTab
+    let store: LiveStore
+
+    var body: some View {
+        Group {
+            switch tab {
+            case .general: GeneralSettings(store: store)
+            case .display: DisplaySettings(store: store)
+            case .widget: WidgetSettings(store: store)
+            case .alerts: SpotterSettingsView(store: store)
+            case .sources: SourcesSettings(store: store)
+            }
+        }
+        .scrollContentBackground(.hidden)
+        .frame(maxWidth: SettingsMetrics.width)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .id(tab)
     }
 }
 
@@ -472,10 +550,28 @@ private struct RadarMap: View {
                 }
             }
             if let selected {
-                let path = FlightMath.removingRepeats(radar.trail + [selected.geoPoint])
-                if path.count > 1 {
-                    MapPolyline(coordinates: path.map(coordinate))
-                        .stroke(Color.accentColor.opacity(0.8), style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
+                // Ahead: a dashed great circle to the destination. Each dash has a dark rim (its casing is
+                // dashed too, with wider round caps) so it reads over land, water and dark mode alike.
+                if let r = selected.route {
+                    let ahead = FlightMath.removingRepeats(FlightMath.greatCircle(from: selected.geoPoint, to: r.to.geoPoint))
+                    if ahead.count > 1 {
+                        MapPolyline(coordinates: ahead.map(coordinate))
+                            .stroke(Color.black.opacity(0.3), style: StrokeStyle(lineWidth: 5, lineCap: .round, dash: [7, 7]))
+                        MapPolyline(coordinates: ahead.map(coordinate))
+                            .stroke(Color.accentColor.opacity(0.7), style: StrokeStyle(lineWidth: 2.5, lineCap: .round, dash: [7, 7]))
+                    }
+                }
+                // Flown: the recorded track (when OpenSky has it), then live positions since selection.
+                let flown = FlightMath.removingRepeats(radar.tracks[selected.id, default: []] + radar.trail + [selected.geoPoint])
+                if flown.count > 1 {
+                    MapPolyline(coordinates: flown.map(coordinate))
+                        .stroke(Color.black.opacity(0.3), style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round))
+                    MapPolyline(coordinates: flown.map(coordinate))
+                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+                }
+                if let r = selected.route {
+                    airport(r.from, role: "Departure")
+                    airport(r.to, role: "Destination")
                 }
             }
             // The selected aircraft is drawn last so it sits on top.
@@ -545,6 +641,29 @@ private struct RadarMap: View {
                 .contextMenu { FlightMenu(f: f, radar: radar) }
                 .accessibilityAction { radar.selection = f.id }
                 .accessibilityAction(named: "Open Details") { radar.open(f) }
+        }
+        .annotationTitles(.hidden)
+    }
+
+    /// An origin or destination: a ringed dot with the airport code beneath.
+    private func airport(_ a: Airport, role: String) -> some MapContent {
+        Annotation("", coordinate: coordinate(a.geoPoint), anchor: .center) {
+            VStack(spacing: 2) {
+                Circle()
+                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .frame(width: 10, height: 10)
+                    .overlay(Circle().stroke(Color.accentColor, lineWidth: 2.5))
+                Text(a.code)
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.primary)
+                    .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
+                    .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
+            }
+            // Keep the dot (not the code) on the airport.
+            .offset(y: 8)
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(role) airport, \(a.code)\(a.city.isEmpty ? "" : ", \(a.city)")")
         }
         .annotationTitles(.hidden)
     }
