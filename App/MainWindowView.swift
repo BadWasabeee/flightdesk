@@ -33,6 +33,7 @@ struct MainWindowView: View {
                         .searchable(text: $radar.query, placement: .sidebar, prompt: "Callsign, reg, type, airport")
                 }
             }
+            .safeAreaInset(edge: .bottom, spacing: 0) { SidebarFooter(radar: radar) }
             .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 420)
         } detail: {
             content
@@ -956,5 +957,34 @@ private struct FlightInspector: View {
         LabeledContent(label) {
             Text(value).monospacedDigit().textSelection(.enabled)
         }
+    }
+}
+
+/// The sidebar's bottom bar: a Settings button that toggles between Settings and the radar.
+private struct SidebarFooter: View {
+    @ObservedObject var radar: RadarModel
+
+    var body: some View {
+        let inSettings = radar.settingsTab != nil
+        VStack(spacing: 0) {
+            Divider()
+            HStack {
+                Button {
+                    withAnimation(MainWindowController.motion) {
+                        if inSettings { radar.closeSettings() } else { radar.showSettings(radar.lastSettingsTab) }
+                    }
+                } label: {
+                    Label(inSettings ? "Done" : "Settings", systemImage: inSettings ? "checkmark.circle" : "gearshape")
+                        .labelStyle(.titleAndIcon)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .help(inSettings ? "Back to the radar" : "Settings (⌘,)")
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+        }
+        .background(.bar)
     }
 }

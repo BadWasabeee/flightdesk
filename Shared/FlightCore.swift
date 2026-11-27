@@ -329,7 +329,7 @@ enum FlightService {
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 8
         c.httpAdditionalHeaders = ["User-Agent": "FlightDesk/\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1") (+https://github.com/BadWasabeee/flightdesk)"]
-        return URLSession(configuration: c)
+        return URLSession(configuration: c, delegate: UsageMeter(), delegateQueue: nil)
     }()
 
     /// Live aircraft around a point (adsb.lol, real-time ADS-B/MLAT), enriched with
@@ -937,6 +937,9 @@ enum LiveFeed: String, CaseIterable, Codable, Sendable {
         }
     }
 
+    /// The rate-limit bucket this feed's requests count against.
+    var service: ApiService { self == .adsbFi ? .adsbFi : .adsbLol }
+
     /// Fetches from the first feed that answers 200, skipping feeds that recently failed.
     static func fetch(_ url: (LiveFeed) -> URL?) async throws -> Data {
         try await fetchWithSource(url).data
@@ -946,7 +949,9 @@ enum LiveFeed: String, CaseIterable, Codable, Sendable {
     static func fetchWithSource(_ url: (LiveFeed) -> URL?) async throws -> (data: Data, feed: LiveFeed) {
         var lastError: Error = URLError(.cannotFindHost)
         let order = await FeedHealth.shared.order()
-        for feed in order {
+        // Feeds close to their daily allowance go last, so they're only used if the others fail.
+        let available = order.filter { ApiBudget.isAvailable($0.service) }
+        for feed in available + order.filter({ !available.contains($0) }) {
             guard let u = url(feed) else { continue }
             do {
                 let (data, resp) = try await FlightService.session.data(from: u)
@@ -1006,6 +1011,14 @@ enum NearbyCache {
         var source: DataSource?
     }
     private static var url: URL { Shared.containerURL.appendingPathComponent("nearby-cache.json") }
+
+    /// The latest entry whatever its key (any position or radius), if it's recent enough.
+    static func latest(maxAge: TimeInterval) -> Entry? {
+        guard let data = try? Data(contentsOf: url),
+              let e = try? JSONDecoder().decode(Entry.self, from: data),
+              -e.time.timeIntervalSinceNow < maxAge else { return nil }
+        return e
+    }
 
     static func read(key: String, maxAge: TimeInterval) -> Entry? {
         guard let data = try? Data(contentsOf: url),

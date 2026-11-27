@@ -260,6 +260,9 @@ final class RadarModel: ObservableObject {
     // MARK: Settings
 
     /// Shows Settings at `tab` above whatever the window was showing; the detail underneath pauses.
+    /// The Settings tab last shown, reopened by the sidebar's Settings button.
+    private(set) var lastSettingsTab = SettingsTab.general
+
     func showSettings(_ tab: SettingsTab) {
         if settingsTab == nil {
             detail?.stop()
@@ -267,6 +270,7 @@ final class RadarModel: ObservableObject {
             sidebar = .all
         }
         settingsTab = tab
+        lastSettingsTab = tab
     }
 
     /// Back from Settings to the map or detail it was opened over.

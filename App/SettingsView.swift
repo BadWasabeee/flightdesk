@@ -418,6 +418,8 @@ struct SourcesSettings: View {
                 Text("Live feeds only ever receive a rounded position (about 1 km). These are free community services — consider contributing a feeder.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+
+            RequestUsageSection()
         }
         .formStyle(.grouped)
         .task {
@@ -510,4 +512,48 @@ struct DataCredits: Identifiable {
                     url: URL(string: "https://github.com/soaring-symbols/soaring-symbols")!),
         DataCredits(role: "Airports", name: "OurAirports", url: URL(string: "https://ourairports.com")!),
     ]
+}
+
+/// Today's requests per service, against each service's free daily allowance.
+private struct RequestUsageSection: View {
+    @State private var counts: [ApiService: Int] = [:]
+    @State private var paused: [ApiService: Date] = [:]
+
+    private var services: [ApiService] {
+        ApiService.allCases.filter { $0 != .other && (counts[$0] ?? 0) > 0 || $0.dailyLimit != nil }
+    }
+
+    var body: some View {
+        Section {
+            ForEach(services, id: \.self) { service in
+                LabeledContent(service.title) {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text(usage(service)).monospacedDigit()
+                        if let until = paused[service] {
+                            Text("Resting until \(until.formatted(date: .omitted, time: .shortened))")
+                                .font(.caption).foregroundStyle(.orange)
+                        }
+                    }
+                }
+                .accessibilityElement(children: .combine)
+            }
+        } header: {
+            Text("Requests Today")
+        } footer: {
+            Text("Results are cached and shared with the widget. FlightDesk stops using a service before it reaches its daily allowance.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .task {
+            while !Task.isCancelled {
+                counts = ApiBudget.counts
+                paused = Dictionary(uniqueKeysWithValues: ApiService.allCases.compactMap { s in ApiBudget.pausedUntil(s).map { (s, $0) } })
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    private func usage(_ service: ApiService) -> String {
+        let n = (counts[service] ?? 0).formatted()
+        return service.dailyLimit.map { "\(n) of \($0.formatted())" } ?? n
+    }
 }

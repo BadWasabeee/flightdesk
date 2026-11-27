@@ -45,6 +45,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var didLaunch = false
     /// A deep link has been handled (used to keep a link-triggered launch from opening the main window).
     private var openedFromLink = false
+    /// A Settings deep link that arrived before launch finished.
+    private var pendingSettingsTab: SettingsTab?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         let loginLaunch = LaunchContext.isLoginItem
@@ -87,6 +89,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         didLaunch = true
         pendingLinks.forEach { showFlight(hex: $0) }
         pendingLinks.removeAll()
+        if let tab = pendingSettingsTab {
+            pendingSettingsTab = nil
+            openSettings(tab: tab)
+        }
 
         // A normal launch opens the main window, with onboarding in front the first time. Launched by
         // a deep link the detail window wins; launched at login the app starts in the menu bar only.
@@ -126,7 +132,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             openedFromLink = true
             pendingWindow?.cancel()
             pendingWindow = nil
-            openSettings(tab: tab)
+            // During launch the main window isn't set up yet; open it once launch finishes.
+            if didLaunch { openSettings(tab: tab) } else { pendingSettingsTab = tab }
         }
         let hexes = urls.compactMap(FlightLink.hex(from:))
         guard !hexes.isEmpty else { return }

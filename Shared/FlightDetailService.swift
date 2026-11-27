@@ -188,28 +188,39 @@ enum FlightDetailService {
     /// The latest report for one aircraft, or nil when the live feeds no longer have it.
     /// Only the aircraft's hex is sent; the observer position is used locally. Uses the user's own
     /// receiver first when enabled (see `ReceiverFeed.route` for the fallback order).
-    static func report(hex: String) async throws -> AircraftReport? {
+    /// With `preferCache`, a fresh shared nearby list answers instead of a network request (it lacks
+    /// extras such as the build year, so callers do one full fetch first).
+    static func report(hex: String, preferCache: Bool = false) async throws -> AircraftReport? {
         let observer = Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) }
         let receiver = ReceiverSettings.current
         return try await ReceiverFeed.route(receiver, local: {
             try await ReceiverFeed.report(hex: hex, observer: observer, settings: receiver)
         }, internet: {
+            // Inside the search radius the shared nearby list already has this aircraft: no request.
+            if preferCache, let e = NearbyCache.latest(maxAge: 20), let f = e.flights.first(where: { $0.id == hex }) {
+                return AircraftReport(flight: f, squawk: f.squawk, onGround: false, positionTime: e.time)
+            }
             let data = try await LiveFeed.fetch { $0.hexURL(hex) }
             let records = try JSONDecoder().decode(DetailResponse.self, from: data).ac ?? []
             return records.lazy.compactMap { AircraftReport(record: $0, observer: observer) }.first
         })
     }
 
-    /// The aircraft's track for its current flight from the OpenSky Network (anonymous, rate-limited).
-    /// Nil when unavailable, or when the track doesn't end near `current` (e.g. an earlier leg).
+    /// The aircraft's track for its current flight from the OpenSky Network (anonymous, about 400
+    /// requests a day). Each flight's track is downloaded once and cached on disk for the app and
+    /// widget; live positions extend it afterwards. Nil when unavailable, when OpenSky is near its
+    /// limit, or when the track belongs to another leg.
     static func track(hex: String, current: GeoPoint?) async -> FlightTrack? {
         let id = hex.lowercased().replacingOccurrences(of: "~", with: "")
-        guard id.count == 6, let url = URL(string: "https://opensky-network.org/api/tracks/all?icao24=\(id)&time=0"),
+        guard id.count == 6, id.allSatisfy(\.isHexDigit) else { return nil }
+        if let cached = TrackCache.track(for: id, current: current) { return cached }
+        guard ApiBudget.isAvailable(.openSky),
+              let url = URL(string: "https://opensky-network.org/api/tracks/all?icao24=\(id)&time=0"),
               let (data, resp) = try? await FlightService.session.data(from: url),
               (resp as? HTTPURLResponse)?.statusCode == 200,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let path = obj["path"] as? [[Any]] else { return nil }
-        return FlightTrack(waypoints: path, current: current)
+              let track = FlightTrack(data: data, current: current) else { return nil }
+        TrackCache.store(data, for: id)
+        return track
     }
 
     /// Route and aircraft details for a flight from the shared lookup cache. The route is returned
@@ -393,5 +404,56 @@ enum DetailFormat {
         }
         let up = sky.elevation < 1 ? "less than 1°" : "\(Int(sky.elevation.rounded()))°"
         return ("Look \(up) up, toward \(sky.compassPoint)", "Bearing \(bearing)")
+    }
+}
+
+extension FlightTrack {
+    /// Parses an OpenSky `/tracks` response.
+    init?(data: Data, current: GeoPoint?, now: Date = Date()) {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let path = obj["path"] as? [[Any]] else { return nil }
+        self.init(waypoints: path, current: current, now: now)
+    }
+}
+
+/// Recorded tracks on disk, one file per aircraft, so each flight's track is fetched only once.
+enum TrackCache {
+    /// A cached track is reused for at most this long (longer than any flight).
+    static let lifetime: TimeInterval = 20 * 3_600
+    private static var dir: URL { Shared.containerURL.appendingPathComponent("tracks", isDirectory: true) }
+
+    static func store(_ data: Data, for id: String) {
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? data.write(to: dir.appendingPathComponent("\(id).json"), options: .atomic)
+        prune()
+    }
+
+    /// The cached track for `id`, if it's recent and the aircraft could plausibly have flown from
+    /// the track's end to `current` since (otherwise it's an earlier leg).
+    static func track(for id: String, current: GeoPoint?, now: Date = Date()) -> FlightTrack? {
+        let file = dir.appendingPathComponent("\(id).json")
+        guard let fetched = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+              now.timeIntervalSince(fetched) < lifetime,
+              let data = try? Data(contentsOf: file),
+              let track = FlightTrack(data: data, current: nil, now: fetched),
+              let end = track.points.last else { return nil }
+        if let c = current, !isContinuation(from: end, to: c, now: now) { return nil }
+        return track
+    }
+
+    /// Whether an aircraft at `end` could be at `current` by `now` (≤ 650 kt plus slack).
+    static func isContinuation(from end: TimedPoint, to current: GeoPoint, now: Date) -> Bool {
+        let hours = max(0, now.timeIntervalSince(end.time)) / 3_600
+        return FlightService.gcDistance(end.point.lat, end.point.lon, current.lat, current.lon) <= hours * 650 + 60
+    }
+
+    /// Deletes cached tracks older than `lifetime`.
+    private static func prune() {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return }
+        for f in files {
+            let date = (try? f.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+            if -date.timeIntervalSinceNow > lifetime { try? fm.removeItem(at: f) }
+        }
     }
 }

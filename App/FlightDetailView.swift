@@ -59,7 +59,9 @@ final class FlightDetailModel: ObservableObject {
     let radiusNM: Int
     private let includeGA: Bool
 
-    private static let pollInterval: Duration = .seconds(5)
+    private static let pollInterval: Duration = .seconds(8)
+    /// A full per-aircraft report has been received (extras like the build year are known).
+    private var hadFullReport = false
     private static let nearbyInterval: Duration = .seconds(15)
     /// OpenSky's anonymous quota is small, so the recorded track is refreshed sparingly.
     private static let historyInterval: Duration = .seconds(180)
@@ -200,7 +202,8 @@ final class FlightDetailModel: ObservableObject {
     private func poll() async {
         let report: AircraftReport?
         do {
-            report = try await FlightDetailService.report(hex: hex)
+            // After one full report, a fresh shared nearby list can answer without a request.
+            report = try await FlightDetailService.report(hex: hex, preferCache: hadFullReport)
         } catch {
             fdLog.info("Detail poll for \(self.hex, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             // Don't claim "Live" forever while the network is down.
@@ -236,6 +239,7 @@ final class FlightDetailModel: ObservableObject {
         onGround = report.onGround
         lastSeen = report.positionTime
         buildYear = report.year ?? buildYear
+        hadFullReport = true
         isLive = -report.positionTime.timeIntervalSinceNow < Self.staleAfter
     }
 
