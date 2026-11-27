@@ -61,3 +61,16 @@ enum RemoteURL {
         return c.url
     }
 }
+
+/// Airport identifiers, checked before they are sent to a weather service.
+enum AirportCode {
+    /// The uppercase ICAO location indicator in `raw` (surrounding spaces ignored): a letter then
+    /// three ASCII letters or digits (`^[A-Z][A-Z0-9]{3}$`), else nil.
+    static func icao(_ raw: String) -> String? {
+        let s = raw.trimmingCharacters(in: .whitespaces).uppercased()
+        let u = Array(s.utf8)
+        guard u.count == 4, (0x41...0x5A).contains(u[0]),
+              u.dropFirst().allSatisfy({ (0x30...0x39).contains($0) || (0x41...0x5A).contains($0) }) else { return nil }
+        return s
+    }
+}

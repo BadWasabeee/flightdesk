@@ -506,6 +506,7 @@ struct DataCredits: Identifiable {
         DataCredits(role: "Live positions", name: "adsb.fi and adsb.lol", url: URL(string: "https://adsb.fi")!),
         DataCredits(role: "Routes and aircraft", name: "adsbdb", url: URL(string: "https://www.adsbdb.com")!),
         DataCredits(role: "Flight tracks", name: "OpenSky Network", url: URL(string: "https://opensky-network.org")!),
+        DataCredits(role: "Airport weather", name: "aviationweather.gov", url: URL(string: "https://aviationweather.gov")!),
         DataCredits(role: "Aircraft photos", name: "Planespotters.net", url: URL(string: "https://www.planespotters.net")!),
         DataCredits(role: "Interesting aircraft", name: "plane-alert-db",
                     url: URL(string: "https://github.com/sdr-enthusiasts/plane-alert-db")!),

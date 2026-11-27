@@ -2,7 +2,7 @@ import Foundation
 
 /// The web services FlightDesk talks to, for counting requests and respecting rate limits.
 enum ApiService: String, CaseIterable, Codable, Sendable {
-    case adsbFi, adsbLol, openSky, adsbdb, planespotters, airframes, logos, other
+    case adsbFi, adsbLol, openSky, adsbdb, planespotters, airframes, aviationWeather, logos, other
 
     init(host: String) {
         switch host {
@@ -12,6 +12,7 @@ enum ApiService: String, CaseIterable, Codable, Sendable {
         case let h where h.hasSuffix("adsbdb.com"): self = .adsbdb
         case let h where h.hasSuffix("planespotters.net") || h.hasSuffix("plnspttrs.net"): self = .planespotters
         case let h where h.hasSuffix("airframes.io"): self = .airframes
+        case let h where h.hasSuffix("aviationweather.gov"): self = .aviationWeather
         case let h where h.hasSuffix("jsdelivr.net") || h.hasSuffix("githubusercontent.com") || h.hasSuffix("kiwi.com"): self = .logos
         default: self = .other
         }
@@ -25,6 +26,7 @@ enum ApiService: String, CaseIterable, Codable, Sendable {
         case .adsbdb: "adsbdb"
         case .planespotters: "Planespotters.net"
         case .airframes: "Airframes.io"
+        case .aviationWeather: "aviationweather.gov"
         case .logos: "Airline logos"
         case .other: "Other"
         }
@@ -35,6 +37,16 @@ enum ApiService: String, CaseIterable, Codable, Sendable {
         switch self {
         case .adsbLol: 500
         case .openSky: 400
+        default: nil
+        }
+    }
+
+    /// FlightDesk's own cap on requests per minute (per process) for services that publish a
+    /// per-minute guideline. aviationweather.gov asks for no more than 100 a minute; airport
+    /// weather is batched and cached, so a handful an hour is typical.
+    var minuteLimit: Int? {
+        switch self {
+        case .aviationWeather: 20
         default: nil
         }
     }
