@@ -43,4 +43,11 @@ final class FlightTrackTests: XCTestCase {
         let a = GeoPoint(lat: 42, lon: -88), b = GeoPoint(lat: 42.5, lon: -88)
         XCTAssertEqual(FlightMath.removingRepeats([a, a, b, b, .init(lat: .nan, lon: 0), a]), [a, b, a])
     }
+
+    func testDecodesBothFeedListNames() throws {
+        let lol = try JSONDecoder().decode(ADSBResponse.self, from: Data(#"{"ac":[{"hex":"abc123"}]}"#.utf8))
+        let fi = try JSONDecoder().decode(ADSBResponse.self, from: Data(#"{"aircraft":[{"hex":"abc123"}]}"#.utf8))
+        XCTAssertEqual(lol.ac?.count, 1)
+        XCTAssertEqual(fi.ac?.count, 1)
+    }
 }

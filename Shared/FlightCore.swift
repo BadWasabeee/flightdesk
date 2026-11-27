@@ -273,7 +273,15 @@ enum Altitude: Decodable {
     }
 }
 
-struct ADSBResponse: Decodable { let ac: [ADSBAircraft]? }
+/// readsb-style response. adsb.lol names the list `ac`, adsb.fi names it `aircraft`.
+struct ADSBResponse: Decodable {
+    let ac: [ADSBAircraft]?
+    private enum CodingKeys: String, CodingKey { case ac, aircraft }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ac = c.value(.ac, nil) ?? c.value(.aircraft, nil)
+    }
+}
 struct ADSBAircraft: Decodable {
     let hex: String
     let flight: String?
@@ -324,12 +332,7 @@ enum FlightService {
     /// aircraft model and a route that has been checked against the live position.
     static func nearby(lat: Double, lon: Double, radiusNM: Int, includeGA: Bool,
                        limit: Int = 12, enrich: Int = 10) async throws -> [Flight] {
-        // Privacy: only a coarse position (2 decimals ≈ 1 km) ever leaves the Mac.
-        let url = URL(string: String(format: "https://api.adsb.lol/v2/point/%.2f/%.2f/%d", lat, lon, radiusNM))!
-        let (data, resp) = try await session.data(from: url)
-        if let h = resp as? HTTPURLResponse, h.statusCode != 200 { throw URLError(.badServerResponse) }
-        let all = try JSONDecoder().decode(ADSBResponse.self, from: data).ac ?? []
-        var list = all.compactMap(Flight.init(adsb:))
+        var list = try await allNearby(lat: lat, lon: lon, radiusNM: radiusNM)
             .filter { includeGA || $0.looksLikeAirline }
             .sorted { $0.distance < $1.distance }
         list = Array(list.prefix(limit))
@@ -348,6 +351,27 @@ enum FlightService {
         await LookupCache.shared.save()
         await AirlineLogos.prefetch(Set(list.compactMap(\.logoKey)))
         fdLog.info("Fetched \(list.count) flights within \(radiusNM) nm")
+        return list
+    }
+
+    /// Every aircraft within the radius, nearest first. Shared between the app and the widget for
+    /// a few seconds so they don't download the same thing twice.
+    static func allNearby(lat: Double, lon: Double, radiusNM: Int) async throws -> [Flight] {
+        // Privacy: only a coarse position (2 decimals ≈ 1 km) ever leaves the Mac.
+        let key = String(format: "%.2f,%.2f,%d", lat, lon, radiusNM)
+        if let cached = NearbyCache.read(key: key, maxAge: 20) { return cached }
+        let data: Data
+        do {
+            data = try await LiveFeed.fetch { $0.pointURL(lat: lat, lon: lon, radiusNM: radiusNM) }
+        } catch {
+            // Every feed failed: keep showing recent data rather than an empty board.
+            if let stale = NearbyCache.read(key: key, maxAge: 600) { return stale }
+            throw error
+        }
+        let list = (try JSONDecoder().decode(ADSBResponse.self, from: data).ac ?? [])
+            .compactMap(Flight.init(adsb:))
+            .sorted { $0.distance < $1.distance }
+        NearbyCache.write(list, key: key)
         return list
     }
 
@@ -841,5 +865,89 @@ enum FlightLink {
         guard url.scheme == scheme, url.host == "flight" else { return nil }
         let h = url.lastPathComponent.lowercased()
         return h.range(of: "^~?[0-9a-f]{6}$", options: .regularExpression) != nil ? h : nil
+    }
+}
+
+// MARK: - Live ADS-B feeds
+
+/// Community ADS-B aggregators with the same readsb JSON format. Requests go to the first healthy
+/// feed and fall back to the next, so a rate limit or outage on one doesn't blank the widget.
+enum LiveFeed: String, CaseIterable, Sendable {
+    /// adsb.fi open data: about one request per second, no daily cap.
+    case adsbFi
+    /// adsb.lol: 500 requests per day per address.
+    case adsbLol
+
+    func pointURL(lat: Double, lon: Double, radiusNM: Int) -> URL {
+        switch self {
+        case .adsbFi: URL(string: String(format: "https://opendata.adsb.fi/api/v2/lat/%.2f/lon/%.2f/dist/%d", lat, lon, radiusNM))!
+        case .adsbLol: URL(string: String(format: "https://api.adsb.lol/v2/point/%.2f/%.2f/%d", lat, lon, radiusNM))!
+        }
+    }
+
+    func hexURL(_ hex: String) -> URL? {
+        guard let id = hex.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(["~"])) else { return nil }
+        switch self {
+        case .adsbFi: return URL(string: "https://opendata.adsb.fi/api/v2/hex/\(id)")
+        case .adsbLol: return URL(string: "https://api.adsb.lol/v2/hex/\(id)")
+        }
+    }
+
+    /// Fetches from the first feed that answers 200, skipping feeds that recently failed.
+    static func fetch(_ url: (LiveFeed) -> URL?) async throws -> Data {
+        var lastError: Error = URLError(.cannotFindHost)
+        let order = await FeedHealth.shared.order()
+        for feed in order {
+            guard let u = url(feed) else { continue }
+            do {
+                let (data, resp) = try await FlightService.session.data(from: u)
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code == 200 {
+                    await FeedHealth.shared.succeeded(feed)
+                    return data
+                }
+                // 429 = rate limited: back off this feed for longer.
+                await FeedHealth.shared.failed(feed, for: code == 429 ? 1_800 : 120)
+                lastError = URLError(.badServerResponse)
+                fdLog.info("\(feed.rawValue, privacy: .public) answered \(code); trying the next feed")
+            } catch {
+                await FeedHealth.shared.failed(feed, for: 120)
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+}
+
+/// Remembers (per process) which feeds failed recently so requests go straight to a working one.
+actor FeedHealth {
+    static let shared = FeedHealth()
+    private var benchedUntil: [LiveFeed: Date] = [:]
+
+    func order() -> [LiveFeed] {
+        let now = Date()
+        let healthy = LiveFeed.allCases.filter { (benchedUntil[$0] ?? .distantPast) <= now }
+        let benched = LiveFeed.allCases.filter { !healthy.contains($0) }
+        return healthy + benched   // still try benched feeds last rather than give up
+    }
+    func failed(_ feed: LiveFeed, for seconds: TimeInterval) { benchedUntil[feed] = Date().addingTimeInterval(seconds) }
+    func succeeded(_ feed: LiveFeed) { benchedUntil[feed] = nil }
+}
+
+/// The latest nearby-aircraft list in the shared container, so the app and widget can reuse it.
+enum NearbyCache {
+    private struct Entry: Codable { var key: String; var time: Date; var flights: [Flight] }
+    private static var url: URL { Shared.containerURL.appendingPathComponent("nearby-cache.json") }
+
+    static func read(key: String, maxAge: TimeInterval) -> [Flight]? {
+        guard let data = try? Data(contentsOf: url),
+              let e = try? JSONDecoder().decode(Entry.self, from: data),
+              e.key == key, -e.time.timeIntervalSinceNow < maxAge else { return nil }
+        return e.flights
+    }
+
+    static func write(_ flights: [Flight], key: String) {
+        guard let data = try? JSONEncoder().encode(Entry(key: key, time: Date(), flights: flights)) else { return }
+        try? data.write(to: url, options: .atomic)
     }
 }

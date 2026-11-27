@@ -96,7 +96,7 @@ Each widget refresh fetches nearby aircraft and adds aircraft and route details 
 
 | Data | Source |
 | --- | --- |
-| Live positions, altitude, speed, heading | [adsb.lol](https://adsb.lol), community-run, ODbL-licensed ADS-B/MLAT feed |
+| Live positions, altitude, speed, heading | [adsb.fi](https://adsb.fi) open data, with [adsb.lol](https://adsb.lol) (ODbL) as an automatic fallback. Both are community-run ADS-B/MLAT feeds |
 | Routes, airlines, aircraft models | [adsbdb](https://www.adsbdb.com) |
 | Recorded flight tracks (detail window) | [OpenSky Network](https://opensky-network.org), anonymous access |
 | Airport locations (bundled) | [OurAirports](https://ourairports.com/data/), public domain |

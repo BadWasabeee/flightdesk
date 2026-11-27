@@ -115,7 +115,14 @@ struct DetailAircraftRecord: Decodable {
     let lastPosition: LastPosition?
 }
 
-private struct DetailResponse: Decodable { let ac: [DetailAircraftRecord]? }
+private struct DetailResponse: Decodable {
+    let ac: [DetailAircraftRecord]?
+    private enum CodingKeys: String, CodingKey { case ac, aircraft }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ac = c.value(.ac, nil) ?? c.value(.aircraft, nil)
+    }
+}
 
 extension AircraftReport {
     /// Builds a report from a record. Distance and bearing are computed locally from `observer`.
@@ -163,13 +170,10 @@ private extension Flight {
 }
 
 enum FlightDetailService {
-    /// The latest report for one aircraft, or nil when adsb.lol no longer has it.
+    /// The latest report for one aircraft, or nil when the live feeds no longer have it.
     /// Only the aircraft's hex is sent; the observer position is used locally.
     static func report(hex: String) async throws -> AircraftReport? {
-        guard let id = hex.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(["~"])),
-              let url = URL(string: "https://api.adsb.lol/v2/hex/\(id)") else { return nil }
-        let (data, resp) = try await FlightService.session.data(from: url)
-        if let h = resp as? HTTPURLResponse, h.statusCode != 200 { throw URLError(.badServerResponse) }
+        let data = try await LiveFeed.fetch { $0.hexURL(hex) }
         let observer = Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) }
         let records = try JSONDecoder().decode(DetailResponse.self, from: data).ac ?? []
         return records.lazy.compactMap { AircraftReport(record: $0, observer: observer) }.first
