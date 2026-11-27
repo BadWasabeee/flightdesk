@@ -146,11 +146,12 @@ final class MainWindowTests: XCTestCase {
 
     func testEmergencySquawk() {
         var f = flight("a")
-        XCTAssertNil(FlightRowText.emergency(f))
+        XCTAssertNil(f.situation)
         f.squawk = "7600"
-        XCTAssertEqual(FlightRowText.emergency(f), "Radio failure")
+        XCTAssertEqual(f.situation, .radioFailure)
+        XCTAssertEqual(FlightRowText.accessibilityLabel(f), "\(f.displayNumber), \(f.typeCode), Radio failure, squawking 7600")
         f.squawk = "1200"
-        XCTAssertNil(FlightRowText.emergency(f))
+        XCTAssertNil(f.situation)
     }
 
     func testAccessibilityTextSpellsOutUnits() {

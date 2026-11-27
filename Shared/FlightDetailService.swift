@@ -160,6 +160,7 @@ extension AircraftReport {
         }
         let code = a.squawk?.trimmingCharacters(in: .whitespaces) ?? ""
         squawk = code.isEmpty ? nil : code
+        flight.squawk = squawk
         if case .ground? = a.alt_baro { onGround = true } else { onGround = false }
         positionTime = now.addingTimeInterval(-pos.age)
         year = a.year?.value
@@ -211,8 +212,7 @@ enum FlightDetailService {
     /// widget; live positions extend it afterwards. Nil when unavailable, when OpenSky is near its
     /// limit, or when the track belongs to another leg.
     static func track(hex: String, current: GeoPoint?) async -> FlightTrack? {
-        // OpenSky keys tracks by the bare 24-bit address, without readsb's "~" marker.
-        guard let id = AircraftID.hex(hex.replacingOccurrences(of: "~", with: ""), allowNonICAO: false) else { return nil }
+        guard let id = TrackCache.openSkyID(hex) else { return nil }
         if let cached = TrackCache.track(for: id, current: current) { return cached }
         guard ApiBudget.isAvailable(.openSky),
               let url = RemoteURL.make("https://opensky-network.org/api/tracks/all", query: [("icao24", id), ("time", "0")]),
@@ -317,23 +317,14 @@ enum DetailFormat {
         return f.displayNumber
     }
 
-    /// "LAS → MKE · Southwest Airlines"; empty when nothing is known beyond the number.
+    /// "LAS → MKE · Southwest Airlines" (the diversion airport while diverting); empty when nothing
+    /// is known beyond the number.
     static func subtitle(for f: Flight?) -> String {
         guard let f else { return "" }
         var parts: [String] = []
-        if let r = f.route { parts.append("\(r.from.code) → \(r.to.code)") }
+        if let r = f.route { parts.append("\(r.from.code) → \((f.destination ?? r.to).code)") }
         if !f.airlineName.isEmpty { parts.append(f.airlineName) } else if let model = f.aircraft?.model { parts.append(model) }
         return parts.joined(separator: " · ")
-    }
-
-    /// What an emergency transponder code means, or nil for an ordinary code.
-    static func squawkAlert(_ code: String?) -> String? {
-        switch code {
-        case "7500": "Hijack"
-        case "7600": "Radio Failure"
-        case "7700": "Emergency"
-        default: nil
-        }
     }
 
     /// Arrival state shown on the route card.
@@ -426,6 +417,16 @@ enum TrackCache {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? data.write(to: dir.appendingPathComponent("\(id).json"), options: .atomic)
         prune()
+    }
+
+    /// OpenSky keys tracks by the bare 24-bit address, without readsb's "~" marker.
+    static func openSkyID(_ hex: String) -> String? {
+        AircraftID.hex(hex.replacingOccurrences(of: "~", with: ""), allowNonICAO: false)
+    }
+
+    /// The cached track for an aircraft by its feed hex, without fetching (see `track(for:current:now:)`).
+    static func track(hex: String, current: GeoPoint?, now: Date = Date()) -> FlightTrack? {
+        openSkyID(hex).flatMap { track(for: $0, current: current, now: now) }
     }
 
     /// The cached track for `id`, if it's recent and the aircraft could plausibly have flown from

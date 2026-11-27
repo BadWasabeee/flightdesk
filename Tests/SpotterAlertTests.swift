@@ -23,6 +23,7 @@ final class SpotterAlertTests: XCTestCase {
     private func settings(_ change: (inout SpotterSettings) -> Void) -> SpotterSettings {
         var s = SpotterSettings()
         s.emergencies = false
+        s.diversions = false
         change(&s)
         return s
     }

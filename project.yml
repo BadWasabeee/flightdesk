@@ -27,7 +27,11 @@ targets:
         buildPhase: resources
       - path: Config/Privacy/App/PrivacyInfo.xcprivacy
         buildPhase: resources
-      - Shared
+      - path: Shared
+        excludes: ["Resources/**"]
+      # Airport table for route checks, read lazily by AirportDB.
+      - path: Shared/Resources/airports.csv
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).flightdesk
@@ -47,7 +51,11 @@ targets:
     platform: macOS
     sources:
       - Widget
-      - Shared
+      - path: Shared
+        excludes: ["Resources/**"]
+      # Airport table for route checks, read lazily by AirportDB.
+      - path: Shared/Resources/airports.csv
+        buildPhase: resources
       - path: Config/Privacy/Widget/PrivacyInfo.xcprivacy
         buildPhase: resources
     settings:
@@ -61,7 +69,13 @@ targets:
   FlightDeskTests:
     type: bundle.unit-test
     platform: macOS
-    sources: [Tests, Shared]
+    sources:
+      - Tests
+      - path: Shared
+        excludes: ["Resources/**"]
+      # Airport table for route checks, read lazily by AirportDB.
+      - path: Shared/Resources/airports.csv
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).flightdesk.tests

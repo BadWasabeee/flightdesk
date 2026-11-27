@@ -22,7 +22,8 @@ final class FlightDetailModel: ObservableObject {
     @Published private(set) var trail: [TimedPoint] = [] { didSet { updatePaths() } }
     /// The flight's recorded track from OpenSky, when available.
     @Published private(set) var history: [TimedPoint] = [] { didSet { updatePaths() } }
-    /// Departure airport read from the start of the recorded track.
+    /// Departure airport read from the start of the recorded track (or from a route correction
+    /// stored after an earlier look at it).
     @Published private(set) var departedFrom: Airport?
     /// When the recorded track left `departedFrom`.
     @Published private(set) var departureTime: Date?
@@ -30,6 +31,8 @@ final class FlightDetailModel: ObservableObject {
     @Published private(set) var routeNote: String?
     /// True when the destination is a guess from the aircraft's descent.
     @Published private(set) var destinationEstimated = false
+    /// True when the live trail shows a holding pattern.
+    @Published private(set) var isHolding = false
     /// Other aircraft within the user's search radius.
     @Published private(set) var nearby: [Flight] = []
     /// The airframe photo, while loading and once found.
@@ -170,43 +173,25 @@ final class FlightDetailModel: ObservableObject {
         guard let track = await FlightDetailService.track(hex: hex, current: flight?.geoPoint),
               !Task.isCancelled else { return }
         history = track.points
-        // A track that starts low began at the departure airport.
-        if let start = track.points.first, (track.startAltitudeFt ?? .infinity) < 3_000 {
-            departedFrom = AirportDB.nearest(to: start.point, within: 8)
-            departureTime = departedFrom == nil ? nil : start.time
+        if let d = RouteResolver.departure(of: track) {
+            departedFrom = d.airport
+            departureTime = d.time
         }
         if var f = flight {
             resolveRoute(&f)
             flight = f
+            // Share the verdict so the list, panel, widget and alerts show the same route.
+            await FlightService.learnRoute(from: track, for: f, scheduled: candidateRoute)
         }
     }
 
-    /// Picks the route to show: the scheduled route when it fits the live position (and the
-    /// recorded departure airport), else what the recorded track and descent imply.
+    /// Picks the route to show (see `RouteResolver`, which the list and widget share).
     private func resolveRoute(_ f: inout Flight) {
-        routeNote = nil
-        destinationEstimated = false
-        let scheduled = candidateRoute
-        if let r = scheduled, FlightService.isPlausible(r, for: f), departedFrom == nil || departedFrom?.code == r.from.code {
-            f.route = r
-            return
-        }
-        guard let origin = departedFrom else {
-            f.route = nil
-            return
-        }
-        if let r = scheduled, r.from.code == origin.code {
-            f.route = r
-            routeNote = "Origin confirmed by the recorded track."
-        } else if let dest = AirportDB.likelyDestination(for: f), dest.code != origin.code {
-            f.route = RouteInfo(airline: scheduled?.airline, flightNo: scheduled?.flightNo,
-                                airlineCode: scheduled?.airlineCode, from: origin, to: dest)
-            destinationEstimated = true
-            routeNote = "No scheduled route. Origin from the recorded track; destination estimated from the descent."
-        } else {
-            f.route = nil
-            routeNote = "No scheduled route. Origin from the recorded track."
-        }
+        let r = RouteResolver.resolve(scheduled: candidateRoute, flight: f, departedFrom: departedFrom)
+        f.route = r.route
+        f.pathSituation = r.situation
+        routeNote = r.note
+        destinationEstimated = r.destinationEstimated
     }
 
     private func poll() async {
@@ -235,6 +220,8 @@ final class FlightDetailModel: ObservableObject {
             // Keep the snapshot's route if a lookup fails for the same callsign.
             if lookup.route != nil || previous != f.callsign { candidateRoute = lookup.route }
             aircraftInfo = lookup.aircraft ?? aircraftInfo
+            if departedFrom == nil { departedFrom = await FlightService.departure(for: f) }
+            guard !Task.isCancelled else { return }
         }
         f.aircraft = AircraftInfo(model: aircraftInfo?.model ?? f.aircraft?.model,
                                   owner: aircraftInfo?.owner ?? f.aircraft?.owner)
@@ -244,6 +231,7 @@ final class FlightDetailModel: ObservableObject {
         let moved = newTrail.last.map { FlightService.gcDistance($0.point.lat, $0.point.lon, f.lat, f.lon) >= 0.05 } ?? true
         if moved { newTrail.append(TimedPoint(point: f.geoPoint, time: report.positionTime)) }
         if newTrail != trail { trail = newTrail }
+        isHolding = !report.onGround && FlightSituation.isHolding(trail: newTrail, now: report.positionTime)
         flight = f
         squawk = report.squawk
         onGround = report.onGround
@@ -264,14 +252,20 @@ final class FlightDetailModel: ObservableObject {
     var title: String { Self.title(for: flight, hex: hex) }
     var subtitle: String { Self.subtitle(for: flight) }
 
+    /// What's unusual: an emergency squawk, a diversion or return, or a holding pattern.
+    var situation: FlightSituation? {
+        FlightSituation.squawk(squawk) ?? flight?.pathSituation ?? (isHolding && isLive ? .holding : nil)
+    }
+
     var flownNM: Double? {
         guard let f = flight, let r = f.route else { return nil }
         return FlightService.gcDistance(r.from.lat, r.from.lon, f.lat, f.lon)
     }
 
+    /// Distance to where the aircraft is going (the diversion or return airport when there is one).
     var remainingNM: Double? {
-        guard let f = flight, let r = f.route else { return nil }
-        return FlightService.gcDistance(f.lat, f.lon, r.to.lat, r.to.lon)
+        guard let f = flight, let to = f.destination else { return nil }
+        return FlightService.gcDistance(f.lat, f.lon, to.lat, to.lon)
     }
 
     /// Arrival state while live: landed, landing, or an estimate at the current ground speed.
@@ -283,10 +277,12 @@ final class FlightDetailModel: ObservableObject {
 
     private func updatePaths() {
         let r = flight?.route
-        let key = r.map { "\($0.from.code)>\($0.to.code)" } ?? ""
+        // During a diversion the route ahead leads to the diversion airport.
+        let to = flight?.destination
+        let key = r.map { "\($0.from.code)>\(to?.code ?? $0.to.code)" } ?? ""
         if key != lastPlannedKey {
             lastPlannedKey = key
-            plannedPath = r.map { FlightMath.removingRepeats(FlightMath.greatCircle(from: $0.from.geoPoint, to: $0.to.geoPoint)) } ?? []
+            plannedPath = r.map { FlightMath.removingRepeats(FlightMath.greatCircle(from: $0.from.geoPoint, to: (to ?? $0.to).geoPoint)) } ?? []
         }
         // Merge by time so the line always runs through the aircraft's current position.
         let end = history.last?.time ?? .distantPast
@@ -300,7 +296,9 @@ final class FlightDetailModel: ObservableObject {
         flownLines = RouteGeometry.antimeridianSafe(flownPath)
 
         // The flown part of the route is shown by the track, so only what's ahead is dashed.
-        if let f = flight, r != nil {
+        if let f = flight, case .returning(let origin)? = f.pathSituation {
+            remainingLines = RouteGeometry.antimeridianSafe(FlightMath.removingRepeats(FlightMath.greatCircle(from: f.geoPoint, to: origin.geoPoint)))
+        } else if let f = flight, r != nil {
             remainingLines = RouteGeometry.antimeridianSafe(RouteGeometry.split(plannedPath, at: f.geoPoint).remaining)
         } else {
             remainingLines = []
@@ -540,9 +538,14 @@ private struct FlightDetailMap: View {
                 MapPolyline(coordinates: line.map(\.coordinate))
                     .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
             }
-            if let r = model.flight?.route {
+            if let f = model.flight, let r = f.route {
                 airport(r.from, role: "Departure")
-                airport(r.to, role: model.destinationEstimated ? "Estimated destination" : "Destination")
+                if let s = f.pathSituation, let to = s.newDestination {
+                    airport(r.to, role: "Scheduled destination", struck: true)
+                    if to.code != r.from.code { airport(to, role: s.headline) }
+                } else {
+                    airport(r.to, role: model.destinationEstimated ? "Estimated destination" : "Destination")
+                }
             } else if let origin = model.departedFrom {
                 airport(origin, role: "Departure")
             }
@@ -621,7 +624,8 @@ private struct FlightDetailMap: View {
         if next != labelled { labelled = next }
     }
 
-    private func airport(_ a: Airport, role: String) -> some MapContent {
+    /// An airport marker; `struck` marks a scheduled destination the flight is no longer heading for.
+    private func airport(_ a: Airport, role: String, struck: Bool = false) -> some MapContent {
         Annotation("", coordinate: a.geoPoint.coordinate, anchor: .center) {
             VStack(spacing: 2) {
                 Circle()
@@ -630,10 +634,12 @@ private struct FlightDetailMap: View {
                     .overlay(Circle().stroke(Color.primary, lineWidth: 2.5))
                 Text(a.code)
                     .font(.system(size: 11, weight: .bold))
+                    .strikethrough(struck)
                     .foregroundStyle(.primary)
                     .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
                     .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
             }
+            .opacity(struck ? 0.55 : 1)
             // Keep the dot (not the label) on the coordinate.
             .offset(y: 8)
             .accessibilityElement(children: .ignore)
@@ -716,7 +722,8 @@ private struct FlightDetailSidebar: View {
                     header(f)
                     photoSection
                     if let r = f.route {
-                        routeCard(f, from: r.from, to: r.to)
+                        routeCard(f, from: r.from, to: f.destination ?? r.to,
+                                  replaced: f.pathSituation?.newDestination == nil ? nil : r.to)
                     } else if let origin = model.departedFrom {
                         routeCard(f, from: origin, to: nil)
                     } else if f.looksLikeAirline {
@@ -767,8 +774,10 @@ private struct FlightDetailSidebar: View {
             .accessibilityAddTraits(.isHeader)
             HStack(spacing: 6) {
                 StatusPill(model: model)
-                if let alert = DetailFormat.squawkAlert(model.squawk) {
-                    Pill(text: "\(alert) · \(model.squawk ?? "")", symbol: "exclamationmark.triangle.fill", tint: .red)
+                if let s = model.situation {
+                    Pill(text: s.title, symbol: s.symbol, tint: s.tint)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(s.spoken)
                 }
             }
         }
@@ -842,13 +851,16 @@ private struct FlightDetailSidebar: View {
 
     // MARK: Route
 
-    private func routeCard(_ f: Flight, from: Airport, to: Airport?) -> some View {
+    /// `replaced`: the scheduled destination when the flight is diverting or returning instead (shown struck through).
+    private func routeCard(_ f: Flight, from: Airport, to: Airport?, replaced: Airport? = nil) -> some View {
         DetailCard("Route", footer: model.routeNote) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline) {
                     endpoint(from.code, from.city, role: "From", alignment: .leading)
                     Spacer(minLength: 8)
-                    if let to {
+                    if let to, let replaced, let s = f.pathSituation {
+                        changedEndpoint(to, replacing: replaced, situation: s)
+                    } else if let to {
                         endpoint(to.code, model.destinationEstimated ? "\(to.city) (est.)" : to.city,
                                  role: model.destinationEstimated ? "To, estimated" : "To", alignment: .trailing)
                     } else {
@@ -899,6 +911,25 @@ private struct FlightDetailSidebar: View {
         }
     }
 
+    /// "~~DEN~~ MKE": the new destination in the situation's colour beside the struck-through scheduled one.
+    private func changedEndpoint(_ to: Airport, replacing scheduled: Airport, situation s: FlightSituation) -> some View {
+        VStack(alignment: .trailing, spacing: 1) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(scheduled.code)
+                    .font(.system(size: 17, weight: .semibold))
+                    .strikethrough()
+                    .foregroundStyle(.secondary)
+                Text(to.code)
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundStyle(s.tint)
+                    .textSelection(.enabled)
+            }
+            Text(to.city).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(s.spoken). To: \(to.code), \(to.city)")
+    }
+
     private func endpoint(_ code: String, _ city: String, role: String, alignment: HorizontalAlignment) -> some View {
         VStack(alignment: alignment, spacing: 1) {
             Text(code).font(.system(size: 28, weight: .bold)).textSelection(.enabled)
@@ -927,7 +958,7 @@ private struct FlightDetailSidebar: View {
                 Tile(label: "Ground Speed", value: o.speed(f.speed))
                 if let track = f.track { Tile(label: "Track", value: DetailFormat.heading(track)) }
                 if let squawk = model.squawk {
-                    Tile(label: "Squawk", value: squawk, tint: DetailFormat.squawkAlert(squawk) == nil ? nil : .red)
+                    Tile(label: "Squawk", value: squawk, tint: FlightSituation.squawk(squawk)?.tint)
                 }
             }
             .opacity(stale ? 0.6 : 1)

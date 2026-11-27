@@ -179,11 +179,11 @@ final class DetailExtrasTests: XCTestCase {
     }
 
     func testSquawkAlerts() {
-        XCTAssertEqual(DetailFormat.squawkAlert("7700"), "Emergency")
-        XCTAssertEqual(DetailFormat.squawkAlert("7600"), "Radio Failure")
-        XCTAssertEqual(DetailFormat.squawkAlert("7500"), "Hijack")
-        XCTAssertNil(DetailFormat.squawkAlert("1200"))
-        XCTAssertNil(DetailFormat.squawkAlert(nil))
+        XCTAssertEqual(FlightSituation.squawk("7700"), .emergency(squawk: "7700"))
+        XCTAssertEqual(FlightSituation.squawk("7600"), .radioFailure)
+        XCTAssertEqual(FlightSituation.squawk("7500"), .hijack)
+        XCTAssertNil(FlightSituation.squawk("1200"))
+        XCTAssertNil(FlightSituation.squawk(nil))
     }
 
     func testArrivalStates() {

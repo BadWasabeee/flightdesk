@@ -196,8 +196,22 @@ final class RadarModel: ObservableObject {
             let track = await FlightDetailService.track(hex: id, current: f.geoPoint)
             guard let self, !Task.isCancelled else { return }
             self.trackTask = nil
-            if let track, self.selection == id { self.tracks[id] = track.points.map(\.point) }
+            guard let track, self.selection == id else { return }
+            self.tracks[id] = track.points.map(\.point)
+            // The track's departure airport can correct the route: here, and (shared) everywhere else.
+            let scheduled = await LookupCache.shared.cachedRoute(f.callsign)
+            await FlightService.learnRoute(from: track, for: f, scheduled: scheduled)
+            self.applyRoute(await FlightService.verifiedRoute(scheduled, for: f), to: f)
         }
+    }
+
+    /// Replaces the remembered route (and any diversion) for `f` with a fresh resolution.
+    private func applyRoute(_ r: RouteResolution, to f: Flight) {
+        var k = known[f.id] ?? f
+        k.route = r.route
+        k.pathSituation = r.situation
+        known[f.id] = k
+        publish()
     }
 
     /// Looks up route and aircraft details for a newly selected aircraft the store hasn't enriched.
@@ -206,8 +220,12 @@ final class RadarModel: ObservableObject {
         lookedUp.insert(f.id)
         Task {
             let found = await FlightDetailService.enrichment(for: f)
+            let resolved = await FlightService.verifiedRoute(found.route, for: f)
             var k = known[f.id] ?? f
-            k.route = k.route ?? found.route
+            if k.route == nil {
+                k.route = resolved.route
+                k.pathSituation = resolved.situation
+            }
             k.aircraft = k.aircraft ?? found.aircraft
             known[f.id] = k
             publish()
@@ -239,8 +257,14 @@ final class RadarModel: ObservableObject {
         detailFlight = snap
         detail = model
         detailSubscription = model.$flight.dropFirst().sink { [weak self] f in
-            self?.detailFlight = f
-            if let self, self.selection == id, !self.flights.contains(where: { $0.id == id }) { self.selected = f }
+            guard let self else { return }
+            self.detailFlight = f
+            // The list and map show the route (and diversion) the detail resolved.
+            if let f, f.route != self.known[id]?.route || f.pathSituation != self.known[id]?.pathSituation {
+                self.known[id] = f
+                self.publish()
+            }
+            if self.selection == id, !self.flights.contains(where: { $0.id == id }) { self.selected = f }
         }
         if selection != id { selection = id }
         closeSettings()

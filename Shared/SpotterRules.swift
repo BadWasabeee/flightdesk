@@ -127,7 +127,7 @@ struct PlaneAlertDB: Equatable, Sendable {
 
 /// The rule that produced an alert, in priority order (earlier wins when one aircraft matches several).
 enum SpotterRule: String, Codable, CaseIterable, Sendable {
-    case emergency, watchlist, interesting, heavy, proximity
+    case emergency, diversion, watchlist, interesting, heavy, proximity
 }
 
 /// A user watchlist entry.
@@ -247,6 +247,8 @@ struct QuietHours: Codable, Equatable {
 /// Spotter alert preferences, stored as JSON under `SpotterSettings.key` in `Shared.defaults`.
 struct SpotterSettings: Codable, Equatable {
     var emergencies = true
+    /// Diversions and returns to the departure airport.
+    var diversions = true
     var interesting = false
     /// plane-alert-db `#CMPG` groups to alert on (e.g. "Mil").
     var interestingGroups: Set<String> = ["Mil"]
@@ -268,6 +270,7 @@ struct SpotterSettings: Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = SpotterSettings()
         emergencies = c.value(.emergencies, d.emergencies)
+        diversions = c.value(.diversions, d.diversions)
         interesting = c.value(.interesting, d.interesting)
         interestingGroups = c.value(.interestingGroups, d.interestingGroups)
         interestingCategories = c.value(.interestingCategories, d.interestingCategories)
@@ -285,6 +288,7 @@ struct SpotterSettings: Codable, Equatable {
     var activeRules: Set<SpotterRule> {
         var r = Set<SpotterRule>()
         if emergencies { r.insert(.emergency) }
+        if diversions { r.insert(.diversion) }
         if interesting, !(interestingGroups.isEmpty && interestingCategories.isEmpty) { r.insert(.interesting) }
         if watchlistEnabled, !watchlist.isEmpty { r.insert(.watchlist) }
         if heavies { r.insert(.heavy) }
@@ -315,8 +319,6 @@ struct SpotterAlert: Equatable {
 }
 
 enum SpotterEngine {
-    static let emergencySquawks: [String: String] = ["7500": "Hijack", "7600": "Radio failure", "7700": "Emergency"]
-
     /// All matches for every flight, grouped per aircraft in `SpotterRule` priority order.
     /// `squawk` supplies each aircraft's transponder code when the feed provides one.
     static func evaluate(_ flights: [Flight], settings: SpotterSettings, db: PlaneAlertDB?,
@@ -334,7 +336,9 @@ enum SpotterEngine {
             let label: String?
             switch rule {
             case .emergency:
-                label = squawk.flatMap { code in emergencySquawks[code].map { "\($0) · squawk \(code)" } }
+                label = squawk.flatMap { code in FlightSituation.squawk(code).map { "\($0.headline) · squawk \(code)" } }
+            case .diversion:
+                label = f.pathSituation.flatMap { $0.newDestination == nil ? nil : $0.headline }
             case .watchlist:
                 label = settings.watchlist.first { $0.matches(f) }.map { "Watchlist · \($0.value)" }
             case .interesting:
@@ -440,12 +444,15 @@ extension SpotterAlert {
     /// e.g. "Boeing C-17A Globemaster III overhead".
     var aircraftHeadline: String { "\(aircraftName) \(flight.distance <= 3 ? "overhead" : "nearby")" }
 
-    /// What the notification leads with: the aircraft, except for emergencies where the squawk comes first.
-    /// e.g. "Boeing C-17A Globemaster III overhead", "Emergency · squawk 7700".
-    var title: String { rule == .emergency ? label : aircraftHeadline }
+    /// Emergencies and diversions lead with what's happening rather than the aircraft.
+    private var leadsWithLabel: Bool { rule == .emergency || rule == .diversion }
 
-    /// Why it alerted, e.g. "Military", "Watchlist · B748"; for emergencies, the aircraft.
-    var subtitle: String { rule == .emergency ? aircraftHeadline : label }
+    /// What the notification leads with: the aircraft, except for emergencies and diversions.
+    /// e.g. "Boeing C-17A Globemaster III overhead", "Emergency · squawk 7700", "Diverting to Milwaukee (MKE)".
+    var title: String { leadsWithLabel ? label : aircraftHeadline }
+
+    /// Why it alerted, e.g. "Military", "Watchlist · B748"; for emergencies and diversions, the aircraft.
+    var subtitle: String { leadsWithLabel ? aircraftHeadline : label }
 
     /// e.g. "RCH123 · 07-7183 · US Air Force\n24,000 ft ▲ · 4.2 nm NE".
     func body(display: DisplayOptions) -> String {
@@ -465,13 +472,16 @@ extension SpotterAlert {
 // MARK: - Menu-bar readout
 
 enum MenuBarReadout {
-    /// Nearest airline flight as "DL1342 · 4.0 nm", or nil when none is around.
-    /// `known` (e.g. the enriched panel list) supplies a flight number when it has one for the same aircraft.
+    /// Nearest airline flight as "DL1342 · 4.0 nm" (plus "· DIVERT MKE" when something is
+    /// unusual), or nil when none is around. `known` (e.g. the enriched panel list) supplies a
+    /// flight number and route situation when it has them for the same aircraft.
     static func text(flights: [Flight], known: [Flight] = [], display: DisplayOptions) -> String? {
         guard let f = flights.filter(\.looksLikeAirline).min(by: { $0.distance < $1.distance }) else { return nil }
         var d = display
         d.style = .standard
-        let number = known.first { $0.id == f.id }?.displayNumber ?? f.displayNumber
-        return "\(number) · \(d.distance(f.distance))"
+        let k = known.first { $0.id == f.id }
+        let number = k?.displayNumber ?? f.displayNumber
+        let situation = (FlightSituation.squawk(f.squawk) ?? k?.pathSituation).map { " · \($0.tag)" } ?? ""
+        return "\(number) · \(d.distance(f.distance))\(situation)"
     }
 }

@@ -98,6 +98,10 @@ struct SpotterSettingsView: View {
                 Text("Emergency squawks")
                 Text("7500 hijack, 7600 radio failure, 7700 general emergency")
             }
+            Toggle(isOn: s.diversions) {
+                Text("Diversions")
+                Text("Airliners diverting to another airport or returning to where they departed")
+            }
             Toggle(isOn: s.heavies) {
                 Text("Wide-bodies")
                 Text("A380, 747, 777, 787, A350 and other heavies")

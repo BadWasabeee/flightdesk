@@ -52,14 +52,18 @@ enum FlightListFilter {
         }
     }
 
-    /// `live` with route and aircraft details filled in from `known` (earlier lookups, by hex)
-    /// where the live record has none. A known route is only reused while it still fits the
-    /// aircraft's live position and heading.
+    /// `live` with route and aircraft details filled in from `known` (earlier resolved lookups, by
+    /// hex) where the live record has none. A known route is reused while it still fits the
+    /// aircraft's live position and heading, or with its diversion or return (which can take the
+    /// aircraft off the scheduled route).
     static func merging(_ live: [Flight], known: [String: Flight]) -> [Flight] {
         live.map { flight in
             guard let k = known[flight.id] else { return flight }
             var f = flight
-            if f.route == nil, let route = k.route, FlightService.isPlausible(route, for: f) { f.route = route }
+            if f.route == nil, let route = k.route, k.pathSituation != nil || FlightService.isPlausible(route, for: f) {
+                f.route = route
+                f.pathSituation = k.pathSituation
+            }
             if f.aircraft == nil { f.aircraft = k.aircraft }
             return f
         }
@@ -86,10 +90,11 @@ enum ClimbState: Equatable {
 
 /// Text for one aircraft in the main window's list, inspector and VoiceOver.
 enum FlightRowText {
-    /// Second line of a list row: the route ("ORD → DEN") when known, otherwise the airline or
-    /// owner, then the ICAO type ("ORD → DEN · B738", "Southwest Airlines · B737").
+    /// Second line of a list row: the route ("ORD → DEN", or "ORD → MKE" while diverting there)
+    /// when known, otherwise the airline or owner, then the ICAO type ("ORD → DEN · B738",
+    /// "Southwest Airlines · B737").
     static func subtitle(_ f: Flight) -> String {
-        let lead = f.route.map { "\($0.from.code) → \($0.to.code)" } ?? f.airlineName
+        let lead = f.route.map { "\($0.from.code) → \(f.destination?.code ?? $0.to.code)" } ?? f.airlineName
         return [lead, f.typeCode].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
@@ -98,13 +103,6 @@ enum FlightRowText {
         if !f.airlineName.isEmpty { return f.airlineName }
         return f.looksLikeAirline ? f.callsign : "Private / general aviation"
     }
-
-    /// Emergency meaning of the squawk ("Emergency", "Radio failure", "Hijack"), if any.
-    static func emergency(_ f: Flight) -> String? {
-        f.squawk.flatMap { emergencySquawks[$0] }
-    }
-
-    private static let emergencySquawks = ["7500": "Hijack", "7600": "Radio failure", "7700": "Emergency"]
 
     /// Vertical speed for the inspector: "+1,800 ft/min" / "−4.2 m/s", or "Level".
     static func verticalSpeed(_ rate: Double, units: UnitSystem) -> String {
@@ -120,7 +118,7 @@ enum FlightRowText {
         if let r = f.route { parts.append("\(r.from.code) to \(r.to.code)") }
         if !f.airlineName.isEmpty { parts.append(f.airlineName) }
         if let model = f.aircraft?.model, !model.isEmpty { parts.append(model) } else if !f.typeCode.isEmpty { parts.append(f.typeCode) }
-        if let e = emergency(f) { parts.append("squawking \(e)") }
+        if let s = f.situation { parts.append(s.spoken) }
         return parts.joined(separator: ", ")
     }
 

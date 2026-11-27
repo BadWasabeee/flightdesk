@@ -209,15 +209,19 @@ struct Flight: Identifiable, Equatable, Codable {
     var aircraft: AircraftInfo?
     /// Transponder code, when the feed reports one (7500/7600/7700 are emergencies).
     var squawk: String? = nil
+    /// A diversion or return worked out with the route (see `RouteResolver`); squawk emergencies
+    /// come from `squawk` (see `situation`). Absent in entries written by older versions.
+    var pathSituation: FlightSituation? = nil
 
     var airlineName: String { route?.airline ?? aircraft?.owner ?? "" }
     var airlineCode: String? { route?.airlineCode }
 
-    /// How far along its route the aircraft is (0 = origin, 1 = destination), from its live position.
+    /// How far along its route the aircraft is (0 = origin, 1 = destination, or the diversion
+    /// airport), from its live position. Nil while returning to the origin.
     var progress: Double? {
-        guard let r = route else { return nil }
+        guard let r = route, let to = destination, to.code != r.from.code else { return nil }
         let flown = FlightService.gcDistance(r.from.lat, r.from.lon, lat, lon)
-        let left = FlightService.gcDistance(lat, lon, r.to.lat, r.to.lon)
+        let left = FlightService.gcDistance(lat, lon, to.lat, to.lon)
         guard flown + left > 1 else { return nil }
         return min(1, max(0, flown / (flown + left)))
     }
@@ -343,8 +347,9 @@ enum FlightService {
     /// `Net.session`, so it carries the same User-Agent, timeouts and request accounting.
     static let session = Net.session()
 
-    /// Live aircraft around a point (adsb.lol, real-time ADS-B/MLAT), enriched with
-    /// aircraft model and a route that has been checked against the live position.
+    /// Live aircraft around a point (adsb.lol, real-time ADS-B/MLAT), enriched with aircraft model
+    /// and a route checked against the live position, any cached recorded track and any stored
+    /// route correction (see `verifiedRoute`), plus any diversion or return.
     static func nearby(lat: Double, lon: Double, radiusNM: Int, includeGA: Bool,
                        limit: Int = 12, enrich: Int = 10) async throws -> [Flight] {
         var list = try await allNearby(lat: lat, lon: lon, radiusNM: radiusNM)
@@ -352,16 +357,20 @@ enum FlightService {
             .sorted { $0.distance < $1.distance }
         list = Array(list.prefix(limit))
 
-        await withTaskGroup(of: (Int, RouteInfo?, AircraftInfo?).self) { group in
+        await withTaskGroup(of: (Int, RouteResolution, AircraftInfo?).self) { group in
             for i in list.indices.prefix(enrich) {
                 let f = list[i]
                 group.addTask {
-                    let route = f.looksLikeAirline ? await LookupCache.shared.route(f.callsign) : nil
+                    let scheduled = f.looksLikeAirline ? await LookupCache.shared.route(f.callsign) : nil
                     let aircraft = await LookupCache.shared.aircraft(f.id)
-                    return (i, route.flatMap { isPlausible($0, for: f) ? $0 : nil }, aircraft)
+                    return (i, await verifiedRoute(scheduled, for: f), aircraft)
                 }
             }
-            for await (i, r, a) in group { list[i].route = r; list[i].aircraft = a }
+            for await (i, r, a) in group {
+                list[i].route = r.route
+                list[i].pathSituation = r.situation
+                list[i].aircraft = a
+            }
         }
         await LookupCache.shared.save()
         await AirlineLogos.prefetch(Set(list.compactMap(\.logoKey)))
@@ -405,6 +414,9 @@ enum FlightService {
 
     // MARK: Route plausibility — reject stale/reused-callsign routes using the live position.
 
+    /// Altitude from which an aircraft counts as cruising for the tighter heading check.
+    static let cruiseAltitudeFt = 25_000
+
     static func isPlausible(_ r: RouteInfo, for f: Flight) -> Bool {
         let total = gcDistance(r.from.lat, r.from.lon, r.to.lat, r.to.lon)
         let fromOrigin = gcDistance(r.from.lat, r.from.lon, f.lat, f.lon)
@@ -414,13 +426,18 @@ enum FlightService {
         // Must be roughly between the two airports, close to the great-circle path.
         let detour = fromOrigin + toDest - total
         guard detour < max(80, total * 0.15) else { return false }
-        // And heading generally toward the destination.
+        // And heading toward the destination: closely in cruise far from both airports (an
+        // airliner there flies almost straight at it), loosely otherwise (climb-out, vectors).
         if let track = f.track {
-            let want = initialBearing(f.lat, f.lon, r.to.lat, r.to.lon)
-            let diff = abs((track - want + 540).truncatingRemainder(dividingBy: 360) - 180)
-            if diff > 100 { return false }
+            let cruising = f.altitude >= cruiseAltitudeFt && fromOrigin > 150 && toDest > 150
+            if angleBetween(track, initialBearing(f.lat, f.lon, r.to.lat, r.to.lon)) > (cruising ? 60 : 100) { return false }
         }
         return true
+    }
+
+    /// The smaller angle between two directions in degrees (0…180).
+    static func angleBetween(_ a: Double, _ b: Double) -> Double {
+        abs((a - b + 540).truncatingRemainder(dividingBy: 360) - 180)
     }
 
     private static func rad(_ d: Double) -> Double { d * .pi / 180 }
@@ -499,9 +516,13 @@ actor LookupCache {
     struct Store: Codable {
         var routes: [String: Entry<RouteInfo>] = [:]
         var aircraft: [String: Entry<AircraftInfo>] = [:]
+        /// Route verdicts from recorded tracks, by callsign.
+        var corrections: [String: RouteCorrection] = [:]
     }
 
     private var store: Store?
+    /// Modification date of the file when last read, so the other process's writes are picked up.
+    private var loadedStamp: Date?
     private var dirty = false
     private let url: URL
 
@@ -509,10 +530,18 @@ actor LookupCache {
         self.url = url
     }
 
+    private var fileStamp: Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
+    /// Reads the file on first use, and again (merged with unsaved entries) whenever the other
+    /// process has written it since, so a correction made in the app reaches a running widget.
     private func load() {
-        if store == nil {
-            store = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Store.self, from: $0) } ?? Store()
-        }
+        let stamp = fileStamp
+        guard store == nil || stamp != loadedStamp else { return }
+        let disk = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Store.self, from: $0) } ?? Store()
+        store = store.map { Self.merge($0, disk) } ?? disk
+        loadedStamp = stamp
     }
 
     func route(_ callsign: String) async -> RouteInfo? {
@@ -524,11 +553,39 @@ actor LookupCache {
         return v
     }
 
+    /// The cached route for this callsign, if one is cached and current. Never fetches.
+    func cachedRoute(_ callsign: String) -> RouteInfo? {
+        guard let callsign = AircraftID.callsign(callsign) else { return nil }
+        load()
+        guard let e = store?.routes[callsign], Date().timeIntervalSince(e.at) < 6 * 3600 else { return nil }
+        return e.value
+    }
+
     /// Stores a route answer (nil = "no route") to be written on the next `save()`.
     func record(route: RouteInfo?, for callsign: String, at date: Date = Date()) {
         load()
         store?.routes[callsign] = Entry(value: route, at: date)
         dirty = true
+    }
+
+    /// The stored route correction for this callsign, if it's about this aircraft and still current.
+    func correction(callsign: String, hex: String, now: Date = Date()) -> RouteCorrection? {
+        guard let callsign = AircraftID.callsign(callsign) else { return nil }
+        load()
+        return store?.corrections[callsign].flatMap { $0.applies(to: hex, now: now) ? $0 : nil }
+    }
+
+    /// Stores a route correction to be written on the next `save()`. Returns false when the same
+    /// verdict was already stored.
+    @discardableResult
+    func record(correction: RouteCorrection, for callsign: String) -> Bool {
+        guard let callsign = AircraftID.callsign(callsign) else { return false }
+        load()
+        if let old = store?.corrections[callsign], old.applies(to: correction.hex, now: correction.at),
+           old.origin.code == correction.origin.code { return false }
+        store?.corrections[callsign] = correction
+        dirty = true
+        return true
     }
 
     func aircraft(_ hex: String) async -> AircraftInfo? {
@@ -551,6 +608,7 @@ actor LookupCache {
             return try? JSONEncoder().encode(merged)
         }
         store = merged
+        loadedStamp = fileStamp
         dirty = false
     }
 
@@ -558,17 +616,27 @@ actor LookupCache {
     static func merge(_ a: Store, _ b: Store) -> Store {
         func newer<T>(_ x: Entry<T>, _ y: Entry<T>) -> Entry<T> { x.at >= y.at ? x : y }
         return Store(routes: a.routes.merging(b.routes, uniquingKeysWith: newer),
-                     aircraft: a.aircraft.merging(b.aircraft, uniquingKeysWith: newer))
+                     aircraft: a.aircraft.merging(b.aircraft, uniquingKeysWith: newer),
+                     corrections: a.corrections.merging(b.corrections) { x, y in x.at >= y.at ? x : y })
     }
 
-    /// Keeps the most recent entries once a table grows past its limit.
-    static func pruned(_ s: Store) -> Store {
+    /// Keeps the most recent entries once a table grows past its limit, and drops expired corrections.
+    static func pruned(_ s: Store, now: Date = Date()) -> Store {
         func newest<T>(_ d: [String: Entry<T>], over limit: Int, keep: Int) -> [String: Entry<T>] {
             guard d.count > limit else { return d }
             return Dictionary(uniqueKeysWithValues: d.sorted { $0.value.at > $1.value.at }.prefix(keep).map { ($0.key, $0.value) })
         }
         return Store(routes: newest(s.routes, over: 1500, keep: 1000),
-                     aircraft: newest(s.aircraft, over: 3000, keep: 2000))
+                     aircraft: newest(s.aircraft, over: 3000, keep: 2000),
+                     corrections: s.corrections.filter { now.timeIntervalSince($0.value.at) < RouteCorrection.lifetime })
+    }
+}
+
+extension LookupCache.Store {
+    /// Missing tables (files written by older versions) decode as empty, keeping the rest.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(routes: c.value(.routes, [:]), aircraft: c.value(.aircraft, [:]), corrections: c.value(.corrections, [:]))
     }
 }
 

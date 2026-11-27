@@ -199,15 +199,17 @@ enum BoardFormat {
         return String(format: "%03d°", Int(deg.rounded()) % 360)
     }
 
-    /// "SEA › JFK" for a list row.
+    /// "SEA›JFK" for a list row; "ORD›MKE" while diverting to MKE, "RTN›ORD" while returning.
     static func route(_ f: Flight) -> String {
-        f.route.map { "\($0.from.code)›\($0.to.code)" } ?? "—"
+        guard let r = f.route else { return "—" }
+        if case .returning(let origin)? = f.pathSituation { return "RTN›\(origin.code)" }
+        return "\(r.from.code)›\((f.destination ?? r.to).code)"
     }
 
-    /// Distance still to fly to the destination, from the live position.
+    /// Distance still to fly to where the aircraft is going, from the live position.
     static func toGo(_ f: Flight) -> Double? {
-        guard let r = f.route else { return nil }
-        return FlightService.gcDistance(f.lat, f.lon, r.to.lat, r.to.lon)
+        guard f.route != nil, let to = f.destination else { return nil }
+        return FlightService.gcDistance(f.lat, f.lon, to.lat, to.lon)
     }
 
     /// The airline name, or a sensible stand-in for flights without one.
@@ -218,7 +220,7 @@ enum BoardFormat {
 
     /// A short accessibility description of a flight.
     static func spoken(_ f: Flight, _ o: DisplayOptions) -> String {
-        var parts = [f.airlineName, f.displayNumber]
+        var parts = [f.situation?.spoken ?? "", f.airlineName, f.displayNumber]
         if let r = f.route {
             parts.append("from \(r.from.city.isEmpty ? r.from.code : r.from.city) to \(r.to.city.isEmpty ? r.to.code : r.to.city)")
         }
@@ -240,13 +242,20 @@ struct LEDText: View {
     var lines = 1
     /// Accent text (route codes) is drawn at full strength.
     var accent = false
+    /// A colour that overrides the style's own (situation highlights).
+    var tint: Color? = nil
+    /// Struck through (a scheduled destination the flight is no longer heading for).
+    var struck = false
     @Environment(\.displayOptions) private var o
 
-    init(_ text: String, _ size: CGFloat, dim: Bool = false, weight: Font.Weight = .bold, lines: Int = 1, accent: Bool = false) {
+    init(_ text: String, _ size: CGFloat, dim: Bool = false, weight: Font.Weight = .bold, lines: Int = 1, accent: Bool = false,
+         tint: Color? = nil, struck: Bool = false) {
         self.text = text; self.size = size; self.dim = dim; self.weight = weight; self.lines = lines; self.accent = accent
+        self.tint = tint; self.struck = struck
     }
 
     private var color: Color {
+        if let tint { return tint }
         // Standard: system label colors, so it follows Light and Dark Mode.
         if o.isStandard { return dim ? Color.secondary : Color.primary }
         return dim ? o.theme.color.opacity(0.5) : o.theme.color
@@ -261,6 +270,7 @@ struct LEDText: View {
         let c = color
         Text(o.isStandard ? text : text.uppercased())
             .font(.system(size: size, weight: o.isStandard ? standardWeight : weight, design: o.isStandard ? .default : .monospaced))
+            .strikethrough(struck)
             .monospacedDigit()
             .foregroundStyle(c)
             // Dim text gets a softer bloom than lit text, like unlit vs. lit LED segments.
@@ -543,6 +553,73 @@ struct RefreshGlyph: View {
     }
 }
 
+// MARK: - Situation labels
+
+extension FlightSituation {
+    /// System colour: red for emergencies and hijack, orange for everything else.
+    var tint: Color { severity == .critical ? .red : .orange }
+
+    /// The colour on a board: LED red or orange segments, or the system colour in the Standard style.
+    func color(_ o: DisplayOptions) -> Color {
+        guard !o.isStandard else { return tint }
+        return severity == .critical ? LEDTheme.red.color : Color(red: 1.0, green: 0.47, blue: 0.1)
+    }
+}
+
+/// A flight's unusual situation, never animated: a filled pill with symbol and tag ("DIVERT MKE")
+/// for the featured flight, or a symbol tile in a list row's logo slot. On the LED board it's an
+/// inverse block of lit segments; in the Standard style a coloured capsule with white text.
+struct SituationBadge: View {
+    enum Style {
+        /// Symbol and tag at this font size.
+        case pill(CGFloat)
+        /// Symbol only, in a square of this side.
+        case tile(CGFloat)
+    }
+
+    let situation: FlightSituation
+    let style: Style
+    @Environment(\.displayOptions) private var o
+
+    /// Text on the lit block: the board's unlit background colour.
+    private static let ink = Color(red: 0.04, green: 0.035, blue: 0.03)
+
+    var body: some View {
+        let fill = situation.color(o)
+        let ink = o.isStandard ? Color.white : Self.ink
+        Group {
+            switch style {
+            case .pill(let size):
+                HStack(spacing: size * 0.3) {
+                    Image(systemName: situation.symbol).font(.system(size: size * 0.85, weight: .bold))
+                    Text(situation.tag)
+                        .font(.system(size: size, weight: .heavy, design: o.isStandard ? .default : .monospaced))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(ink)
+                .padding(.horizontal, size * 0.45)
+                .padding(.vertical, size * 0.18)
+                .background(shape(radius: size * 0.3).fill(fill).widgetAccentable())
+            case .tile(let side):
+                Image(systemName: situation.symbol)
+                    .font(.system(size: side * 0.58, weight: .bold))
+                    .foregroundStyle(ink)
+                    .frame(width: side, height: side)
+                    .background(shape(radius: side * 0.24).fill(fill).widgetAccentable())
+            }
+        }
+        .shadow(color: o.glowEnabled ? fill.opacity(0.55) : .clear, radius: 3)
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(situation.spoken)
+    }
+
+    /// A capsule in the Standard style; a squarer block, like a lit LED module, on the board.
+    private func shape(radius: CGFloat) -> AnyShape {
+        o.isStandard ? AnyShape(Capsule()) : AnyShape(RoundedRectangle(cornerRadius: radius * 0.5, style: .continuous))
+    }
+}
+
 // MARK: - Featured flight
 
 struct FeaturedView: View {
@@ -574,22 +651,28 @@ struct FeaturedView: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 5) {
                 FlightMark(flight: f, size: 13)
-                LEDText(BoardFormat.operatorName(f), m.identitySize, dim: true)
+                // No room for both: the situation replaces the operator.
+                if let s = f.situation {
+                    SituationBadge(situation: s, style: .pill(8.5))
+                } else {
+                    LEDText(BoardFormat.operatorName(f), m.identitySize, dim: true)
+                }
                 Spacer(minLength: 2)
                 LEDText(f.displayNumber, 10.5).fixedSize()
             }
             if let r = f.route {
+                let to = f.destination ?? r.to
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         LEDText(r.from.code, codeSize, accent: true).fixedSize()
                         RouteLine(iconSize: 11, progress: f.progress)
-                        LEDText(r.to.code, codeSize, accent: true).fixedSize()
+                        LEDText(to.code, codeSize, accent: true, tint: changedTint).fixedSize()
                     }
                     if o.showCities {
                         HStack(spacing: 4) {
                             LEDText(r.from.city, m.citySize, dim: true, weight: .semibold)
                             Spacer(minLength: 4)
-                            LEDText(r.to.city, m.citySize, dim: true, weight: .semibold)
+                            LEDText(to.city, m.citySize, dim: true, weight: .semibold)
                         }
                     }
                 }
@@ -625,23 +708,34 @@ struct FeaturedView: View {
             FlightMark(flight: f, size: m.identitySize + 4)
             LEDText(BoardFormat.operatorName(f), m.identitySize, dim: true)
             Spacer(minLength: 6)
+            if let s = f.situation { SituationBadge(situation: s, style: .pill(m.identitySize - 2)) }
             LEDText(f.displayNumber, m.identitySize).fixedSize()
         }
+    }
+
+    /// The new destination's colour while diverting or returning.
+    private var changedTint: Color? {
+        f.pathSituation.flatMap { $0.newDestination == nil ? nil : $0.color(o) }
     }
 
     @ViewBuilder private var route: some View {
         VStack(alignment: .leading, spacing: 3) {
             if let r = f.route {
+                let to = f.destination ?? r.to
                 HStack(spacing: 10) {
                     LEDText(r.from.code, codeSize, accent: true).fixedSize()
                     RouteLine(iconSize: min(20, codeSize * 0.42), progress: f.progress)
-                    LEDText(r.to.code, codeSize, accent: true).fixedSize()
+                    // "~~DEN~~ MKE": the scheduled destination struck through beside the new one.
+                    HStack(alignment: .firstTextBaseline, spacing: codeSize * 0.15) {
+                        if changedTint != nil { LEDText(r.to.code, codeSize * 0.4, dim: true, struck: true).fixedSize() }
+                        LEDText(to.code, codeSize, accent: true, tint: changedTint).fixedSize()
+                    }
                 }
                 if o.showCities {
                     HStack {
                         LEDText(r.from.city, m.citySize, dim: true, weight: .semibold)
                         Spacer(minLength: 8)
-                        LEDText(r.to.city, m.citySize, dim: true, weight: .semibold)
+                        LEDText(to.city, m.citySize, dim: true, weight: .semibold)
                     }
                 }
             } else {
@@ -730,11 +824,16 @@ struct RowView: View {
         let c = RowColumns(size: size, showLogos: o.showLogos)
         HStack(spacing: c.spacing) {
             HStack(spacing: 5) {
-                FlightMark(flight: f, size: c.mark)
+                // The situation takes the logo's slot, so the columns don't move.
+                if let s = f.situation {
+                    SituationBadge(situation: s, style: .tile(c.mark))
+                } else {
+                    FlightMark(flight: f, size: c.mark)
+                }
                 LEDText(f.displayNumber, size)
             }
             .frame(width: c.number, alignment: .leading)
-            LEDText(BoardFormat.route(f), size, dim: true)
+            LEDText(BoardFormat.route(f), size, dim: f.pathSituation == nil, tint: f.pathSituation?.color(o))
                 .frame(width: c.route, alignment: .leading)
             LEDText(wide ? (f.aircraft?.model ?? f.typeCode) : f.typeCode, size, dim: true)
                 .frame(minWidth: c.type, maxWidth: .infinity, alignment: .leading)
@@ -1008,47 +1107,70 @@ extension PanelModel {
         let dfw = ap("DFW", "Dallas", 32.90, -97.04), mem = ap("MEM", "Memphis", 35.04, -89.98)
         let slc = ap("SLC", "Salt Lake City", 40.79, -111.98), fra = ap("FRA", "Frankfurt", 50.03, 8.56)
         let phx = ap("PHX", "Phoenix", 33.43, -112.01), lax = ap("LAX", "Los Angeles", 33.94, -118.41)
-
-        func f(_ hex: String, _ cs: String, _ reg: String, _ t: String, _ alt: Int, _ vr: Double, _ gs: Double,
-               _ trk: Double, _ d: Double, _ b: Double, _ lat: Double, _ lon: Double,
-               _ route: (String, String, String, Airport, Airport)?, _ model: String) -> Flight {
-            let json = """
-            {"hex":"\(hex)","flight":"\(cs)","r":"\(reg)","t":"\(t)","alt_baro":\(alt),"gs":\(gs),"track":\(trk),
-             "lat":\(lat),"lon":\(lon),"dst":\(d),"dir":\(b),"baro_rate":\(vr)}
-            """
-            var fl = Flight(adsb: try! JSONDecoder().decode(ADSBAircraft.self, from: Data(json.utf8)))!
-            if let r = route {
-                fl.route = RouteInfo(airline: r.0, flightNo: r.1, airlineCode: r.2, from: r.3, to: r.4)
-            }
-            fl.aircraft = AircraftInfo(model: model, owner: route?.0)
-            return fl
-        }
         let flights = [
-            f("a1b2c3", "DAL1342", "N391DN", "A321", 34_000, 0, 468, 92, 4.2, 95, 39.75, -104.80,
-              ("Delta Air Lines", "DL1342", "DL", sea, jfk), "Airbus A321-211"),
-            f("a2b3c4", "UAL960", "N27965", "B789", 36_000, 0, 488, 61, 11.8, 40, 39.85, -104.70,
-              ("United Airlines", "UA960", "UA", ord, lhr), "Boeing 787-9"),
-            f("a3b4c5", "SWA2210", "N8703Q", "B38M", 7_200, -1400, 260, 172, 14.5, 160, 39.55, -104.80,
-              ("Southwest Airlines", "WN2210", "WN", ord, den), "Boeing 737 MAX 8"),
-            f("a4b5c6", "N172SP", "N172SP", "C172", 6_500, 0, 105, 220, 16.0, 220, 39.50, -105.10,
-              nil, "Cessna 172S Skyhawk"),
-            f("a5b6c7", "JBU488", "N3008J", "BCS3", 24_100, 900, 401, 284, 19.3, 300, 39.90, -105.20,
-              ("JetBlue", "B6488", "B6", bos, den), "Airbus A220-300"),
-            f("a6b7c8", "AAL2417", "N421UW", "A21N", 11_800, -1900, 290, 190, 21.6, 20, 40.05, -104.70,
-              ("American Airlines", "AA2417", "AA", dfw, den), "Airbus A321neo"),
-            f("a7b8c9", "FDX1207", "N116FE", "B763", 38_000, 0, 502, 275, 24.9, 110, 39.65, -104.40,
-              ("FedEx", "FX1207", "FX", mem, slc), "Boeing 767-300F"),
-            f("a8b9ca", "SKW5741", "N187SY", "E75L", 16_400, 2100, 330, 300, 27.0, 290, 39.80, -105.40,
-              ("SkyWest", "OO5741", "OO", den, slc), "Embraer E175"),
-            f("a9bacb", "DLH481", "D-AIXP", "A359", 39_000, 0, 512, 52, 31.4, 60, 40.10, -104.40,
-              ("Lufthansa", "LH481", "LH", den, fra), "Airbus A350-900"),
-            f("aabbcc", "N911FL", "N911FL", "EC35", 2_200, 0, 120, 340, 33.8, 330, 40.20, -105.10,
-              nil, "Airbus H135"),
-            f("abbccd", "FFT1311", "N365FR", "A20N", 28_700, 1200, 420, 225, 36.2, 210, 39.30, -105.00,
-              ("Frontier Airlines", "F91311", "F9", den, phx), "Airbus A320neo"),
-            f("acbdce", "UAL2033", "N37522", "B39M", 33_000, 0, 455, 245, 41.7, 235, 39.40, -105.30,
-              ("United Airlines", "UA2033", "UA", den, lax), "Boeing 737 MAX 9"),
+            sampleFlight("a1b2c3", "DAL1342", "N391DN", "A321", 34_000, 0, 468, 92, 4.2, 95, 39.75, -104.80,
+                         ("Delta Air Lines", "DL1342", "DL", sea, jfk), "Airbus A321-211"),
+            sampleFlight("a2b3c4", "UAL960", "N27965", "B789", 36_000, 0, 488, 61, 11.8, 40, 39.85, -104.70,
+                         ("United Airlines", "UA960", "UA", ord, lhr), "Boeing 787-9"),
+            sampleFlight("a3b4c5", "SWA2210", "N8703Q", "B38M", 7_200, -1400, 260, 172, 14.5, 160, 39.55, -104.80,
+                         ("Southwest Airlines", "WN2210", "WN", ord, den), "Boeing 737 MAX 8"),
+            sampleFlight("a4b5c6", "N172SP", "N172SP", "C172", 6_500, 0, 105, 220, 16.0, 220, 39.50, -105.10,
+                         nil, "Cessna 172S Skyhawk"),
+            sampleFlight("a5b6c7", "JBU488", "N3008J", "BCS3", 24_100, 900, 401, 284, 19.3, 300, 39.90, -105.20,
+                         ("JetBlue", "B6488", "B6", bos, den), "Airbus A220-300"),
+            sampleFlight("a6b7c8", "AAL2417", "N421UW", "A21N", 11_800, -1900, 290, 190, 21.6, 20, 40.05, -104.70,
+                         ("American Airlines", "AA2417", "AA", dfw, den), "Airbus A321neo"),
+            sampleFlight("a7b8c9", "FDX1207", "N116FE", "B763", 38_000, 0, 502, 275, 24.9, 110, 39.65, -104.40,
+                         ("FedEx", "FX1207", "FX", mem, slc), "Boeing 767-300F"),
+            sampleFlight("a8b9ca", "SKW5741", "N187SY", "E75L", 16_400, 2100, 330, 300, 27.0, 290, 39.80, -105.40,
+                         ("SkyWest", "OO5741", "OO", den, slc), "Embraer E175"),
+            sampleFlight("a9bacb", "DLH481", "D-AIXP", "A359", 39_000, 0, 512, 52, 31.4, 60, 40.10, -104.40,
+                         ("Lufthansa", "LH481", "LH", den, fra), "Airbus A350-900"),
+            sampleFlight("aabbcc", "N911FL", "N911FL", "EC35", 2_200, 0, 120, 340, 33.8, 330, 40.20, -105.10,
+                         nil, "Airbus H135"),
+            sampleFlight("abbccd", "FFT1311", "N365FR", "A20N", 28_700, 1200, 420, 225, 36.2, 210, 39.30, -105.00,
+                         ("Frontier Airlines", "F91311", "F9", den, phx), "Airbus A320neo"),
+            sampleFlight("acbdce", "UAL2033", "N37522", "B39M", 33_000, 0, 455, 245, 41.7, 235, 39.40, -105.30,
+                         ("United Airlines", "UA2033", "UA", den, lax), "Boeing 737 MAX 9"),
         ]
         return PanelModel(flights: flights, placeName: "Denver", radiusNM: 50, updated: Date())
     }()
+
+    /// A sample flight built from a feed record, as the live data would be.
+    private static func sampleFlight(_ hex: String, _ cs: String, _ reg: String, _ t: String, _ alt: Int, _ vr: Double,
+                                     _ gs: Double, _ trk: Double, _ d: Double, _ b: Double, _ lat: Double, _ lon: Double,
+                                     _ route: (String, String, String, Airport, Airport)?, _ model: String,
+                                     squawk: String? = nil) -> Flight {
+        let code = squawk.map { ",\"squawk\":\"\($0)\"" } ?? ""
+        let json = """
+        {"hex":"\(hex)","flight":"\(cs)","r":"\(reg)","t":"\(t)","alt_baro":\(alt),"gs":\(gs),"track":\(trk),
+         "lat":\(lat),"lon":\(lon),"dst":\(d),"dir":\(b),"baro_rate":\(vr)\(code)}
+        """
+        var fl = Flight(adsb: try! JSONDecoder().decode(ADSBAircraft.self, from: Data(json.utf8)))!
+        if let r = route {
+            fl.route = RouteInfo(airline: r.0, flightNo: r.1, airlineCode: r.2, from: r.3, to: r.4)
+        }
+        fl.aircraft = AircraftInfo(model: model, owner: route?.0)
+        return fl
+    }
+
+    #if DEBUG
+    /// The gallery sky with a diversion (featured) and an emergency (second), for snapshot renders
+    /// of the situation labels. The diversion is detected by the real rules, not hard-coded.
+    static let situations: PanelModel = {
+        let ord = Airport(code: "ORD", city: "Chicago", lat: 41.98, lon: -87.90)
+        let sfo = Airport(code: "SFO", city: "San Francisco", lat: 37.62, lon: -122.38)
+        let las = Airport(code: "LAS", city: "Las Vegas", lat: 36.08, lon: -115.15)
+        let bwi = Airport(code: "BWI", city: "Baltimore", lat: 39.18, lon: -76.67)
+        // North of Denver, scheduled for San Francisco, turned south and descending toward DEN.
+        var diverting = sampleFlight("adbecf", "UAL1189", "N37281", "B39M", 11_000, -1_500, 300, 185, 9.6, 5, 40.25, -104.70,
+                                     ("United Airlines", "UA1189", "UA", ord, sfo), "Boeing 737 MAX 9")
+        diverting.pathSituation = diverting.route.flatMap { FlightSituation.path(for: diverting, route: $0) }
+        let mayday = sampleFlight("aecfd0", "SWA1984", "N8710M", "B38M", 14_200, -2_200, 340, 250, 12.4, 70, 39.85, -104.45,
+                                  ("Southwest Airlines", "WN1984", "WN", bwi, las), "Boeing 737 MAX 8", squawk: "7700")
+        var m = gallery
+        m.flights = [diverting, mayday] + gallery.flights.prefix(10)
+        return m
+    }()
+    #endif
 }

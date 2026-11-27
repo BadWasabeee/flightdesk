@@ -19,7 +19,8 @@
 
 - **Native desktop widget (WidgetKit).** Comes in Small, Medium, Large and Extra Large. It lives in *Edit Widgets* next to Apple's own widgets.
 - **Live data.** Aircraft positions come from real-time ADS-B/MLAT. Between fetches, the widget moves each aircraft along its live heading, speed and climb rate every 15 s.
-- **Verified routes.** Origin and destination come from a public database. Each route is checked against the aircraft's live position and heading, and routes that don't fit are hidden. This catches stale or reused callsigns.
+- **Verified routes.** Origin and destination come from a public database. Each route is checked against the aircraft's live position and heading, and routes that don't fit are hidden. This catches stale or reused callsigns. When a flight's recorded track shows it departed somewhere else, that correction is shared with the list, widget, panel and alerts, so every view shows the same route.
+- **Unusual situations.** Emergency squawks (7700, 7600, 7500), diversions and returns to the departure airport get a red or orange label everywhere the flight appears, and a diverting flight's route reads "ORD → ~~DEN~~ MKE".
 - **Live progress.** The plane slides along the route line to show how far into the flight it is.
 - **Flight details.** Click a flight in the widget (or the desktop panel) to open a live map with its route, its recorded track since takeoff, every flight within your search radius (drawn as a circle) and full details, including a photo of the airframe and where to look for it in your sky. Click any other plane on the map to switch to it.
 - **Airline logos.** Downloaded once and cached (can be turned off in Settings).
@@ -75,7 +76,7 @@ To work in Xcode, run `xcodegen generate` and open `FlightDesk.xcodeproj`.
 | --- | --- |
 | General | Location (this Mac's location, a city/airport, or `lat, lon`), radius, units, private/GA traffic, menu bar readout, floating panel, launch at login |
 | Widget | How to add the widget, live preview, style (LED Board or Standard), colour, glow, dot-matrix texture, header, flight list, city names, logos, rotation, how often to update (15 s – 5 min), refresh now |
-| Alerts | Notifications for emergency squawks, your watchlist, interesting (military, government) aircraft, heavies and aircraft passing close by; quiet hours |
+| Alerts | Notifications for emergency squawks, diversions, your watchlist, interesting (military, government) aircraft, heavies and aircraft passing close by; quiet hours |
 | Sources | Your own ADS-B receiver, the data sources in use |
 
 Links of the form `flightdesk://settings/<general|widget|alerts|sources>` open a tab directly.

@@ -49,6 +49,16 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             Task { @MainActor in self?.rotate() }
         })
         scheduleWidgetPump()
+        // A recorded track corrected a route (detail view or radar selection): show it everywhere now.
+        NotificationCenter.default.addObserver(forName: RouteCorrection.didChange, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                Task {
+                    await self.refresh()
+                    self.reloadWidgets()
+                }
+            }
+        }
     }
 
     // MARK: Data
@@ -162,6 +172,9 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
         // Spotter alerts and the menu-bar readout see every aircraft in range (GA included) while hidden.
         guard let onFlights, wantsBackgroundFlights(), let loc = Shared.location else { return }
+        // They take routes and diversions from the enriched panel list, so keep it from going stale
+        // (it shares the feed download; route lookups are cached).
+        if Date().timeIntervalSince(model.updated ?? .distantPast) > 60 { await refresh() }
         if appAreaFlights == nil {
             appAreaFlights = try? await FlightService.allNearby(lat: loc.lat, lon: loc.lon, radiusNM: settings.radius.nm)
         }

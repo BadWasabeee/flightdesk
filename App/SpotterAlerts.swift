@@ -260,7 +260,9 @@ extension AppDelegate {
         alerts.start()
         store.wantsBackgroundFlights = { SpotterAlerts.shared.needsBackgroundFlights }
         store.onFlights = { [weak self] flights in
-            SpotterAlerts.shared.process(flights)
+            // Background lists carry no routes: take resolved routes and diversions from the panel's list.
+            let known = Dictionary(self?.store.model.flights.map { ($0.id, $0) } ?? [], uniquingKeysWith: { a, _ in a })
+            SpotterAlerts.shared.process(FlightListFilter.merging(flights, known: known))
             self?.updateStatusReadout()
         }
         alerts.onChange = { [weak self] in self?.updateStatusReadout() }

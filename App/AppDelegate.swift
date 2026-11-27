@@ -226,12 +226,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         add("Quit FlightDesk", #selector(quit), "q")
     }
 
-    /// "DL1342  MKE→BOS · 4.0 nm NE" (route only when known).
+    /// "DL1342  MKE→BOS · 4.0 nm NE" (route only when known), with any situation: "· DIVERT MKE".
     static func menuTitle(for f: Flight, display: DisplayOptions) -> String {
         let d = display.withStandardStyle
         var parts: [String] = []
-        if let r = f.route, !r.from.code.isEmpty, !r.to.code.isEmpty { parts.append("\(r.from.code)→\(r.to.code)") }
+        if let r = f.route, let to = f.destination, !r.from.code.isEmpty, !to.code.isEmpty { parts.append("\(r.from.code)→\(to.code)") }
         else if !f.typeCode.isEmpty { parts.append(f.typeCode) }
+        if let s = f.situation { parts.append(s.tag) }
         parts.append("\(d.distance(f.distance)) \(f.direction)")
         return "\(f.displayNumber)  " + parts.joined(separator: " · ")
     }
@@ -338,13 +339,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     #if DEBUG
     /// FLIGHTDESK_SNAPSHOT_DIR=/path renders every widget size, the designed empty/error states
-    /// and the floating panel to PNGs, then quits. FLIGHTDESK_SNAPSHOT_SAMPLE=1 uses the gallery sky;
+    /// the situation labels (a diversion and an emergency, `alert-*`) and the floating panel to PNGs,
+    /// then quits. FLIGHTDESK_SNAPSHOT_SAMPLE=1 uses the gallery sky;
     /// FLIGHTDESK_SNAPSHOT_STYLE=led|standard and FLIGHTDESK_SNAPSHOT_SCHEME=light|dark override the look.
     /// Debug builds only; under the App Sandbox the directory must be inside the app's container
     /// (for example `~/Library/Containers/<bundle id>/Data/tmp`).
     private func runSnapshotIfRequested() {
         guard let dir = ProcessInfo.processInfo.environment["FLIGHTDESK_SNAPSHOT_DIR"] else { return }
-        Task { await AirlineLogos.prefetch(Set((PanelModel.gallery.flights + PanelModel.sample.flights).compactMap(\.logoKey))) }
+        let alerts = PanelModel.situations
+        var emergency = alerts
+        emergency.featuredIndex = 1
+        Task { await AirlineLogos.prefetch(Set((alerts.flights + PanelModel.sample.flights).compactMap(\.logoKey))) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
             guard let self else { return }
             let env = ProcessInfo.processInfo.environment
@@ -374,6 +379,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 ("state-offline-small", state("Can’t reach flight data — Retrying in a couple of minutes"), .small, small, o),
                 ("state-nolocation-medium", state("No location set — Choose one in FlightDesk or with Edit Widget"), .medium, medium, o),
                 ("state-loading-large", state(""), .large, large, o),
+                ("alert-small", alerts, .small, small, o),
+                ("alert-small-emergency", emergency, .small, small, o),
+                ("alert-medium", alerts, .medium, medium, o),
+                ("alert-medium-emergency", emergency, .medium, medium, o),
+                ("alert-large", alerts, .large, large, o),
+                ("alert-large-emergency", emergency, .large, large, o),
+                ("alert-xlarge", alerts, .extraLarge, xlarge, o),
+                ("alert-large-nolist", alerts, .large, large, noList),
             ]
             for (name, model, layout, size, opts) in shots {
                 self.render(PanelContent(model: model, layout: layout, accessory: AnyView(RefreshGlyph()))
@@ -391,6 +404,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 .modifier(PanelChrome(options: o))
                 .padding(20)
                 .environment(\.colorScheme, scheme), to: "\(dir)/panel.png")
+            self.render(PanelContent(model: alerts, layout: .panel)
+                .environment(\.displayOptions, o)
+                .frame(width: 460)
+                .fixedSize(horizontal: false, vertical: true)
+                .modifier(PanelChrome(options: o))
+                .padding(20)
+                .environment(\.colorScheme, scheme), to: "\(dir)/alert-panel.png")
             NSApp.terminate(nil)
         }
     }

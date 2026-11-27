@@ -102,7 +102,10 @@ struct MainWindowView: View {
         if let tab = radar.settingsTab { return tab.title }
         if radar.detail != nil {
             guard let f = radar.detailFlight else { return "Loading…" }
-            if let r = f.route { return "\(r.from.city.isEmpty ? r.from.code : r.from.city) → \(r.to.city.isEmpty ? r.to.code : r.to.city)" }
+            if let r = f.route, let to = f.destination {
+                let route = "\(r.from.city.isEmpty ? r.from.code : r.from.city) → \(to.city.isEmpty ? to.code : to.city)"
+                return [route, f.situation?.title].compactMap { $0 }.joined(separator: " · ")
+            }
             return [FlightRowText.operatorName(f), f.typeCode].filter { !$0.isEmpty }.joined(separator: " · ")
         }
         guard !store.placeName.isEmpty else { return "No location set" }
@@ -360,7 +363,7 @@ private struct FlightRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
                     Text(f.displayNumber).font(.headline).lineLimit(1)
-                    if FlightRowText.emergency(f) != nil, let squawk = f.squawk { SquawkBadge(code: squawk) }
+                    if let s = f.situation { SituationChip(situation: s) }
                 }
                 Text(FlightRowText.subtitle(f))
                     .font(.subheadline)
@@ -411,17 +414,21 @@ private struct ClimbGlyph: View {
     }
 }
 
-/// A red "7700" pill for emergency squawks.
-private struct SquawkBadge: View {
-    let code: String
+/// A compact situation label for a list row: "⚠ EMERGENCY", "◆ DIVERT MKE" in a red or orange capsule.
+/// The row's accessibility label already speaks it.
+private struct SituationChip: View {
+    let situation: FlightSituation
     var body: some View {
-        Text(code)
+        Label(situation.tag, systemImage: situation.symbol)
+            .labelStyle(.titleAndIcon)
             .font(.caption2.weight(.bold))
-            .monospacedDigit()
+            .lineLimit(1)
             .foregroundStyle(.white)
-            .padding(.horizontal, 4)
+            .padding(.horizontal, 5)
             .padding(.vertical, 1)
-            .background(Capsule().fill(Color.red))
+            .background(Capsule().fill(situation.tint))
+            .fixedSize()
+            .help(situation.spoken)
             .accessibilityHidden(true)
     }
 }
@@ -535,8 +542,8 @@ private struct RadarMap: View {
             if let selected {
                 // Ahead: a dashed great circle to the destination. Each dash has a dark rim (its casing is
                 // dashed too, with wider round caps) so it reads over land, water and dark mode alike.
-                if let r = selected.route {
-                    let ahead = FlightMath.removingRepeats(FlightMath.greatCircle(from: selected.geoPoint, to: r.to.geoPoint))
+                if let to = selected.route != nil ? selected.destination : nil {
+                    let ahead = FlightMath.removingRepeats(FlightMath.greatCircle(from: selected.geoPoint, to: to.geoPoint))
                     if ahead.count > 1 {
                         MapPolyline(coordinates: ahead.map(coordinate))
                             .stroke(Color.black.opacity(0.3), style: StrokeStyle(lineWidth: 5, lineCap: .round, dash: [7, 7]))
@@ -554,7 +561,12 @@ private struct RadarMap: View {
                 }
                 if let r = selected.route {
                     airport(r.from, role: "Departure")
-                    airport(r.to, role: "Destination")
+                    if let s = selected.pathSituation, let to = s.newDestination {
+                        airport(r.to, role: "Scheduled destination", struck: true)
+                        if to.code != r.from.code { airport(to, role: s.headline) }
+                    } else {
+                        airport(r.to, role: "Destination")
+                    }
                 }
             }
             // The selected aircraft is drawn last so it sits on top.
@@ -628,8 +640,9 @@ private struct RadarMap: View {
         .annotationTitles(.hidden)
     }
 
-    /// An origin or destination: a ringed dot with the airport code beneath.
-    private func airport(_ a: Airport, role: String) -> some MapContent {
+    /// An origin or destination: a ringed dot with the airport code beneath. `struck` marks a
+    /// scheduled destination the flight is no longer heading for.
+    private func airport(_ a: Airport, role: String, struck: Bool = false) -> some MapContent {
         Annotation("", coordinate: coordinate(a.geoPoint), anchor: .center) {
             VStack(spacing: 2) {
                 Circle()
@@ -638,10 +651,12 @@ private struct RadarMap: View {
                     .overlay(Circle().stroke(Color.accentColor, lineWidth: 2.5))
                 Text(a.code)
                     .font(.system(size: 11, weight: .bold))
+                    .strikethrough(struck)
                     .foregroundStyle(.primary)
                     .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
                     .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
             }
+            .opacity(struck ? 0.55 : 1)
             // Keep the dot (not the code) on the airport.
             .offset(y: 8)
             .allowsHitTesting(false)
@@ -715,7 +730,8 @@ private struct AircraftMarker: View {
     }
 
     private var kind: AircraftClass { AircraftClass(typeCode: f.typeCode) }
-    private var isEmergency: Bool { FlightRowText.emergency(f) != nil }
+    /// Red for emergencies, orange for diversions and returns; nil for ordinary flights.
+    private var alertTint: Color? { f.situation?.tint }
 
     /// The symbol points east; the map is always north-up.
     private var rotation: Angle { .degrees(kind == .rotorcraft ? 0 : (f.track ?? 90) - 90) }
@@ -728,18 +744,20 @@ private struct AircraftMarker: View {
                 .foregroundStyle(.white)
                 .rotationEffect(rotation)
                 .frame(width: 32, height: 32)
-                .background(Circle().fill(isEmergency ? Color.red : Color.accentColor))
+                .background(Circle().fill(alertTint ?? Color.accentColor))
                 .overlay(Circle().strokeBorder(.white, lineWidth: 2))
                 .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
                 .contentShape(Circle())
         } else {
             Image(systemName: kind.symbol)
-                .font(.system(size: 15 * kind.iconScale, weight: .semibold))
-                .foregroundStyle(isEmergency ? Color.red : f.looksLikeAirline ? Color.primary : Color.primary.opacity(0.7))
+                .font(.system(size: 15 * kind.iconScale, weight: alertTint == nil ? .semibold : .heavy))
+                .foregroundStyle(alertTint ?? (f.looksLikeAirline ? Color.primary : Color.primary.opacity(0.7)))
                 .rotationEffect(rotation)
                 .shadow(color: halo, radius: 1)
                 .shadow(color: halo, radius: 1)
                 .frame(width: 26, height: 26)
+                // A ring makes unusual flights stand out among dozens of icons.
+                .background { if let alertTint { Circle().strokeBorder(alertTint, lineWidth: 1.5).padding(1) } }
                 .contentShape(Circle())
         }
     }
@@ -751,12 +769,12 @@ private struct AircraftMarker: View {
                 .font(.system(size: 11, weight: .bold))
                 .foregroundStyle(.white)
                 .padding(.horizontal, 5)
-                .background(Capsule().fill(isEmergency ? Color.red : Color.accentColor))
+                .background(Capsule().fill(alertTint ?? Color.accentColor))
                 .contentShape(Rectangle())
         } else {
             Text(f.displayNumber)
                 .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(isEmergency ? Color.red : Color.primary)
+                .foregroundStyle(alertTint ?? Color.primary)
                 .shadow(color: halo, radius: 1)
                 .shadow(color: halo, radius: 1)
                 .contentShape(Rectangle())
@@ -764,7 +782,8 @@ private struct AircraftMarker: View {
     }
 
     private var helpText: String {
-        let detail = [FlightRowText.subtitle(f), o.altitude(f.altitude)].filter { !$0.isEmpty }.joined(separator: " · ")
+        let detail = [f.situation?.title ?? "", FlightRowText.subtitle(f), o.altitude(f.altitude)]
+            .filter { !$0.isEmpty }.joined(separator: " · ")
         return "\(f.displayNumber) — \(detail)\nDouble-click for details"
     }
 }
@@ -846,6 +865,14 @@ private struct FlightInspector: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    if let s = f.situation {
+                        Section {
+                            Label(s.title, systemImage: s.symbol)
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(s.tint)
+                                .accessibilityLabel(s.spoken)
+                        }
+                    }
                     if let r = f.route { Section("Route") { route(r, f) } }
                     Section("Flight") {
                         fact("Altitude", o.altitude(f.altitude))
@@ -854,9 +881,10 @@ private struct FlightInspector: View {
                         fact("Track", f.track.map { "\(Int($0.rounded()))° \(FlightMath.compassPoint($0))" } ?? "—")
                         if let squawk = f.squawk {
                             LabeledContent("Squawk") {
-                                Text(FlightRowText.emergency(f).map { "\(squawk) · \($0)" } ?? squawk)
+                                let alert = FlightSituation.squawk(squawk)
+                                Text(alert.map { "\(squawk) · \($0.headline)" } ?? squawk)
                                     .monospacedDigit()
-                                    .foregroundStyle(FlightRowText.emergency(f) == nil ? Color.primary : Color.red)
+                                    .foregroundStyle(alert?.tint ?? Color.primary)
                                     .textSelection(.enabled)
                             }
                         }
@@ -910,14 +938,25 @@ private struct FlightInspector: View {
 
     private func route(_ r: RouteInfo, _ f: Flight) -> some View {
         VStack(spacing: 8) {
+            let to = f.destination ?? r.to
             HStack(alignment: .firstTextBaseline) {
                 airport(r.from, alignment: .leading)
                 Spacer()
-                airport(r.to, alignment: .trailing)
+                if let s = f.pathSituation, s.newDestination != nil {
+                    // "~~DEN~~ MKE": the scheduled destination struck through beside the new one.
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        Text(r.to.code).font(.callout).strikethrough().foregroundStyle(.secondary)
+                        airport(to, alignment: .trailing).foregroundStyle(s.tint)
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(s.spoken)
+                } else {
+                    airport(to, alignment: .trailing)
+                }
             }
             RouteLine(iconSize: 12, progress: f.progress)
             let flown = FlightService.gcDistance(r.from.lat, r.from.lon, f.lat, f.lon)
-            let left = FlightService.gcDistance(f.lat, f.lon, r.to.lat, r.to.lon)
+            let left = FlightService.gcDistance(f.lat, f.lon, to.lat, to.lon)
             Text("\(o.distance(flown)) flown · \(o.distance(left)) to go")
                 .font(.caption)
                 .monospacedDigit()
