@@ -751,6 +751,8 @@ actor AcarsService {
             c = AcarsCursor(airframeID: c.airframeID, callsign: callsign)
         }
         guard let key = AircraftID.hex(hex, allowNonICAO: false) else { return (.unknownAircraft, c) }
+        if let answer = await viaServer(key, callsign: callsign, flightNumber: flightNumber, position: position,
+                                        cursor: c, now: now) { return answer }
         if c.airframeID == nil { c.airframeID = try await airframeID(hex: key, now: now) }
         guard let airframe = c.airframeID else { return (.unknownAircraft, c) }
 
@@ -775,6 +777,61 @@ actor AcarsService {
     static func isListDue(_ c: AcarsCursor, now: Date) -> Bool {
         guard let t = c.listCheckedAt else { return true }
         return now.timeIntervalSince(t) >= (c.flightID == nil ? listSearchInterval : listRecheckInterval)
+    }
+
+    // MARK: FlightDesk server
+
+    /// The same refresh through the user's FlightDesk server (`/v1/acars`, which wraps Airframes'
+    /// own records and caches them for every device), or nil to go to Airframes directly: server
+    /// off, backing off, or this request failed. The current flight is picked here with
+    /// `AcarsFlightMatcher`, exactly as for direct requests, and asked for by id when the server
+    /// picked another.
+    private func viaServer(_ key: String, callsign: String, flightNumber: String?, position: GeoPoint?,
+                           cursor: AcarsCursor, now: Date) async -> (AcarsResult?, AcarsCursor)? {
+        let server = FlightDeskServer.shared
+        guard await server.isAvailable else { return nil }
+        var c = cursor
+        let listDue = Self.isListDue(c, now: now)
+        if !listDue {
+            guard let id = c.flightID else { return (.noFlight, c) }
+            if let t = c.messagesFetchedAt, now.timeIntervalSince(t) < Self.messagesInterval { return (nil, c) }
+            guard let r = await serverAcars(key, flight: id), let f = r.flight, r.flightId == id else { return nil }
+            c.messagesFetchedAt = now
+            return (.flight(AcarsFlight(f, aircraftHex: key)), c)
+        }
+        guard let first = await serverAcars(key, flight: nil) else { return nil }
+        guard let airframe = first.airframeId else {
+            store(Entry(id: nil, at: now), for: key)
+            c.airframeID = nil
+            return (.unknownAircraft, c)
+        }
+        if c.airframeID != airframe { store(Entry(id: airframe, at: now), for: key) }
+        c.airframeID = airframe
+        c.listCheckedAt = now
+        let pick = AcarsFlightMatcher.current(in: first.airframe?.flights?.elements ?? [], callsign: callsign,
+                                              flightNumber: flightNumber, position: position, now: now)
+        if pick?.id != c.flightID {
+            c.flightID = pick?.id
+            c.messagesFetchedAt = nil
+        }
+        guard let id = c.flightID else { return (.noFlight, c) }
+        if let t = c.messagesFetchedAt, now.timeIntervalSince(t) < Self.messagesInterval { return (nil, c) }
+        let flight: AirframesAPI.Flight
+        if first.flightId == id, let f = first.flight {
+            flight = f
+        } else {
+            guard let r = await serverAcars(key, flight: id), r.flightId == id, let f = r.flight else { return nil }
+            flight = f
+        }
+        c.messagesFetchedAt = now
+        return (.flight(AcarsFlight(flight, aircraftHex: key)), c)
+    }
+
+    private func serverAcars(_ key: String, flight: Int?) async -> ServerAcarsResponse? {
+        let query = flight.map { [("flight", String($0))] } ?? []
+        guard let r = await FlightDeskServer.shared.get(["v1", "acars", key], query: query, limit: ResponseLimit.airframes),
+              r.status == 200 else { return nil }
+        return try? AirframesAPI.decoder().decode(ServerAcarsResponse.self, from: r.data)
     }
 
     // MARK: Requests

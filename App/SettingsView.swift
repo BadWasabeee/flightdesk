@@ -420,6 +420,7 @@ struct SourcesSettings: View {
     @State private var testingReceiver = false
     @State private var receiverTest: ReceiverFeed.TestResult?
     @State private var served: ServedSource?
+    @State private var serverActive = ServerSettings.current.isActive
 
     var body: some View {
         Form {
@@ -447,6 +448,8 @@ struct SourcesSettings: View {
                 if old.url != new.url { receiverTest = nil } else { refreshData() }
             }
 
+            FlightDeskServerSection(onChange: refreshData)
+
             Section {
                 LabeledContent("Positions", value: positionsSummary)
                 if let served {
@@ -471,6 +474,7 @@ struct SourcesSettings: View {
         .task {
             while !Task.isCancelled {
                 served = await FeedHealth.shared.lastServed
+                serverActive = ServerSettings.current.isActive
                 try? await Task.sleep(for: .seconds(3))
             }
         }
@@ -509,8 +513,9 @@ struct SourcesSettings: View {
     }
 
     private var positionsSummary: String {
-        guard receiver.isActive else { return "adsb.fi, then adsb.lol" }
-        return receiver.useAsOnlySource ? "Your receiver only" : "Your receiver, then adsb.fi and adsb.lol"
+        let internet = serverActive ? "your FlightDesk server, then adsb.fi and adsb.lol" : "adsb.fi and adsb.lol"
+        guard receiver.isActive else { return serverActive ? "Your FlightDesk server, then adsb.fi and adsb.lol" : "adsb.fi, then adsb.lol" }
+        return receiver.useAsOnlySource ? "Your receiver only" : "Your receiver, then \(internet)"
     }
 
     private func testReceiver() {
@@ -534,6 +539,176 @@ struct SourcesSettings: View {
         Task {
             await store.refresh()
             store.reloadWidgets()
+        }
+    }
+}
+
+// MARK: - FlightDesk server
+
+/// Settings › Sources › FlightDesk Server: the address (app-group defaults), the token (Keychain,
+/// shared with the widget), a connection test and whether to sync the logbook.
+struct FlightDeskServerSection: View {
+    /// Called after a change that should refetch (the panel and widgets pick up the new source).
+    var onChange: () -> Void
+
+    static let guideURL = URL(string: "https://github.com/BadWasabeee/flightdesk/blob/main/Server/README.md")!
+
+    @State private var settings = ServerSettings.current
+    @State private var token = ""
+    @State private var tokenLoaded = false
+    @State private var tokenError: String?
+    @State private var testing = false
+    @State private var test: FlightDeskServer.TestResult?
+    @State private var skippedUntil: Date?
+    @State private var problem: String?
+
+    private var addressProblem: ServerAddress.Problem? {
+        guard !settings.url.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        if case .failure(let p) = ServerAddress.check(settings.url) { return p }
+        return nil
+    }
+
+    var body: some View {
+        Section {
+            Toggle(isOn: $settings.enabled) {
+                Text("Use my FlightDesk server")
+                Text("Your self-hosted cache and flight history. If it can’t be reached, FlightDesk uses the public services as usual.")
+            }
+            if settings.enabled {
+                TextField("Server URL", text: $settings.url, prompt: Text(verbatim: "https://flightdesk.example.com"))
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.URL)
+                    .textContentType(.URL)
+                    #endif
+                    .onSubmit(runTest)
+                if let p = addressProblem {
+                    Text(p.message).font(.caption).foregroundStyle(.orange)
+                }
+                SecureField("Token", text: $token, prompt: Text("Bearer token from the server"))
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    #endif
+                    .onSubmit(runTest)
+                if let tokenError {
+                    Text(tokenError).font(.caption).foregroundStyle(.orange)
+                }
+                testRow
+                Toggle(isOn: $settings.syncLogbook) {
+                    Text("Add the server’s sightings to the logbook")
+                    Text("Aircraft the server saw in its area while \(DeviceName.this) wasn’t looking. Downloaded only; your logbook isn’t uploaded.")
+                }
+                if let skippedUntil, let problem {
+                    Label("Not responding (\(problem)). Using the public services until \(skippedUntil.formatted(date: .omitted, time: .shortened)).",
+                          systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.orange)
+                }
+            }
+        } header: {
+            Text("FlightDesk Server")
+        } footer: {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("The token is kept in the Keychain on \(DeviceName.this) and sent only to this server.")
+                Link("How to set up a FlightDesk server", destination: Self.guideURL)
+            }
+            .font(.caption).foregroundStyle(.secondary)
+        }
+        .onAppear(perform: loadToken)
+        .onChange(of: settings) { old, new in
+            new.save()
+            if old.url != new.url { test = nil }
+            Task {
+                await FlightDeskServer.shared.reset()
+                if old.enabled != new.enabled || old.url != new.url { onChange() }
+            }
+        }
+        .task(id: token) {
+            // Saves shortly after typing stops, so each keystroke isn't a Keychain write.
+            guard tokenLoaded else { return }
+            try? await Task.sleep(for: .milliseconds(700))
+            guard !Task.isCancelled else { return }
+            saveToken()
+        }
+        .task {
+            while !Task.isCancelled {
+                skippedUntil = await FlightDeskServer.shared.skippedUntil
+                problem = await FlightDeskServer.shared.lastProblem
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
+    }
+
+    private var testRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Button("Test Connection", action: runTest)
+                    .disabled(settings.url.trimmingCharacters(in: .whitespaces).isEmpty || testing)
+                if testing {
+                    ProgressView().controlSize(.small)
+                    Text("Connecting…").font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            if let r = test, !testing {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(r.message).foregroundStyle(.primary)
+                        if let detail = r.detail {
+                            Text(detail).font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .textSelection(.enabled).lineLimit(2).truncationMode(.middle)
+                        }
+                    }
+                    .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: r.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(r.ok ? .green : .orange)
+                }
+                .font(.callout)
+                .accessibilityElement(children: .combine)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func loadToken() {
+        guard !tokenLoaded else { return }
+        token = KeychainSecretStore.serverToken.read() ?? ""
+        // Let the load itself settle before `.task(id: token)` treats changes as edits.
+        DispatchQueue.main.async { tokenLoaded = true }
+    }
+
+    private func saveToken() {
+        let value = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard value != (KeychainSecretStore.serverToken.read() ?? "") else { return }
+        do {
+            try KeychainSecretStore.serverToken.write(value.isEmpty ? nil : value)
+            tokenError = nil
+            test = nil
+            Task {
+                await FlightDeskServer.shared.reset()
+                onChange()
+            }
+        } catch {
+            tokenError = error.localizedDescription
+        }
+    }
+
+    private func runTest() {
+        guard !testing else { return }
+        saveToken()
+        let url = settings.url, token = token
+        testing = true
+        Task {
+            let result = await FlightDeskServer.test(url: url, token: token)
+            guard url == settings.url else { testing = false; return }   // edited meanwhile
+            test = result
+            testing = false
+            if result.ok {
+                await FlightDeskServer.shared.reset()
+                onChange()
+            }
         }
     }
 }

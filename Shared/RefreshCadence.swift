@@ -5,7 +5,7 @@
 import Foundation
 
 enum RefreshCadence {
-    /// Normal cadence, matching the Mac radar (adsb.fi or your own receiver).
+    /// Normal cadence, matching the Mac radar (adsb.fi, your own receiver or your FlightDesk server).
     static let live: TimeInterval = 12
     /// While adsb.lol (daily allowance) is serving the radar.
     static let rationed: TimeInterval = 45
@@ -24,7 +24,7 @@ enum RefreshCadence {
                          lowPower: Bool = false) -> TimeInterval {
         var t: TimeInterval
         switch source {
-        case .receiver?:
+        case .receiver?, .server?:
             t = live
         case .feed(.adsbLol)?:
             t = remaining(.adsbLol, counts: counts) < lowRemaining ? resting : rationed
@@ -32,7 +32,7 @@ enum RefreshCadence {
             t = live
         }
         // Every internet feed is resting: polling faster would only hit the same limits.
-        if source != .receiver, paused.contains(.adsbFi), paused.contains(.adsbLol) { t = max(t, resting) }
+        if source != .receiver, source != .server, paused.contains(.adsbFi), paused.contains(.adsbLol) { t = max(t, resting) }
         return lowPower ? t * 2 : t
     }
 

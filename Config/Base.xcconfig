@@ -14,4 +14,10 @@ APP_GROUP_ID = $(DEVELOPMENT_TEAM).$(BUNDLE_ID_PREFIX).flightdesk
 // Team-ID-prefixed group can't be provisioned for a device).
 IOS_APP_GROUP_ID = group.$(BUNDLE_ID_PREFIX).flightdesk
 
+// Keychain access group the iPhone app and its widget share (the FlightDesk server token), used
+// as $(AppIdentifierPrefix)$(IOS_KEYCHAIN_GROUP). The Mac app and widget are signed without a
+// provisioning profile, which macOS requires for keychain-access-groups, so on the Mac the token
+// lives in the login keychain with an access list naming the app and widget (Shared/Keychain.swift).
+IOS_KEYCHAIN_GROUP = $(BUNDLE_ID_PREFIX).flightdesk.shared
+
 #include? "Local.xcconfig"

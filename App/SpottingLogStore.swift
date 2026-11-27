@@ -46,6 +46,8 @@ final class SpottingLogStore: ObservableObject {
     private var publishTask: Task<Void, Never>?
     private let io = DispatchQueue(label: "flightdesk.spotting-log", qos: .utility)
     private var terminateObserver: NSObjectProtocol?
+    private var serverSyncTask: Task<Void, Never>?
+    private var isSyncing = false
 
     init(url: URL = SpottingLog.defaultURL) {
         self.url = url
@@ -60,6 +62,13 @@ final class SpottingLogStore: ObservableObject {
         terminateObserver = NotificationCenter.default.addObserver(forName: flushOn,
                                                                    object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.flushNow() }
+        }
+        serverSyncTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(10))
+            while !Task.isCancelled {
+                await self?.syncFromServer()
+                try? await Task.sleep(for: Self.serverSyncInterval)
+            }
         }
     }
 
@@ -129,6 +138,51 @@ final class SpottingLogStore: ObservableObject {
         lastPublish = Date()
         revision += 1
         log = working
+    }
+
+    // MARK: FlightDesk server
+
+    private static let serverSyncInterval: Duration = .seconds(15 * 60)
+    private static let serverCursorKey = "spottingLog.serverCursor"
+    /// Pages of up to 1,000 airframes read per sync; the rest follow at the next one.
+    private static let serverPagesPerSync = 10
+
+    private struct StoredCursor: Codable {
+        /// The server the cursor belongs to; another server starts from the beginning.
+        var server: String
+        var cursor: ServerSightingsPage.Cursor
+    }
+
+    /// Adds what the FlightDesk server's area poller has logged since the last sync (see
+    /// `SpottingLog.absorb`), when the server and logbook syncing are on. Only downloads: the
+    /// local log is never sent anywhere.
+    func syncFromServer() async {
+        let settings = ServerSettings.current
+        guard isEnabled, isLoaded, !isSyncing, settings.isActive, settings.syncLogbook,
+              let server = settings.baseURL?.absoluteString else { return }
+        isSyncing = true
+        defer { isSyncing = false }
+        let defaults = UserDefaults.standard
+        var cursor = defaults.data(forKey: Self.serverCursorKey)
+            .flatMap { try? JSONDecoder().decode(StoredCursor.self, from: $0) }
+            .flatMap { $0.server == server ? $0.cursor : nil }
+        var imported: [LogEntry] = []
+        for _ in 0..<Self.serverPagesPerSync {
+            guard let page = await FlightDeskServer.shared.sightings(after: cursor) else { break }
+            imported += page.sightings.compactMap(LogEntry.init(server:))
+            if let last = page.sightings.last { cursor = .init(since: last.lastSeen, after: last.hex.lowercased()) }
+            if page.next == nil { break }
+        }
+        if let cursor, let data = try? JSONEncoder().encode(StoredCursor(server: server, cursor: cursor)) {
+            defaults.set(data, forKey: Self.serverCursorKey)
+        }
+        guard !imported.isEmpty, isEnabled else { return }
+        let change = working.absorb(imported)
+        guard change.any else { return }
+        knownTypes.formUnion(imported.map(\.typeCode).filter { !$0.isEmpty })
+        fdLog.info("Added \(imported.count) airframes from the FlightDesk server to the logbook")
+        scheduleSave()
+        schedulePublish()
     }
 
     // MARK: Clearing and export

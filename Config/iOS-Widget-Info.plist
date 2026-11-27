@@ -4,6 +4,8 @@
 <dict>
 	<key>FDAppGroupID</key>
 	<string>$(IOS_APP_GROUP_ID)</string>
+	<key>FDKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)$(IOS_KEYCHAIN_GROUP)</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>

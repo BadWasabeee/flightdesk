@@ -146,6 +146,27 @@ struct SpottingLog: Equatable {
         return change
     }
 
+    /// Merges entries recorded elsewhere (the FlightDesk server's log): new airframes are added,
+    /// known ones combined with `LogEntry.absorb`. Purely additive: nothing local is removed.
+    @discardableResult
+    mutating func absorb(_ remote: [LogEntry]) -> Change {
+        var change = Change()
+        for r in remote {
+            guard let hex = AircraftID.hex(r.hex, allowNonICAO: false) else { continue }
+            if entries[hex] != nil {
+                let before = entries[hex]
+                entries[hex]!.absorb(r)
+                if entries[hex] != before { change.any = true }
+            } else {
+                entries[hex] = r
+                change.added.append(hex)
+                change.any = true
+            }
+        }
+        if entries.count > Self.capacity { compact(to: Self.compactTarget) }
+        return change
+    }
+
     /// Keeps the `limit` most recently seen airframes.
     mutating func compact(to limit: Int) {
         guard entries.count > limit else { return }
@@ -363,4 +384,70 @@ extension LogEntry {
     }
 
     private static func validDistance(_ d: Double) -> Double? { d.isFinite && d >= 0 ? d : nil }
+
+    /// Combines another record of the same airframe: the earliest first sighting, the latest last
+    /// one, the larger visit count (the two logs may have seen the same visits), the higher
+    /// altitude, the nearer pass, details from whichever saw it more recently (kept when the
+    /// other omits them), and both callsign and route lists, most recent last.
+    mutating func absorb(_ other: LogEntry) {
+        guard other.hex == hex else { return }
+        let otherIsNewer = other.lastSeen > lastSeen
+        func pick(_ mine: String, _ theirs: String) -> String {
+            theirs.isEmpty || (!mine.isEmpty && !otherIsNewer) ? mine : theirs
+        }
+        registration = pick(registration, other.registration)
+        typeCode = pick(typeCode, other.typeCode)
+        operatorName = pick(operatorName, other.operatorName)
+        if let a = other.airlineICAO, airlineICAO == nil || otherIsNewer { airlineICAO = a }
+        if let a = other.airlineIATA, airlineIATA == nil || otherIsNewer { airlineIATA = a }
+        if alertGroup == nil { alertGroup = other.alertGroup }
+        firstSeen = min(firstSeen, other.firstSeen)
+        lastSeen = max(lastSeen, other.lastSeen)
+        sightings = max(sightings, other.sightings)
+        maxAltitude = max(maxAltitude, other.maxAltitude)
+        if other.closestNM < closestNM {
+            closestNM = other.closestNM
+            closestAt = other.closestAt
+        }
+        func merged(_ mine: [String], _ theirs: [String], limit: Int) -> [String] {
+            var out: [String] = []
+            for item in otherIsNewer ? mine + theirs : theirs + mine {
+                out.removeAll { $0 == item }
+                out.append(item)
+            }
+            return Array(out.suffix(limit))
+        }
+        callsigns = merged(callsigns, other.callsigns, limit: SpottingLog.callsignLimit)
+        routes = merged(routes, other.routes, limit: SpottingLog.routeLimit)
+    }
+
+    /// An entry from the FlightDesk server's sightings log, checked like feed data. The server
+    /// measures distance from the centre of its area rather than from the user, so the closest
+    /// pass is left unknown ("—") until this device sees the aircraft itself.
+    init?(server s: ServerSighting) {
+        guard let hex = AircraftID.hex(s.hex, allowNonICAO: false), s.firstSeen > 0, s.lastSeen >= s.firstSeen else { return nil }
+        self.hex = hex
+        firstSeen = Date(timeIntervalSince1970: TimeInterval(s.firstSeen))
+        lastSeen = Date(timeIntervalSince1970: TimeInterval(s.lastSeen))
+        sightings = max(1, s.sightings ?? 1)
+        closestNM = .greatestFiniteMagnitude
+        closestAt = lastSeen
+        maxAltitude = max(0, s.maxAltitude ?? 0)
+        func clean(_ v: String?, _ limit: Int) -> String {
+            String((v ?? "").trimmingCharacters(in: .whitespacesAndNewlines).filter { !$0.isNewline }.prefix(limit))
+        }
+        let reg = clean(s.registration, 12)
+        registration = reg.caseInsensitiveCompare(hex) == .orderedSame ? "" : reg
+        typeCode = clean(s.typeCode, 8).uppercased()
+        operatorName = clean(s.operatorName, 80)
+        if let icao = s.airlineICAO?.uppercased(), icao.count == 3, icao.allSatisfy({ $0.isASCII && $0.isLetter }) { airlineICAO = icao }
+        callsigns = Array((s.callsigns ?? []).compactMap(AircraftID.callsign).suffix(SpottingLog.callsignLimit))
+        routes = Array((s.routes ?? []).filter(Self.isRoute).suffix(SpottingLog.routeLimit))
+    }
+
+    /// "ORD-DEN": two airport codes of 3–4 letters or digits.
+    private static func isRoute(_ r: String) -> Bool {
+        let parts = r.split(separator: "-", omittingEmptySubsequences: false)
+        return parts.count == 2 && parts.allSatisfy { (3...4).contains($0.count) && $0.allSatisfy { $0.isASCII && ($0.isUppercase || $0.isNumber) } }
+    }
 }

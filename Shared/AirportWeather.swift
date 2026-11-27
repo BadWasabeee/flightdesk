@@ -596,8 +596,14 @@ actor WeatherService {
         save()
     }
 
-    /// GETs `/api/data/{metar|taf}?ids=…&format=json` (ids already validated as ICAO codes).
+    /// GETs `/api/data/{metar|taf}?ids=…&format=json` (ids already validated as ICAO codes), from
+    /// the user's FlightDesk server when it's in use (`/v1/metar|taf?ids=`, the same body, cached
+    /// per station for every device), else from aviationweather.gov.
     private static let download: Fetcher = { product, ids in
+        if let r = await FlightDeskServer.shared.get(["v1", product.rawValue], query: [("ids", ids.joined(separator: ","))]),
+           r.status == 200 {
+            return r.data
+        }
         let base = product == .metar ? "https://aviationweather.gov/api/data/metar" : "https://aviationweather.gov/api/data/taf"
         guard let url = RemoteURL.make(base, query: [("ids", ids.joined(separator: ",")), ("format", "json")]) else {
             throw URLError(.badURL)

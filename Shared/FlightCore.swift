@@ -393,8 +393,8 @@ enum FlightService {
     }
 
     /// Every aircraft within the radius, nearest first: from the user's own receiver when enabled,
-    /// otherwise (or as fallback) the internet feeds. Shared between the app and the widget for
-    /// a few seconds so they don't download the same thing twice.
+    /// otherwise (or as fallback) the user's FlightDesk server, then the internet feeds. Shared
+    /// between the app and the widget for a few seconds so they don't download the same thing twice.
     static func allNearby(lat: Double, lon: Double, radiusNM: Int) async throws -> [Flight] {
         let receiver = ReceiverSettings.current
         // Privacy: only a coarse position (2 decimals ≈ 1 km) ever leaves the Mac; the receiver gets none.
@@ -405,18 +405,19 @@ enum FlightService {
             if let source = cached.source { await FeedHealth.shared.served(source, at: cached.time) }
             return cached.flights
         }
-        var source = DataSource.receiver
         let list: [Flight]
+        let source: DataSource
         do {
-            list = try await ReceiverFeed.route(receiver, local: {
+            (list, source) = try await nearbyFromSources(lat: lat, lon: lon, radiusNM: radiusNM, receiver: receiver,
+                                                         server: FlightDeskServer.shared, local: {
                 try await ReceiverFeed.nearby(lat: lat, lon: lon, radiusNM: radiusNM, settings: receiver)
-            }, internet: {
+            }, feeds: {
                 let (data, feed) = try await LiveFeed.fetchWithSource { $0.pointURL(lat: lat, lon: lon, radiusNM: radiusNM) }
-                source = .feed(feed)
-                return (try JSONDecoder().decode(ADSBResponse.self, from: data).ac ?? [])
+                let flights = (try JSONDecoder().decode(ADSBResponse.self, from: data).ac ?? [])
                     .compactMap(Flight.init(adsb:))
                     .sorted { $0.distance < $1.distance }
-            }) ?? []
+                return (flights, feed)
+            })
         } catch {
             // Every source failed: keep showing recent data rather than an empty board.
             if let stale = NearbyCache.read(key: key, maxAge: 600) { return stale.flights }
@@ -424,6 +425,27 @@ enum FlightService {
         }
         NearbyCache.write(list, key: key, source: source)
         return list
+    }
+
+    /// The order positions are asked for in: the user's receiver (`local`) as `ReceiverFeed.route`
+    /// decides, then the FlightDesk server, then the public feeds. The server is skipped silently
+    /// when it is off, backing off or fails.
+    static func nearbyFromSources(lat: Double, lon: Double, radiusNM: Int, receiver: ReceiverSettings,
+                                  server: FlightDeskServer,
+                                  local: () async throws -> [Flight],
+                                  feeds: () async throws -> ([Flight], LiveFeed)) async throws -> ([Flight], DataSource) {
+        var source = DataSource.receiver
+        let list = try await ReceiverFeed.route(receiver, local: local, internet: {
+            if let flights = await server.nearby(lat: lat, lon: lon, radiusNM: radiusNM) {
+                source = .server
+                await FeedHealth.shared.served(.server)
+                return flights
+            }
+            let (flights, feed) = try await feeds()
+            source = .feed(feed)
+            return flights
+        }) ?? []
+        return (list, source)
     }
 
     // MARK: Route plausibility — reject stale/reused-callsign routes using the live position.
@@ -471,11 +493,18 @@ enum FlightService {
 
     // MARK: Lookups (adsbdb). Second value = definitive answer (safe to cache).
 
+    /// An adsbdb answer from the FlightDesk server (which proxies adsbdb with the same body and
+    /// status) when it's in use, else from adsbdb directly.
+    private static func adsbdb(server path: [String], direct url: URL) async -> (Data, Int)? {
+        if let r = await FlightDeskServer.shared.get(path) { return (r.data, r.status) }
+        guard let (data, resp) = try? await session.boundedData(from: url) else { return nil }
+        return (data, (resp as? HTTPURLResponse)?.statusCode ?? 0)
+    }
+
     static func fetchRoute(_ callsign: String) async -> (RouteInfo?, Bool) {
         guard let cs = AircraftID.callsign(callsign),
               let url = RemoteURL.make("https://api.adsbdb.com/v0/callsign", [cs]) else { return (nil, true) }
-        guard let (data, resp) = try? await session.boundedData(from: url) else { return (nil, false) }
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard let (data, code) = await adsbdb(server: ["v1", "route", cs], direct: url) else { return (nil, false) }
         guard let r = try? JSONDecoder().decode(DBRouteResponse.self, from: data).response.flightroute else {
             return (nil, code == 200 || code == 404)
         }
@@ -487,8 +516,7 @@ enum FlightService {
         // Non-ICAO ("~…") addresses don't identify an airframe.
         guard let id = AircraftID.hex(hex, allowNonICAO: false),
               let url = RemoteURL.make("https://api.adsbdb.com/v0/aircraft", [id]) else { return (nil, true) }
-        guard let (data, resp) = try? await session.boundedData(from: url) else { return (nil, false) }
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard let (data, code) = await adsbdb(server: ["v1", "aircraft", id], direct: url) else { return (nil, false) }
         guard let a = try? JSONDecoder().decode(DBAircraftResponse.self, from: data).response.aircraft else {
             return (nil, code == 200 || code == 404)
         }
@@ -1089,11 +1117,14 @@ enum FlightLink {
 enum DataSource: Hashable, Codable, Sendable {
     /// The user's own ADS-B receiver (see `ReceiverFeed`).
     case receiver
+    /// The user's own FlightDesk server (see `FlightDeskServer`).
+    case server
     case feed(LiveFeed)
 
     var title: String {
         switch self {
         case .receiver: "Your receiver"
+        case .server: "Your FlightDesk server"
         case .feed(let f): f.title
         }
     }

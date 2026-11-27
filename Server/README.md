@@ -488,7 +488,7 @@ Server health and usage:
 
 ## How the apps use it
 
-The client side isn't built yet. This section is the contract for it.
+The apps implement this contract in `Shared/FlightDeskServer.swift` (see "Your own FlightDesk server" in the main README).
 
 **Settings › Sources › "FlightDesk server"** takes a URL (for example `https://flightdesk.example.com`) and the token. Store the token in the Keychain, not in shared defaults.
 
@@ -511,7 +511,7 @@ The client side isn't built yet. This section is the contract for it.
 
 - Requests to the server can be counted under their own `ApiService` case, so they don't use up the per-service budgets meant for direct calls.
 - Keep the apps' local caches (`NearbyCache`, `LookupCache`, `TrackCache`). The server makes misses cheap; it doesn't replace them.
-- Widgets can use the server too, with the same URL and token through the app group, so a widget refresh costs no upstream request.
+- Widgets use the server too: the URL through the app group, the token through the shared Keychain, so a widget refresh costs no upstream request.
 
 ---
 

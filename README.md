@@ -112,7 +112,7 @@ The device must be registered to your team, which Xcode does when you select it.
 | General | Location (this Mac's location, a city/airport, or `lat, lon`), radius, units, private/GA traffic, menu bar readout, floating panel, spotting log (on by default) and Clear Log, launch at login |
 | Widget | How to add the widget, live preview, style (LED Board or Standard), colour, glow, dot-matrix texture, header, flight list, city names, logos, rotation, how often to update (15 s – 5 min), refresh now |
 | Alerts | Notifications for emergency squawks, diversions, your watchlist, interesting (military, government) aircraft, heavies and aircraft passing close by; quiet hours |
-| Sources | Your own ADS-B receiver, the data sources in use |
+| Sources | Your own ADS-B receiver, your own FlightDesk server, the data sources in use, requests today |
 
 Links of the form `flightdesk://settings/<general|widget|alerts|sources>` open a tab directly.
 
@@ -127,6 +127,18 @@ macOS decides when a widget actually redraws. While FlightDesk is running it ask
 If you run dump1090-fa (PiAware / SkyAware), readsb, tar1090 or ultrafeeder, open **Settings › Sources**, turn on **Use my ADS-B receiver** and enter the address of its map page, for example `http://raspberrypi.local/tar1090`, `http://piaware.local/skyaware` or `http://192.168.1.50:8080`. **Test Connection** finds the receiver's `aircraft.json` (it tries `data/aircraft.json`, `aircraft.json` and the usual `tar1090/`, `skyaware/`, `dump1090-fa/` and `dump1090/` sub-paths) and shows how many aircraft it sees.
 
 FlightDesk then asks your receiver first and computes distances itself. If the receiver can't be reached it falls back to the internet feeds and retries the receiver a minute later. Turn on **Only use my receiver** to never use the internet feeds. macOS asks once for permission to access your local network; you can change this in System Settings › Privacy & Security › Local Network. Plain `http://` works for IP addresses and `.local` names.
+
+### Your own FlightDesk server (optional)
+
+The [FlightDesk server](Server/README.md) is a small self-hosted service that polls the live feed for your area, caches the other free APIs for all your devices and keeps a compact flight history. See [Server/README.md](Server/README.md) to set one up.
+
+To connect the apps, open **Settings › Sources** on each Mac and iPhone, turn on **Use my FlightDesk server**, and enter its address (for example `https://flightdesk.example.com`) and the token the server printed at setup. **Test Connection** checks the server and the token, and shows how many aircraft the server sees and how large its database is. The widgets use the same server.
+
+- The server is then the first source for positions (after your own receiver, which keeps its priority), recorded tracks, routes and aircraft, ACARS and airport weather. If it can't be reached, times out (4 s) or returns an error, FlightDesk silently uses the public services and leaves the server alone for about 90 seconds. Requests to it appear as **FlightDesk server** under Requests Today and don't count against the public services' allowances.
+- When you open a flight's detail, FlightDesk asks the server to record that flight's whole track (once per flight).
+- With **Add the server's sightings to the logbook** on, the aircraft the server saw in its area are added to your logbook. This only downloads; your logbook is never uploaded.
+- Addresses must use `https://`. Plain `http://` is accepted only for `localhost`, `.local` names and private IP addresses.
+- The token is stored in the Keychain, never in settings files. The iPhone app and its widget share it through a keychain access group. On the Mac it's in your login keychain, readable only by FlightDesk and its widget. It's sent only to the server's own address, and redirects to any other address are refused.
 
 ## Shortcuts & Siri
 
@@ -164,7 +176,7 @@ The app and widget both run in the App Sandbox; remote images are size-checked b
 
 | Data | Source |
 | --- | --- |
-| Live positions, altitude, speed, heading | Your own ADS-B receiver if you set one up, otherwise [adsb.fi](https://adsb.fi) open data, with [adsb.lol](https://adsb.lol) (ODbL) as an automatic fallback. Both are community-run ADS-B/MLAT feeds |
+| Live positions, altitude, speed, heading | Your own ADS-B receiver if you set one up, then your own FlightDesk server if you set one up, otherwise [adsb.fi](https://adsb.fi) open data, with [adsb.lol](https://adsb.lol) (ODbL) as an automatic fallback. Both are community-run ADS-B/MLAT feeds |
 | Routes, airlines, aircraft models | [adsbdb](https://www.adsbdb.com); in the detail, when adsbdb has no route that fits, the departure and destination the aircraft reports over ACARS (checked against its live position the same way) |
 | Recorded flight tracks (detail window) | [OpenSky Network](https://opensky-network.org), anonymous access |
 | ACARS messages (detail window) | [Airframes.io](https://airframes.io) public API, anonymous access. Data provided by Airframes.io and its community of feeders; the detail credits and links it. Used under its [terms](https://app.airframes.io/terms) and [licensing & attribution](https://docs.airframes.io/api/licensing) guidance: personal, non-commercial display, a couple of requests every two minutes while a detail is open, and a pause whenever the service signals its rate limit. Airframe lookups are cached for a day |
@@ -188,6 +200,7 @@ These are free community services. Please be kind to them, and consider supporti
 
 - Your location stays on your Mac. Requests to adsb.fi and adsb.lol include only a **rounded** position (about 1 km).
 - With your own receiver, FlightDesk only downloads its aircraft list over your local network; your position is never sent to it. With **Only use my receiver**, no position requests go to the internet at all.
+- With your own FlightDesk server, the requests above (rounded position, ICAO addresses, callsigns, airport codes) go to your server instead, which forwards what it can't answer from its cache. When you open a flight's detail, the server is told to follow that aircraft. Nothing is sent to the FlightDesk project.
 - adsbdb receives only flight callsigns and aircraft hex codes.
 - There are no accounts, analytics or tracking. Settings live in the App Group container on your Mac.
 - The spotting log is local only and never uploaded. It is a file in FlightDesk's own sandbox (`~/Library/Containers/<FlightDesk>/Data/Library/Application Support/FlightDesk/spotting-log.json`), not shared with the widget, and it makes no network requests of its own. Turn it off or clear it in Settings › General; CSV export writes only to a file you choose.

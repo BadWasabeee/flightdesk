@@ -2,7 +2,11 @@ import Foundation
 
 /// The web services FlightDesk talks to, for counting requests and respecting rate limits.
 enum ApiService: String, CaseIterable, Codable, Sendable {
-    case adsbFi, adsbLol, openSky, adsbdb, planespotters, airframes, aviationWeather, logos, other
+    case adsbFi, adsbLol, openSky, adsbdb, planespotters, airframes, aviationWeather, logos
+    /// The user's own FlightDesk server (see `FlightDeskServer`): counted for the usage list only,
+    /// never against an allowance, and never matched by host (it's whatever the user configured).
+    case flightdeskServer
+    case other
 
     init(host: String) {
         switch host {
@@ -28,6 +32,7 @@ enum ApiService: String, CaseIterable, Codable, Sendable {
         case .airframes: "Airframes.io"
         case .aviationWeather: "aviationweather.gov"
         case .logos: "Airline logos"
+        case .flightdeskServer: "FlightDesk server"
         case .other: "Other"
         }
     }
@@ -144,6 +149,12 @@ enum ApiBudget {
     }
 
     static func isAvailable(_ service: ApiService) -> Bool { pausedUntil(service) == nil }
+
+    /// Counts a finished request to `service` without reading rate-limit headers (the FlightDesk
+    /// server, whose back-off `FlightDeskServer` handles itself).
+    static func count(_ service: ApiService) {
+        update { $0.counts[service, default: 0] += 1 }
+    }
 
     /// Counts a finished request and reads the service's rate-limit headers.
     static func record(_ response: HTTPURLResponse) {

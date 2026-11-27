@@ -191,6 +191,9 @@ private extension Flight {
 }
 
 enum FlightDetailService {
+    /// How often a track from the FlightDesk server is fetched again while a flight is shown.
+    static let serverTrackRefresh: TimeInterval = 120
+
     /// The latest report for one aircraft, or nil when the live feeds no longer have it.
     /// Only the aircraft's hex is sent; the observer position is used locally. Uses the user's own
     /// receiver first when enabled (see `ReceiverFeed.route` for the fallback order).
@@ -216,9 +219,24 @@ enum FlightDetailService {
     /// requests a day). Each flight's track is downloaded once and cached on disk for the app and
     /// widget; live positions extend it afterwards. Nil when unavailable, when OpenSky is near its
     /// limit, or when the track belongs to another leg.
+    ///
+    /// With a FlightDesk server in use, the track comes from the server instead (its own recorded
+    /// history, with OpenSky's merged in by the server when it missed the departure) and is
+    /// refreshed every `serverTrackRefresh`, since the server keeps recording the flight. A 404
+    /// from the server is an answer: it already asked OpenSky.
     static func track(hex: String, current: GeoPoint?) async -> FlightTrack? {
         guard let id = TrackCache.openSkyID(hex) else { return nil }
-        if let cached = TrackCache.track(for: id, current: current) { return cached }
+        let cached = TrackCache.track(for: id, current: current)
+        if await FlightDeskServer.shared.isAvailable {
+            if let cached, let age = TrackCache.age(of: id), age < serverTrackRefresh { return cached }
+            // The server also keeps "~" (non-ICAO) tracks, under the feed's hex.
+            if let feedHex = AircraftID.hex(hex), let r = await FlightDeskServer.shared.get(["v1", "track", feedHex]) {
+                guard r.status == 200, let track = FlightTrack(data: r.data, current: current) else { return cached }
+                TrackCache.store(r.data, for: id)
+                return track
+            }
+        }
+        if let cached { return cached }
         guard ApiBudget.isAvailable(.openSky),
               let url = RemoteURL.make("https://opensky-network.org/api/tracks/all", query: [("icao24", id), ("time", "0")]),
               let (data, resp) = try? await FlightService.session.boundedData(from: url),
@@ -428,6 +446,13 @@ enum TrackCache {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? data.write(to: dir.appendingPathComponent("\(id).json"), options: .atomic)
         prune()
+    }
+
+    /// Seconds since the track for `id` was stored, or nil when none is.
+    static func age(of id: String, now: Date = Date()) -> TimeInterval? {
+        let file = dir.appendingPathComponent("\(id).json")
+        guard let stored = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { return nil }
+        return now.timeIntervalSince(stored)
     }
 
     /// OpenSky keys tracks by the bare 24-bit address, without readsb's "~" marker.

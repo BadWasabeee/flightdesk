@@ -45,6 +45,16 @@ extension URLSession {
     /// received body exceeds `limit` bytes, so an oversized response is never held in memory.
     func boundedData(from url: URL, limit: Int = ResponseLimit.json) async throws -> (Data, URLResponse) {
         let (bytes, response) = try await self.bytes(from: url)
+        return try await Self.collect(bytes, response, limit: limit)
+    }
+
+    /// Like `boundedData(from:limit:)`, for a full request (method, headers, timeout).
+    func boundedData(for request: URLRequest, limit: Int = ResponseLimit.json) async throws -> (Data, URLResponse) {
+        let (bytes, response) = try await self.bytes(for: request)
+        return try await Self.collect(bytes, response, limit: limit)
+    }
+
+    private static func collect(_ bytes: AsyncBytes, _ response: URLResponse, limit: Int) async throws -> (Data, URLResponse) {
         if response.expectedContentLength > Int64(limit) {
             bytes.task.cancel()
             throw URLError(.dataLengthExceedsMaximum)

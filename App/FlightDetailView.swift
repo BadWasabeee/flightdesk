@@ -335,6 +335,10 @@ final class FlightDetailModel: ObservableObject {
         if f.callsign != enrichedCallsign {
             let previous = enrichedCallsign ?? flight?.callsign
             enrichedCallsign = f.callsign
+            // Have the FlightDesk server (when in use) record this flight's whole track. Fire and
+            // forget; the server client posts each aircraft and callsign once per session.
+            let hex = hex, callsign = f.callsign
+            Task.detached(priority: .utility) { await FlightDeskServer.shared.watch(hex: hex, callsign: callsign) }
             let lookup = await FlightDetailService.enrichment(for: f)
             guard !Task.isCancelled else { return }
             // Keep the snapshot's route if a lookup fails for the same callsign.
