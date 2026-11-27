@@ -38,6 +38,28 @@ enum FlightMath {
     }
 
     /// Time to cover `remainingNM` at `speedKT`, or nil when the aircraft is too slow for a meaningful estimate.
+    /// Drops consecutive points closer than ~20 m; repeated vertices stop MapKit drawing the map.
+    static func removingRepeats(_ points: [GeoPoint]) -> [GeoPoint] {
+        var out: [GeoPoint] = []
+        out.reserveCapacity(points.count)
+        for p in points where p.lat.isFinite && p.lon.isFinite {
+            if let last = out.last, FlightService.gcDistance(last.lat, last.lon, p.lat, p.lon) < 0.01 { continue }
+            out.append(p)
+        }
+        return out
+    }
+
+    /// Points on a circle of `radiusNM` around `center` (true distances on the sphere).
+    static func circle(around center: GeoPoint, radiusNM: Double, count: Int = 120) -> [GeoPoint] {
+        let δ = radiusNM / 3440.065, φ1 = center.lat * .pi / 180, λ1 = center.lon * .pi / 180
+        return (0..<count).map { i in
+            let θ = Double(i) / Double(count) * 2 * .pi
+            let φ2 = asin(sin(φ1) * cos(δ) + cos(φ1) * sin(δ) * cos(θ))
+            let λ2 = λ1 + atan2(sin(θ) * sin(δ) * cos(φ1), cos(δ) - sin(φ1) * sin(φ2))
+            return GeoPoint(lat: φ2 * 180 / .pi, lon: λ2 * 180 / .pi)
+        }
+    }
+
     static func timeToGo(remainingNM: Double, speedKT: Double) -> TimeInterval? {
         guard speedKT > 50, remainingNM >= 0 else { return nil }
         return remainingNM / speedKT * 3600
@@ -153,25 +175,16 @@ enum FlightDetailService {
         return records.lazy.compactMap { AircraftReport(record: $0, observer: observer) }.first
     }
 
-    /// The aircraft's track for its current flight from the OpenSky Network (anonymous, rate-limited),
-    /// oldest first. Nil when unavailable, or when the track doesn't end near `current`
-    /// (e.g. it belongs to an earlier leg).
-    static func track(hex: String, current: GeoPoint?) async -> [GeoPoint]? {
+    /// The aircraft's track for its current flight from the OpenSky Network (anonymous, rate-limited).
+    /// Nil when unavailable, or when the track doesn't end near `current` (e.g. an earlier leg).
+    static func track(hex: String, current: GeoPoint?) async -> FlightTrack? {
         let id = hex.lowercased().replacingOccurrences(of: "~", with: "")
         guard id.count == 6, let url = URL(string: "https://opensky-network.org/api/tracks/all?icao24=\(id)&time=0"),
               let (data, resp) = try? await FlightService.session.data(from: url),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let path = obj["path"] as? [[Any]] else { return nil }
-        // Waypoints: [time, lat, lon, baro altitude m, true track, on ground]
-        let points = path.compactMap { w -> GeoPoint? in
-            guard w.count >= 3, let lat = w[1] as? Double, let lon = w[2] as? Double else { return nil }
-            return GeoPoint(lat: lat, lon: lon)
-        }
-        guard points.count > 1, let last = points.last else { return nil }
-        if let end = obj["endTime"] as? Double, Date().timeIntervalSince1970 - end > 30 * 60 { return nil }
-        if let c = current, FlightService.gcDistance(c.lat, c.lon, last.lat, last.lon) > 60 { return nil }
-        return points
+        return FlightTrack(waypoints: path, current: current)
     }
 
     /// Route and aircraft details for a flight from the shared lookup cache. The route is returned
@@ -183,5 +196,33 @@ enum FlightDetailService {
         await LookupCache.shared.save()
         if let code = result.0?.airlineCode { await AirlineLogos.prefetch([code]) }
         return result
+    }
+}
+
+/// A position with the time it was reported.
+struct TimedPoint: Equatable, Sendable {
+    var point: GeoPoint
+    var time: Date
+}
+
+/// A recorded track, oldest first.
+struct FlightTrack: Equatable, Sendable {
+    var points: [TimedPoint]
+    /// Altitude of the first waypoint in feet (low means the track starts at the departure airport).
+    var startAltitudeFt: Double?
+
+    /// Parses OpenSky waypoints `[time, lat, lon, baro altitude m, true track, on ground]`.
+    /// Returns nil for tracks that are too short, stale (> 30 min old) or don't end near `current`.
+    init?(waypoints: [[Any]], current: GeoPoint?, now: Date = Date()) {
+        let parsed = waypoints.compactMap { w -> (TimedPoint, Double?)? in
+            guard w.count >= 3, let t = (w[0] as? NSNumber)?.doubleValue,
+                  let lat = (w[1] as? NSNumber)?.doubleValue, let lon = (w[2] as? NSNumber)?.doubleValue else { return nil }
+            let alt = w.count > 3 ? (w[3] as? NSNumber)?.doubleValue : nil
+            return (TimedPoint(point: GeoPoint(lat: lat, lon: lon), time: Date(timeIntervalSince1970: t)), alt)
+        }
+        guard parsed.count > 1, let last = parsed.last?.0, now.timeIntervalSince(last.time) < 30 * 60 else { return nil }
+        if let c = current, FlightService.gcDistance(c.lat, c.lon, last.point.lat, last.point.lon) > 60 { return nil }
+        points = parsed.map(\.0)
+        startAltitudeFt = parsed.first?.1.map { $0 * 3.28084 }
     }
 }

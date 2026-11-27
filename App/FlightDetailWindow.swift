@@ -51,7 +51,9 @@ final class FlightDetailNavigator: ObservableObject {
     func select(_ flight: Flight) {
         guard flight.id != model.hex else { return }
         model.stop()
-        model = FlightDetailModel(hex: flight.id, snapshot: flight)
+        // Keep the other aircraft (and the one being left) on the map while the new one loads.
+        let others = model.nearby + [model.flight].compactMap { $0 }
+        model = FlightDetailModel(hex: flight.id, snapshot: flight, nearby: others)
         model.start()
         onSwitch?(model)
     }

@@ -19,9 +19,13 @@ final class FlightDetailModel: ObservableObject {
     /// When the most recent position was received, once a poll has returned one.
     @Published private(set) var lastSeen: Date?
     /// Positions observed while the window has been open, oldest first.
-    @Published private(set) var trail: [GeoPoint] = []
+    @Published private(set) var trail: [TimedPoint] = []
     /// The flight's recorded track from OpenSky, when available.
-    @Published private(set) var history: [GeoPoint] = []
+    @Published private(set) var history: [TimedPoint] = []
+    /// Departure airport read from the start of the recorded track.
+    @Published private(set) var departedFrom: Airport?
+    /// How the shown route was worked out, when it isn't the verified scheduled route.
+    @Published private(set) var routeNote: String?
     /// Other aircraft within the user's search radius.
     @Published private(set) var nearby: [Flight] = []
     /// The user's search radius, drawn around their location.
@@ -43,8 +47,10 @@ final class FlightDetailModel: ObservableObject {
     private var nearbyPoller: Task<Void, Never>?
     private var historyPoller: Task<Void, Never>?
 
-    init(hex: String, snapshot: Flight?) {
+    /// `nearby` seeds the map's other aircraft (when switching planes) until the next refresh.
+    init(hex: String, snapshot: Flight?, nearby: [Flight] = []) {
         self.hex = hex
+        self.nearby = nearby.filter { $0.id != hex }
         let settings = AppSettings.load()
         var display = settings.display
         display.style = .standard
@@ -55,7 +61,8 @@ final class FlightDetailModel: ObservableObject {
         candidateRoute = snapshot?.route
         aircraftInfo = snapshot?.aircraft
         isLive = snapshot != nil
-        if let snapshot { trail = [snapshot.geoPoint] }
+        // The snapshot can be minutes old, so it only stands in until the first live position.
+        if let snapshot { trail = [TimedPoint(point: snapshot.geoPoint, time: .distantPast)] }
     }
 
     deinit {
@@ -103,10 +110,40 @@ final class FlightDetailModel: ObservableObject {
     private func pollHistory() async {
         guard let track = await FlightDetailService.track(hex: hex, current: flight?.geoPoint),
               !Task.isCancelled else { return }
-        history = track
-        // Live positions from before the recorded track ended are now redundant.
-        if let end = track.last, let i = trail.lastIndex(where: { FlightService.gcDistance($0.lat, $0.lon, end.lat, end.lon) < 2 }) {
-            trail.removeFirst(i)
+        history = track.points
+        // A track that starts low began at the departure airport.
+        if let start = track.points.first, (track.startAltitudeFt ?? .infinity) < 3_000 {
+            departedFrom = AirportDB.nearest(to: start.point, within: 8)
+        }
+        if var f = flight {
+            resolveRoute(&f)
+            flight = f
+        }
+    }
+
+    /// Picks the route to show: the scheduled route when it fits the live position (and the
+    /// recorded departure airport), else what the recorded track and descent imply.
+    private func resolveRoute(_ f: inout Flight) {
+        routeNote = nil
+        let scheduled = candidateRoute
+        if let r = scheduled, FlightService.isPlausible(r, for: f), departedFrom == nil || departedFrom?.code == r.from.code {
+            f.route = r
+            return
+        }
+        guard let origin = departedFrom else {
+            f.route = nil
+            return
+        }
+        if let r = scheduled, r.from.code == origin.code {
+            f.route = r
+            routeNote = "Departure confirmed by the flight’s track"
+        } else if let dest = AirportDB.likelyDestination(for: f), dest.code != origin.code {
+            f.route = RouteInfo(airline: scheduled?.airline, flightNo: scheduled?.flightNo,
+                                airlineCode: scheduled?.airlineCode, from: origin, to: dest)
+            routeNote = "Departure from the flight’s track · destination estimated from its descent"
+        } else {
+            f.route = nil
+            routeNote = "Departure from the flight’s track"
         }
     }
 
@@ -136,10 +173,11 @@ final class FlightDetailModel: ObservableObject {
         }
         f.aircraft = AircraftInfo(model: aircraftInfo?.model ?? f.aircraft?.model,
                                   owner: aircraftInfo?.owner ?? f.aircraft?.owner)
-        f.route = candidateRoute.flatMap { FlightService.isPlausible($0, for: f) ? $0 : nil }
+        resolveRoute(&f)
 
-        let moved = trail.last.map { FlightService.gcDistance($0.lat, $0.lon, f.lat, f.lon) >= 0.05 } ?? true
-        if moved { trail.append(f.geoPoint) }
+        trail.removeAll { $0.time == .distantPast }
+        let moved = trail.last.map { FlightService.gcDistance($0.point.lat, $0.point.lon, f.lat, f.lon) >= 0.05 } ?? true
+        if moved { trail.append(TimedPoint(point: f.geoPoint, time: report.positionTime)) }
         flight = f
         squawk = report.squawk
         onGround = report.onGround
@@ -176,15 +214,20 @@ final class FlightDetailModel: ObservableObject {
     /// Planned great-circle route, origin to destination.
     var plannedPath: [GeoPoint] {
         guard let r = flight?.route else { return [] }
-        return FlightMath.greatCircle(from: r.from.geoPoint, to: r.to.geoPoint)
+        return FlightMath.removingRepeats(FlightMath.greatCircle(from: r.from.geoPoint, to: r.to.geoPoint))
     }
 
     /// Flown track: the recorded track plus live positions since, or (without a recorded track)
     /// a great circle from the origin to the first observed position, then the observed trail.
     var flownPath: [GeoPoint] {
-        if !history.isEmpty { return history + trail }
-        guard let r = flight?.route, let first = trail.first else { return trail }
-        return FlightMath.greatCircle(from: r.from.geoPoint, to: first).dropLast() + trail
+        // Merge by time so the line always runs through the aircraft's current position.
+        let end = history.last?.time ?? .distantPast
+        var points = history.map(\.point) + trail.filter { $0.time > end }.map(\.point)
+        if let f = flight, points.last != f.geoPoint { points.append(f.geoPoint) }
+        if history.isEmpty, let r = flight?.route, let first = points.first {
+            points = FlightMath.greatCircle(from: r.from.geoPoint, to: first).dropLast() + points
+        }
+        return FlightMath.removingRepeats(points)
     }
 
     var adsbLolURL: URL? { URL(string: "https://adsb.lol/?icao=\(hex)") }
@@ -228,17 +271,21 @@ private struct FlightDetailMap: View {
     var body: some View {
         Map(position: $camera, interactionModes: [.pan, .zoom]) {
             if let r = model.flight?.route {
-                MapPolyline(coordinates: model.plannedPath.map(\.coordinate), contourStyle: .geodesic)
+                MapPolyline(coordinates: model.plannedPath.map(\.coordinate))
                     .stroke(Color.secondary.opacity(0.7), style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [6, 6]))
                 airport(r.from)
                 airport(r.to)
             }
+            if model.flight?.route == nil, let origin = model.departedFrom {
+                airport(origin)
+            }
             if model.flownPath.count > 1 {
-                MapPolyline(coordinates: model.flownPath.map(\.coordinate), contourStyle: .geodesic)
+                MapPolyline(coordinates: model.flownPath.map(\.coordinate))
                     .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
             }
             if let observer {
-                MapCircle(center: observer.coordinate, radius: Double(model.radiusNM) * 1852)
+                // Drawn as a polygon: MapCircle stopped the map rendering tiles while on screen.
+                MapPolygon(coordinates: FlightMath.circle(around: observer, radiusNM: Double(model.radiusNM)).map(\.coordinate))
                     .foregroundStyle(Color.blue.opacity(0.06))
                     .stroke(Color.blue.opacity(0.6), lineWidth: 1.5)
                 // Radius label on the circle's northern edge.
@@ -255,8 +302,9 @@ private struct FlightDetailMap: View {
                 Annotation("", coordinate: other.geoPoint.coordinate, anchor: .center) {
                     Button { openFlight(other) } label: {
                         VStack(spacing: 1) {
-                            Image(systemName: "airplane")
-                                .font(.system(size: 13, weight: .semibold))
+                            let kind = AircraftClass(typeCode: other.typeCode)
+                            Image(systemName: kind.symbol)
+                                .font(.system(size: 14 * kind.iconScale, weight: .semibold))
                                 .rotationEffect(.degrees((other.track ?? 90) - 90))
                             Text(other.displayNumber)
                                 .font(.system(size: 9, weight: .medium))
@@ -279,8 +327,9 @@ private struct FlightDetailMap: View {
             }
             if let f = model.flight {
                 Annotation(f.displayNumber, coordinate: f.geoPoint.coordinate, anchor: .center) {
-                    Image(systemName: "airplane")
-                        .font(.system(size: 22, weight: .semibold))
+                    let kind = AircraftClass(typeCode: f.typeCode)
+                    Image(systemName: kind.symbol)
+                        .font(.system(size: 22 * kind.iconScale, weight: .semibold))
                         .foregroundStyle(model.isLive ? Color.accentColor : Color.secondary)
                         .shadow(color: .black.opacity(0.35), radius: 1.5)
                         // The symbol points east; the map is always north-up.
@@ -338,7 +387,7 @@ private struct FlightDetailMap: View {
             } else if let observer, FlightService.gcDistance(observer.lat, observer.lon, f.lat, f.lon) < 300 {
                 points.append(observer)
             }
-            points += model.history
+            points += model.history.map(\.point)
         } else if let observer {
             points.append(observer)
         }
@@ -369,7 +418,11 @@ private struct FlightDetailSidebar: View {
                     .padding(.horizontal, 20)
                     .padding(.top, 16)
                 Form {
-                    if let r = f.route { routeSection(f, r) }
+                    if let r = f.route {
+                        routeSection(f, from: r.from, to: r.to)
+                    } else if let origin = model.departedFrom {
+                        routeSection(f, from: origin, to: nil)
+                    }
                     flightSection(f)
                     aircraftSection(f)
                     if Shared.location != nil {
@@ -431,14 +484,21 @@ private struct FlightDetailSidebar: View {
         }
     }
 
-    private func routeSection(_ f: Flight, _ r: RouteInfo) -> some View {
-        Section("Route") {
+    private func routeSection(_ f: Flight, from: Airport, to: Airport?) -> some View {
+        Section {
             HStack(alignment: .top) {
-                airport(r.from, alignment: .leading)
+                airport(from, alignment: .leading)
                 Spacer()
                 Image(systemName: "arrow.right").foregroundStyle(.secondary).padding(.top, 6)
                 Spacer()
-                airport(r.to, alignment: .trailing)
+                if let to {
+                    airport(to, alignment: .trailing)
+                } else {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("—").font(.system(size: 26, weight: .semibold, design: .rounded))
+                        Text("Unknown").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
             }
             if let p = f.progress, let flown = model.flownNM, let left = model.remainingNM {
                 VStack(alignment: .leading, spacing: 4) {
@@ -455,6 +515,12 @@ private struct FlightDetailSidebar: View {
                         Text("in \(FlightMath.durationText(t))").font(.caption).foregroundStyle(.secondary)
                     }
                 }
+            }
+        } header: {
+            Text("Route")
+        } footer: {
+            if let note = model.routeNote {
+                Text(note).font(.caption).foregroundStyle(.secondary)
             }
         }
     }
