@@ -20,6 +20,8 @@ struct MainWindowView: View {
             Group {
                 if radar.settingsTab != nil {
                     SettingsSidebar(radar: radar)
+                } else if radar.showsLogbook {
+                    LogbookList(model: radar.logbook)
                 } else {
                     FlightList(radar: radar,
                                flights: FlightListFilter.apply(radar.flights, query: radar.query, sort: radar.sort),
@@ -61,6 +63,9 @@ struct MainWindowView: View {
             if let tab = radar.settingsTab {
                 SettingsPane(tab: tab, store: store)
                     .transition(.opacity)
+            } else if radar.showsLogbook {
+                LogbookContent(radar: radar, model: radar.logbook)
+                    .transition(.opacity)
             } else if let detail = radar.detail {
                 FlightDetailView(model: detail)
                     .id(detail.hex)
@@ -88,6 +93,7 @@ struct MainWindowView: View {
 
     private var title: String {
         if radar.settingsTab != nil { return "Settings" }
+        if radar.showsLogbook { return "Logbook" }
         return detailTitle ?? "FlightDesk"
     }
 
@@ -100,6 +106,7 @@ struct MainWindowView: View {
 
     private var subtitle: String {
         if let tab = radar.settingsTab { return tab.title }
+        if radar.showsLogbook { return "Stored only on this Mac" }
         if radar.detail != nil {
             guard let f = radar.detailFlight else { return "Loading…" }
             if let r = f.route, let to = f.destination {
@@ -128,7 +135,7 @@ struct MainWindowView: View {
 
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        if radar.settingsTab != nil || radar.detail != nil {
+        if radar.settingsTab != nil || radar.showsLogbook || radar.detail != nil {
             ToolbarItem(placement: .navigation) {
                 Button { withAnimation(MainWindowController.motion) { _ = radar.goBack() } } label: {
                     Label("Back", systemImage: "chevron.backward")
@@ -136,13 +143,24 @@ struct MainWindowView: View {
                 .help(backHelp)
             }
         }
-        if radar.settingsTab == nil {
+        if radar.settingsTab == nil && radar.showsLogbook {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    let log = SpottingLogStore.shared
+                    radar.logbook.export(radar.logbook.visible(in: log, db: SpotterAlerts.shared.database))
+                } label: {
+                    Label("Export CSV…", systemImage: "square.and.arrow.up")
+                }
+                .help("Export the aircraft shown to a CSV file")
+            }
+        } else if radar.settingsTab == nil {
             radarActions
         }
     }
 
     /// Where Back goes: from Settings to the flight or map underneath, from a flight to the map.
     private var backHelp: String {
+        if radar.settingsTab != nil, radar.showsLogbook { return "Back to the logbook (⌘[)" }
         if radar.settingsTab != nil, let flight = detailTitle { return "Back to \(flight) (⌘[)" }
         return "Back to the map (⌘[)"
     }
@@ -191,6 +209,7 @@ private struct FlightList: View {
     let includeGA: Bool
     let hasLocation: Bool
     let locationStatus: String
+    @ObservedObject private var log = SpottingLogStore.shared
     @Environment(\.displayOptions) private var o
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -199,7 +218,10 @@ private struct FlightList: View {
             List(selection: $radar.selection) {
                 if !flights.isEmpty {
                     Section {
-                        ForEach(flights) { FlightRow(f: $0, phase: radar.runwayPhases[$0.id]).tag($0.id) }
+                        ForEach(flights) {
+                            FlightRow(f: $0, phase: radar.runwayPhases[$0.id],
+                                      firstSighting: log.firstTypeSightings.contains($0.id)).tag($0.id)
+                        }
                     } header: {
                         header
                     }
@@ -356,6 +378,8 @@ private struct FlightMenu: View {
 private struct FlightRow: View {
     let f: Flight
     let phase: RunwayPhase?
+    /// The spotting log had never seen this aircraft's type before.
+    var firstSighting = false
     @Environment(\.displayOptions) private var o
 
     /// The second line: the runway phase (tinted) ahead of the route, or the usual subtitle.
@@ -371,7 +395,7 @@ private struct FlightRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 5) {
                     Text(f.displayNumber).font(.headline).lineLimit(1)
-                    if let s = f.situation { SituationChip(situation: s) }
+                    if let s = f.situation { SituationChip(situation: s) } else if firstSighting { FirstSightingChip() }
                 }
                 subtitle
                     .font(.subheadline)
@@ -397,7 +421,8 @@ private struct FlightRow: View {
         .padding(.vertical, 3)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(FlightRowText.accessibilityLabel(f))
-        .accessibilityValue([FlightRowText.accessibilityValue(f, units: o.units), phase?.tag(o)].compactMap { $0 }.joined(separator: ", "))
+        .accessibilityValue([FlightRowText.accessibilityValue(f, units: o.units), phase?.tag(o), firstSighting ? "first sighting of this type" : nil]
+            .compactMap { $0 }.joined(separator: ", "))
         .accessibilityAction(named: "Open Details") { FlightDetail.show(hex: f.id, snapshot: f) }
     }
 }
@@ -437,6 +462,22 @@ private struct SituationChip: View {
             .background(Capsule().fill(situation.tint))
             .fixedSize()
             .help(situation.spoken)
+            .accessibilityHidden(true)
+    }
+}
+
+/// "First sighting": a type the spotting log had never seen. The row's accessibility value speaks it.
+private struct FirstSightingChip: View {
+    var body: some View {
+        Text("First sighting")
+            .font(.caption2.weight(.bold))
+            .lineLimit(1)
+            .foregroundStyle(Color.accentColor)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Capsule().strokeBorder(Color.accentColor, lineWidth: 1))
+            .fixedSize()
+            .help("The first time your logbook has seen this aircraft type")
             .accessibilityHidden(true)
     }
 }
@@ -1061,12 +1102,14 @@ private struct DestinationWeatherRow: View {
     }
 }
 
-/// The sidebar's bottom bar: a Settings button that toggles between Settings and the radar.
+/// The sidebar's bottom bar: a Settings button that toggles between Settings and the radar, and
+/// a Logbook button that toggles between the logbook and the radar.
 private struct SidebarFooter: View {
     @ObservedObject var radar: RadarModel
 
     var body: some View {
         let inSettings = radar.settingsTab != nil
+        let inLogbook = radar.showsLogbook && !inSettings
         VStack(spacing: 0) {
             Divider()
             HStack {
@@ -1080,8 +1123,19 @@ private struct SidebarFooter: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
-                .help(inSettings ? "Back to the radar" : "Settings (⌘,)")
+                .help(inSettings ? (radar.showsLogbook ? "Back to the logbook" : "Back to the radar") : "Settings (⌘,)")
                 Spacer()
+                Button {
+                    withAnimation(MainWindowController.motion) {
+                        if inLogbook { radar.closeLogbook() } else { radar.showLogbook() }
+                    }
+                } label: {
+                    Label(inLogbook ? "Radar" : "Logbook", systemImage: inLogbook ? "dot.radiowaves.left.and.right" : "book")
+                        .labelStyle(.titleAndIcon)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+                .help(inLogbook ? "Back to the radar" : "Every aircraft you’ve seen, kept on this Mac")
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 9)

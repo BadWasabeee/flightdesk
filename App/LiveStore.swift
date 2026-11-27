@@ -77,6 +77,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             m.runwayPhases = RunwayPhase.listPhases(for: flights, previous: model.runwayPhases, phase: ApproachAnalyzer.listPhase)
             m.status = flights.isEmpty ? "Quiet skies — nothing within \(settings.display.radius(settings.radius.nm))" : ""
             model = m
+            SpottingLogStore.shared.record(flights)
             onFlights?(flights)
         } catch {
             model.status = "Can’t reach flight data — retrying"
@@ -171,6 +172,8 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             let now = Date()
             widgetBaselines = fresh.mapValues { (now, $0) }
         }
+        // The spotting log takes the app area's list whenever it was fetched anyway.
+        if let all = appAreaFlights { recordInLog(all) }
         // Spotter alerts and the menu-bar readout see every aircraft in range (GA included) while hidden.
         guard let onFlights, wantsBackgroundFlights(), let loc = Shared.location else { return }
         // They take routes and diversions from the enriched panel list, so keep it from going stale
@@ -178,8 +181,16 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
         if Date().timeIntervalSince(model.updated ?? .distantPast) > 60 { await refresh() }
         if appAreaFlights == nil {
             appAreaFlights = try? await FlightService.allNearby(lat: loc.lat, lon: loc.lon, radiusNM: settings.radius.nm)
+            if let all = appAreaFlights { recordInLog(all) }
         }
         if let all = appAreaFlights { onFlights(all) }
+    }
+
+    /// Background lists carry no routes: the log takes them from the panel's enriched list (no lookups).
+    private func recordInLog(_ flights: [Flight]) {
+        guard SpottingLogStore.shared.isEnabled else { return }
+        let known = Dictionary(model.flights.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        SpottingLogStore.shared.record(FlightListFilter.merging(flights, known: known))
     }
 
     // MARK: Location
