@@ -109,7 +109,7 @@ These are free community services. Please be kind to them, and consider supporti
 - The flight detail window looks up the selected aircraft's track on the [OpenSky Network](https://opensky-network.org) by its ICAO address only.
 - Airline logos are fetched by airline code only (ICAO and/or IATA, never your location) from jsDelivr, GitHub (raw.githubusercontent.com) and Kiwi.com's logo CDN, then cached on your Mac. Turn off **Show airline logos** to disable this.
 
-- Your location stays on your Mac. Requests to adsb.lol include only a **rounded** position (about 1 km).
+- Your location stays on your Mac. Requests to adsb.fi and adsb.lol include only a **rounded** position (about 1 km).
 - adsbdb receives only flight callsigns and aircraft hex codes.
 - There are no accounts, analytics or tracking. Settings live in the App Group container on your Mac.
 
