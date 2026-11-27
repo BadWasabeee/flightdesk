@@ -66,10 +66,14 @@ struct AcarsMessage: Identifiable, Equatable, Sendable {
     let station: String?
     let direction: AcarsDirection?
     let fields: [Field]
+    /// One sentence describing the contents, when they have a natural summary.
+    let summary: String?
+    /// Readable text carried inside an encoded message (MIAM), when it decoded.
+    let decodedText: String?
     let event: OOOIReport?
-    /// Named route fixes the message mentions, in order (no positions: they need a fix database).
-    let waypoints: [String]
-    /// A position given in an unambiguous format in the text.
+    /// The route or position an FMS message reports (wind requests and position reports).
+    let routeReport: AcarsRouteReport?
+    /// A position given in an unambiguous format in the text, or by an FMS position report.
     let position: GeoPoint?
     /// Link maintenance with nothing to read (keep-alives, link tests, empty frames).
     let isNoise: Bool
@@ -94,13 +98,14 @@ struct AcarsFlight: Equatable, Sendable {
     let messages: [AcarsMessage]
     /// The earliest report of each OOOI event.
     let times: [OOOIEvent: Date]
-    /// Named fixes from all messages, in route order.
-    let waypoints: [String]
 
     /// Messages worth reading (or all of them).
     func visibleMessages(showAll: Bool) -> [AcarsMessage] {
         showAll ? messages : messages.filter { !$0.isNoise }
     }
+
+    /// What the messages say about the route, newest first.
+    var routeReports: [AcarsRouteReport] { messages.compactMap(\.routeReport) }
 }
 
 // MARK: - Airframes.io wire format
@@ -531,31 +536,12 @@ enum AcarsDecoder {
     }
     private static let oooiPattern = regex("^([A-Z]{4})([A-Z]{4})([0-2][0-9])([0-5][0-9])")
 
-    /// Named fixes from an FMS wind request (`REQPWI/…/WQ390.360:ACK.WHALE.NANSO/…`) or position
-    /// report (`POSN47144W122283,BREVE,033304,100,NETTZ,033431,KWEST,…`). Coordinates and tokens
-    /// that may be cut off at the end of a message block are left out.
-    static func waypoints(in core: String) -> [String] {
-        func isFix(_ s: Substring) -> Bool { (2...5).contains(s.count) && s.allSatisfy { $0.isASCII && $0.isUppercase } }
-        var names: [Substring] = []
-        if core.hasPrefix("REQPWI"), let m = match(windRoutePattern, core) {
-            var tokens = m[2].split(separator: ".", omittingEmptySubsequences: false)
-            if m[3].isEmpty, !tokens.isEmpty { tokens.removeLast() }   // runs to the end: may be truncated
-            names = tokens.filter(isFix)
-        } else if core.hasPrefix("POS"), match(positionReportPattern, core) != nil {
-            let f = core.split(separator: ",", omittingEmptySubsequences: false)
-            names = [1, 4, 6].compactMap { $0 < f.count - 1 ? f[$0].trimmingCharacters(in: .whitespaces)[...] : nil }.filter(isFix)
-        }
-        var seen = Set<Substring>()
-        return names.filter { seen.insert($0).inserted }.map(String.init)
-    }
-    private static let windRoutePattern = regex("/WQ([0-9.]+):([A-Z0-9.]*)(/?)")
-    private static let positionReportPattern = regex("^POS[NS][0-9]{5}[EW][0-9]{6},")
-
     /// Flight levels in an FMS wind request ("WQ410.390" → FL410, FL390).
     static func windLevels(in core: String) -> [String] {
-        guard core.hasPrefix("REQPWI"), let m = match(windRoutePattern, core) else { return [] }
+        guard core.hasPrefix("REQPWI"), let m = match(windLevelsPattern, core) else { return [] }
         return m[1].split(separator: ".").filter { $0.count == 3 && $0.allSatisfy(\.isNumber) }.map { "FL\($0)" }
     }
+    private static let windLevelsPattern = regex("/WQ([0-9.]+):")
 
     /// The first position in `text` written in an unambiguous format: decimal degrees
     /// ("N 41.193/E141.675", "LAT N 58.253,LON E 20.112") or degrees and decimal minutes
@@ -608,29 +594,25 @@ extension AcarsMessage {
         let text = AcarsDecoder.cleaned(m.text)
         let core = AcarsDecoder.core(text)
         let label = m.label.flatMap { $0.isEmpty ? nil : $0 }
-        var fields: [Field] = []
         let oooi = AcarsDecoder.oooi(label: label, text: core, sent: m.timestamp)
-        if let oooi {
-            fields.append(Field(name: oooi.kind.title, value: AcarsMessage.utc(oooi.time)))
-            if let r = oooi.route { fields.append(Field(name: "Route", value: "\(r.from) → \(r.to)")) }
-        }
-        let levels = AcarsDecoder.windLevels(in: core)
-        if !levels.isEmpty { fields.append(Field(name: "Levels", value: levels.joined(separator: ", "))) }
-        let position = AcarsDecoder.position(in: core)
-        if let position { fields.append(Field(name: "Position", value: AcarsDecoder.format(position))) }
+        let report = label == "H1" ? AcarsRouteParser.report(in: core, sent: m.timestamp) : nil
+        let position = report?.position?.point ?? AcarsDecoder.position(in: core)
+        let content = AcarsContentDecoder.decode(label: label, core: core, sent: m.timestamp, route: report)
 
         id = String(m.id)
         time = m.timestamp
         self.label = label
-        plainLabel = AcarsDecoder.plainLabel(label, text: text)
+        plainLabel = content?.kind ?? AcarsDecoder.plainLabel(label, text: text)
         self.text = text
         link = AcarsDecoder.linkName(m.sourceType)
         station = m.station?.ident.flatMap { $0.isEmpty ? nil : String($0.prefix(40)) }
         direction = AcarsDecoder.direction(link: m.linkDirection, fromHex: m.fromHex, toHex: m.toHex,
                                            blockID: m.blockId, aircraftHex: aircraftHex)
-        self.fields = fields
+        fields = content?.fields ?? position.map { [Field(name: "Position", value: AcarsDecoder.format($0))] } ?? []
+        summary = content?.summary
+        decodedText = content?.text
         event = oooi.map { OOOIReport(kind: $0.kind, time: $0.time) }
-        waypoints = AcarsDecoder.waypoints(in: core)
+        routeReport = report
         self.position = position
         isNoise = label == nil || AcarsDecoder.noiseLabels.contains(label ?? "") || core.isEmpty
     }
@@ -659,7 +641,8 @@ extension AcarsMessage {
         return AcarsMessage(id: id, time: min(time, other.time), label: label, plainLabel: fuller.plainLabel, text: fuller.text,
                             link: link, station: station ?? other.station, direction: direction ?? other.direction,
                             fields: fields.count >= other.fields.count ? fields : other.fields,
-                            event: event ?? other.event, waypoints: waypoints.count >= other.waypoints.count ? waypoints : other.waypoints,
+                            summary: fuller.summary ?? summary ?? other.summary, decodedText: fuller.decodedText ?? decodedText ?? other.decodedText,
+                            event: event ?? other.event, routeReport: fuller.routeReport ?? routeReport ?? other.routeReport,
                             position: position ?? other.position, isNoise: isNoise && other.isNoise)
     }
 }
@@ -681,8 +664,6 @@ extension AcarsFlight {
         unique.sort { $0.time > $1.time }   // a merged copy keeps the earliest time it was heard
         var times: [OOOIEvent: Date] = [:]
         for m in unique { if let e = m.event { times[e.kind] = min(times[e.kind] ?? e.time, e.time) } }
-        var seen = Set<String>()
-        let route = unique.reversed().flatMap(\.waypoints).filter { seen.insert($0).inserted }
 
         id = f.id
         flightNumber = f.flight
@@ -694,7 +675,6 @@ extension AcarsFlight {
         messagesCount = max(f.messagesCount ?? 0, unique.count)
         messages = unique
         self.times = times
-        waypoints = Array(route.prefix(60))
     }
 
     /// The departure and destination as a route (with `scheduled`'s airline and number), when

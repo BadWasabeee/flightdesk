@@ -510,6 +510,17 @@ private struct RadarMap: View {
 
     private var motion: Animation? { reduceMotion ? nil : .default }
 
+    /// The selected aircraft's route ahead: along its decoded ACARS route (not during a diversion
+    /// or return), else a great circle to where it's going; empty when that's unknown.
+    private func aheadPath(of f: Flight) -> [GeoPoint] {
+        if let route = radar.acarsRoutes[f.id], f.pathSituation?.newDestination == nil,
+           let plan = route.plan(aircraft: f.geoPoint, origin: f.route?.from.geoPoint, destination: f.route?.to.geoPoint) {
+            return plan.remaining
+        }
+        guard f.route != nil, let to = f.destination else { return [] }
+        return FlightMath.removingRepeats(FlightMath.greatCircle(from: f.geoPoint, to: to.geoPoint))
+    }
+
     var body: some View {
         let selected = radar.flights.first { $0.id == radar.selection }
         Map(position: $camera, interactionModes: [.pan, .zoom]) {
@@ -540,16 +551,14 @@ private struct RadarMap: View {
                 }
             }
             if let selected {
-                // Ahead: a dashed great circle to the destination. Each dash has a dark rim (its casing is
+                // Ahead: dashes along the route the aircraft reported over ACARS (when a detail decoded
+                // it), else a great circle to the destination. Each dash has a dark rim (its casing is
                 // dashed too, with wider round caps) so it reads over land, water and dark mode alike.
-                if let to = selected.route != nil ? selected.destination : nil {
-                    let ahead = FlightMath.removingRepeats(FlightMath.greatCircle(from: selected.geoPoint, to: to.geoPoint))
-                    if ahead.count > 1 {
-                        MapPolyline(coordinates: ahead.map(coordinate))
-                            .stroke(Color.black.opacity(0.3), style: StrokeStyle(lineWidth: 5, lineCap: .round, dash: [7, 7]))
-                        MapPolyline(coordinates: ahead.map(coordinate))
-                            .stroke(Color.accentColor.opacity(0.7), style: StrokeStyle(lineWidth: 2.5, lineCap: .round, dash: [7, 7]))
-                    }
+                ForEach(Array(RouteGeometry.antimeridianSafe(aheadPath(of: selected)).enumerated()), id: \.offset) { _, ahead in
+                    MapPolyline(coordinates: ahead.map(coordinate))
+                        .stroke(Color.black.opacity(0.3), style: StrokeStyle(lineWidth: 5, lineCap: .round, dash: [7, 7]))
+                    MapPolyline(coordinates: ahead.map(coordinate))
+                        .stroke(Color.accentColor.opacity(0.7), style: StrokeStyle(lineWidth: 2.5, lineCap: .round, dash: [7, 7]))
                 }
                 // Flown: the recorded track (when OpenSky has it), then live positions since selection.
                 let flown = FlightMath.removingRepeats(radar.tracks[selected.id, default: []] + radar.trail + [selected.geoPoint])

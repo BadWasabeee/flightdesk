@@ -32,6 +32,12 @@ targets:
       # Airport table for route checks, read lazily by AirportDB.
       - path: Shared/Resources/airports.csv
         buildPhase: resources
+      # Runway thresholds for approach/landing detection, read lazily by RunwayDB.
+      - path: Shared/Resources/runways.csv
+        buildPhase: resources
+      # Fixes and navaids for routes decoded from ACARS (detail view only, so not in the widget).
+      - path: Shared/Resources/navdata.csv
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).flightdesk
@@ -56,6 +62,9 @@ targets:
       # Airport table for route checks, read lazily by AirportDB.
       - path: Shared/Resources/airports.csv
         buildPhase: resources
+      # Runway thresholds for approach/landing detection, read lazily by RunwayDB.
+      - path: Shared/Resources/runways.csv
+        buildPhase: resources
       - path: Config/Privacy/Widget/PrivacyInfo.xcprivacy
         buildPhase: resources
     settings:
@@ -75,6 +84,11 @@ targets:
         excludes: ["Resources/**"]
       # Airport table for route checks, read lazily by AirportDB.
       - path: Shared/Resources/airports.csv
+        buildPhase: resources
+      # Runway thresholds for approach/landing detection, read lazily by RunwayDB.
+      - path: Shared/Resources/runways.csv
+        buildPhase: resources
+      - path: Shared/Resources/navdata.csv
         buildPhase: resources
     settings:
       base:

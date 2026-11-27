@@ -36,16 +36,23 @@ enum RouteGeometry {
         return GeoPoint(lat: atan2(z, sqrt(x * x + y * y)) * 180 / .pi, lon: atan2(y, x) * 180 / .pi)
     }
 
+    /// The segment of `path` (from `path[index]` to `path[index + 1]`) passing closest to `p`, how
+    /// far along it the nearest point lies, and its distance (nm). Nil for fewer than two points.
+    static func nearestSegment(_ path: [GeoPoint], to p: GeoPoint) -> (index: Int, fraction: Double, distance: Double)? {
+        guard path.count > 1 else { return nil }
+        var best = (index: 0, fraction: 0.0, distance: Double.infinity)
+        for i in path.indices.dropLast() {
+            let n = nearest(on: path[i], path[i + 1], to: p)
+            if n.distance < best.distance { best = (i, n.fraction, n.distance) }
+        }
+        return best
+    }
+
     /// Splits `path` where it passes closest to `aircraft`. `flown` runs from the start to that
     /// point on the path; `remaining` starts at the aircraft itself (so the line meets the marker
     /// even when it's off the planned route) and continues with the rest of the path.
     static func split(_ path: [GeoPoint], at aircraft: GeoPoint) -> (flown: [GeoPoint], remaining: [GeoPoint]) {
-        guard path.count > 1 else { return ([], []) }
-        var best = (index: 0, distance: Double.infinity, fraction: 0.0)
-        for i in path.indices.dropLast() {
-            let n = nearest(on: path[i], path[i + 1], to: aircraft)
-            if n.distance < best.distance { best = (i, n.distance, n.fraction) }
-        }
+        guard let best = nearestSegment(path, to: aircraft) else { return ([], []) }
         let onPath = intermediate(path[best.index], path[best.index + 1], fraction: best.fraction)
         let flown = FlightMath.removingRepeats(Array(path[...best.index]) + [onPath])
         let remaining = FlightMath.removingRepeats([aircraft] + Array(path[(best.index + 1)...]))

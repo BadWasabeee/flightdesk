@@ -41,6 +41,8 @@ final class FlightDetailModel: ObservableObject {
     @Published private(set) var buildYear: Int?
     /// ACARS messages for the current flight, from Airframes.io.
     @Published private(set) var acars: AcarsState = .loading
+    /// The route the aircraft reported over ACARS, with its names placed.
+    @Published private(set) var acarsRoute: AcarsRoute? { didSet { updatePaths() } }
 
     /// Planned great-circle route, origin to destination (cached; recomputed when data changes).
     private(set) var plannedPath: [GeoPoint] = []
@@ -51,6 +53,10 @@ final class FlightDetailModel: ObservableObject {
     private(set) var flownLines: [[GeoPoint]] = []
     private(set) var remainingLines: [[GeoPoint]] = []
     private(set) var headingLines: [[GeoPoint]] = []
+    /// How `acarsRoute` runs on from the aircraft, while it fits the flight (cached with the paths).
+    private(set) var routePlan: AcarsRoutePlan?
+    /// Placed ACARS route waypoints still ahead, for the map.
+    private(set) var waypointMarks: [WaypointMark] = []
 
     /// Progress of the airframe photo lookup.
     enum PhotoState {
@@ -84,7 +90,9 @@ final class FlightDetailModel: ObservableObject {
     private var acarsCursor = AcarsCursor()
     /// Departure and destination the aircraft reported over ACARS: a route used only when the
     /// scheduled one is missing or doesn't fit (see `RouteResolver`).
-    private var acarsRoute: RouteInfo?
+    private var acarsEndpoints: RouteInfo?
+    /// What `acarsRoute` was last decoded from.
+    private var acarsRouteInput: AcarsRouteInput?
 
     /// `nearby` seeds the map's other aircraft (when switching planes) until the next refresh.
     init(hex: String, snapshot: Flight?, nearby: [Flight] = []) {
@@ -208,10 +216,13 @@ final class FlightDetailModel: ObservableObject {
             switch result {
             case .flight(let a)?:
                 if acars != .loaded(a) { acars = .loaded(a) }
-                useAcarsRoute(a.route(scheduled: candidateRoute))
+                useAcarsEndpoints(a.route(scheduled: candidateRoute))
+                await decodeRoute(of: a)
             case .noFlight?, .unknownAircraft?:
                 acars = .none
-                useAcarsRoute(nil)
+                useAcarsEndpoints(nil)
+                acarsRouteInput = nil
+                acarsRoute = nil
             case nil:
                 break
             }
@@ -222,18 +233,36 @@ final class FlightDetailModel: ObservableObject {
         }
     }
 
-    private func useAcarsRoute(_ route: RouteInfo?) {
-        guard route != acarsRoute else { return }
-        acarsRoute = route
+    private func useAcarsEndpoints(_ route: RouteInfo?) {
+        guard route != acarsEndpoints else { return }
+        acarsEndpoints = route
         if var f = flight {
             resolveRoute(&f)
             flight = f
         }
     }
 
+    /// Places the route the messages describe, off the main thread (the first use loads the
+    /// navigation table). Skipped when neither the messages nor the endpoints changed.
+    private func decodeRoute(of a: AcarsFlight) async {
+        let origin = flight?.route?.from ?? departedFrom ?? a.departingAirport
+        let destination = flight?.route?.to ?? a.destinationAirport
+        let input = AcarsRouteInput(reports: a.routeReports, origin: origin?.code, destination: destination?.code)
+        guard input != acarsRouteInput else { return }
+        acarsRouteInput = input
+        guard !input.reports.isEmpty else { acarsRoute = nil; return }
+        let context = AcarsRouteContext(origin: origin?.geoPoint, destination: destination?.geoPoint,
+                                        track: history + trail.filter { $0.time != .distantPast })
+        let route = await Task.detached(priority: .utility) {
+            AcarsRouteResolver.route(from: input.reports, context: context, navDB: .bundled)
+        }.value
+        guard !Task.isCancelled, input == acarsRouteInput else { return }
+        if route != acarsRoute { acarsRoute = route }
+    }
+
     /// Picks the route to show (see `RouteResolver`, which the list and widget share).
     private func resolveRoute(_ f: inout Flight) {
-        let r = RouteResolver.resolve(scheduled: candidateRoute, flight: f, departedFrom: departedFrom, hint: acarsRoute)
+        let r = RouteResolver.resolve(scheduled: candidateRoute, flight: f, departedFrom: departedFrom, hint: acarsEndpoints)
         f.route = r.route
         f.pathSituation = r.situation
         routeNote = r.note
@@ -308,10 +337,19 @@ final class FlightDetailModel: ObservableObject {
         return FlightService.gcDistance(r.from.lat, r.from.lon, f.lat, f.lon)
     }
 
-    /// Distance to where the aircraft is going (the diversion or return airport when there is one).
+    /// Distance to where the aircraft is going (the diversion or return airport when there is
+    /// one), along the ACARS route when it's drawn.
     var remainingNM: Double? {
         guard let f = flight, let to = f.destination else { return nil }
-        return FlightService.gcDistance(f.lat, f.lon, to.lat, to.lon)
+        return routePlan?.remainingNM ?? FlightService.gcDistance(f.lat, f.lon, to.lat, to.lon)
+    }
+
+    /// The route card's footnote: how the route was worked out and where its drawn path comes from.
+    var routeFooter: String? {
+        let n = acarsRoute?.resolvedCount ?? 0
+        let acars = routePlan == nil ? nil : "Route from ACARS (\(n) \(n == 1 ? "waypoint" : "waypoints"))."
+        let parts = [routeNote, acars].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
     /// Arrival state while live: landed, landing, or an estimate at the current ground speed.
@@ -325,14 +363,32 @@ final class FlightDetailModel: ObservableObject {
         let r = flight?.route
         // During a diversion the route ahead leads to the diversion airport.
         let to = flight?.destination
-        let key = r.map { "\($0.from.code)>\(to?.code ?? $0.to.code)" } ?? ""
-        if key != lastPlannedKey {
-            lastPlannedKey = key
-            plannedPath = r.map { FlightMath.removingRepeats(FlightMath.greatCircle(from: $0.from.geoPoint, to: (to ?? $0.to).geoPoint)) } ?? []
+        // The reported route leads to the scheduled destination, so it isn't used during a diversion or return.
+        if let f = flight, let route = acarsRoute, f.pathSituation?.newDestination == nil {
+            routePlan = route.plan(aircraft: f.geoPoint, origin: (r?.from ?? departedFrom)?.geoPoint, destination: r?.to.geoPoint)
+        } else {
+            routePlan = nil
         }
-        // Merge by time so the line always runs through the aircraft's current position.
+        waypointMarks = (routePlan?.ahead ?? []).enumerated().compactMap { i, w in
+            w.point.map { WaypointMark(id: "wp\(i)-\(w.name)", point: $0, label: w.label) }
+        }
+        if let plan = routePlan {
+            plannedPath = plan.path
+            lastPlannedKey = "acars"
+        } else {
+            let key = r.map { "\($0.from.code)>\(to?.code ?? $0.to.code)" } ?? ""
+            if key != lastPlannedKey {
+                lastPlannedKey = key
+                plannedPath = r.map { FlightMath.removingRepeats(FlightMath.greatCircle(from: $0.from.geoPoint, to: (to ?? $0.to).geoPoint)) } ?? []
+            }
+        }
+        // Merge by time so the line always runs through the aircraft's current position. Without a
+        // recorded track, positions reported over ACARS stand in for it until the first live one.
         let end = history.last?.time ?? .distantPast
-        var points = history.map(\.point) + trail.filter { $0.time > end }.map(\.point)
+        let live = trail.filter { $0.time > end }
+        let firstLive = live.first?.time ?? .distantFuture
+        let recorded = history.isEmpty ? (acarsRoute?.positions ?? []).filter { $0.time < firstLive } : history
+        var points = recorded.map(\.point) + live.map(\.point)
         if let f = flight, points.last != f.geoPoint { points.append(f.geoPoint) }
         // Without a recorded track, join the origin to the first observed position.
         if history.isEmpty, let r, let first = points.first {
@@ -344,12 +400,14 @@ final class FlightDetailModel: ObservableObject {
         // The flown part of the route is shown by the track, so only what's ahead is dashed.
         if let f = flight, case .returning(let origin)? = f.pathSituation {
             remainingLines = RouteGeometry.antimeridianSafe(FlightMath.removingRepeats(FlightMath.greatCircle(from: f.geoPoint, to: origin.geoPoint)))
+        } else if let plan = routePlan {
+            remainingLines = RouteGeometry.antimeridianSafe(plan.remaining)
         } else if let f = flight, r != nil {
             remainingLines = RouteGeometry.antimeridianSafe(RouteGeometry.split(plannedPath, at: f.geoPoint).remaining)
         } else {
             remainingLines = []
         }
-        if let f = flight, r == nil, isLive, !onGround, let track = f.track {
+        if let f = flight, r == nil, routePlan == nil, isLive, !onGround, let track = f.track {
             headingLines = RouteGeometry.antimeridianSafe(RouteGeometry.headingVector(from: f.geoPoint, track: track, speedKT: f.speed))
         } else {
             headingLines = []
@@ -380,6 +438,20 @@ private extension GeoPoint {
 }
 
 private func observerPoint() -> GeoPoint? { Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) } }
+
+/// The messages and endpoints an ACARS route was decoded from.
+private struct AcarsRouteInput: Equatable {
+    var reports: [AcarsRouteReport]
+    var origin: String?
+    var destination: String?
+}
+
+/// A waypoint of the ACARS route drawn on the map.
+struct WaypointMark: Identifiable, Equatable {
+    let id: String
+    let point: GeoPoint
+    let label: String
+}
 
 /// Progress of a detail's ACARS lookup.
 enum AcarsState: Equatable {
@@ -587,6 +659,15 @@ private struct FlightDetailMap: View {
                     .stroke(Color.accentColor.opacity(model.destinationEstimated ? 0.65 : 1),
                             style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round, dash: [6, 8]))
             }
+            // Waypoints of the route reported over ACARS, labelled when there's room.
+            if detail >= .icons {
+                ForEach(model.waypointMarks) { w in
+                    Annotation("", coordinate: w.point.coordinate, anchor: .center) {
+                        WaypointMarker(label: w.label, showLabel: detail == .labelled && labelled.contains(w.id))
+                    }
+                    .annotationTitles(.hidden)
+                }
+            }
             // Route unknown: a thin dotted vector along the current heading (about 10 minutes ahead).
             ForEach(Array(model.headingLines.enumerated()), id: \.offset) { _, line in
                 MapPolyline(coordinates: line.map(\.coordinate))
@@ -665,7 +746,7 @@ private struct FlightDetailMap: View {
 
     /// Changes when the aircraft to label move or change.
     private var labelKey: [String] {
-        model.nearby.map { "\($0.id)\(Int($0.lat * 100)),\(Int($0.lon * 100))" } + [model.hex]
+        model.nearby.map { "\($0.id)\(Int($0.lat * 100)),\(Int($0.lon * 100))" } + [model.hex] + model.waypointMarks.map(\.id)
     }
 
     /// Picks which nearby aircraft get labels: nearest first, never overlapping each other, the
@@ -680,6 +761,8 @@ private struct FlightDetailMap: View {
         if let f = model.flight {
             items.insert(MapLabelLayout.Item(id: f.id, point: f.geoPoint, text: f.displayNumber), at: 0)
         }
+        // Waypoint labels give way to aircraft labels.
+        items += model.waypointMarks.map { MapLabelLayout.Item(id: $0.id, point: $0.point, text: $0.label) }
         var next = MapLabelLayout.labelled(items, in: viewport, pinned: model.flight?.id, prefer: labelled)
         if let id = model.flight?.id { next.remove(id) }
         if next != labelled { labelled = next }
@@ -737,6 +820,34 @@ private struct NearbyMarker: View {
             }
             .animation(.easeInOut(duration: 0.15), value: showLabel)
             .contentShape(Rectangle())
+    }
+}
+
+/// A waypoint of the ACARS route: a small ringed dot, plus its name when `MapLabelLayout` found room.
+private struct WaypointMarker: View {
+    let label: String
+    let showLabel: Bool
+
+    var body: some View {
+        Circle()
+            .fill(Color(nsColor: .windowBackgroundColor))
+            .frame(width: 6, height: 6)
+            .overlay(Circle().stroke(Color.accentColor, lineWidth: 1.5))
+            .frame(width: MapLabelLayout.iconSize.width, height: MapLabelLayout.iconSize.height)
+            .overlay(alignment: .top) {
+                if showLabel {
+                    Text(label)
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1)
+                        .fixedSize()
+                        .offset(y: MapLabelLayout.iconSize.height / 2 + MapLabelLayout.labelOffset - 6)
+                        .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.15), value: showLabel)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Route waypoint \(label)")
     }
 }
 
@@ -798,7 +909,7 @@ private struct FlightDetailSidebar: View {
                     liveDataSection(f)
                     if Shared.location != nil { fromYouCard(f) }
                     // Mostly airliners use ACARS; for other aircraft the section appears once something is heard.
-                    if f.looksLikeAirline || model.acars.hasMessages { AcarsSection(state: model.acars) }
+                    if f.looksLikeAirline || model.acars.hasMessages { AcarsSection(state: model.acars, route: model.acarsRoute) }
                     aircraftCard(f)
                     linksCard(f)
                 }
@@ -916,7 +1027,7 @@ private struct FlightDetailSidebar: View {
 
     /// `replaced`: the scheduled destination when the flight is diverting or returning instead (shown struck through).
     private func routeCard(_ f: Flight, from: Airport, to: Airport?, replaced: Airport? = nil) -> some View {
-        DetailCard("Route", footer: model.routeNote) {
+        DetailCard("Route", footer: model.routeFooter) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline) {
                     endpoint(from.code, from.city, role: "From", alignment: .leading)
@@ -1117,6 +1228,8 @@ private struct FlightDetailSidebar: View {
 /// ACARS messages heard for the flight, newest first, with any decoded OOOI times and route fixes.
 private struct AcarsSection: View {
     let state: AcarsState
+    /// The route decoded from the messages, for the waypoint chips.
+    let route: AcarsRoute?
     @State private var showAll = false
     @State private var expanded: Set<String> = []
     @State private var limit = AcarsSection.pageSize
@@ -1173,7 +1286,7 @@ private struct AcarsSection: View {
             emptyState(hidden: hidden)
         } else {
             if !f.times.isEmpty { OOOIRow(times: f.times) }
-            if !f.waypoints.isEmpty { WaypointChips(names: f.waypoints) }
+            if let route, !route.waypoints.isEmpty { WaypointChips(waypoints: route.waypoints) }
             DetailCard(nil) {
                 TimelineView(.periodic(from: .now, by: 30)) { ctx in
                     VStack(spacing: 0) {
@@ -1250,12 +1363,17 @@ private struct AcarsSection: View {
     }
 }
 
-/// One ACARS message: what it is, which way and over which link, when, and its text.
+/// One ACARS message: what it is, which way and over which link, when, what it says (when it
+/// could be decoded) and its text as sent.
 private struct AcarsRow: View {
     let message: AcarsMessage
     let now: Date
     let isExpanded: Bool
     let toggle: () -> Void
+    @State private var showRaw = false
+
+    /// Something was decoded, so the text as sent moves behind a disclosure.
+    private var isDecoded: Bool { message.summary != nil || message.decodedText != nil || !message.fields.isEmpty }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1285,25 +1403,41 @@ private struct AcarsRow: View {
             .help(timeHelp)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(spokenHeader)
-            if !message.fields.isEmpty {
-                Text(message.fields.map { "\($0.name) \($0.value)" }.joined(separator: " · "))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            if let summary = message.summary {
+                Text(summary)
+                    .font(.callout)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if !message.fields.isEmpty {
+                Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 8, verticalSpacing: 2) {
+                    ForEach(Array(message.fields.enumerated()), id: \.offset) { _, field in
+                        GridRow {
+                            Text(field.name).foregroundStyle(.secondary)
+                            Text(field.value).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .font(.caption)
+                .accessibilityElement(children: .combine)
+            }
+            if let inner = message.decodedText {
+                body(inner, label: "Decoded text")
+            }
             if !message.text.isEmpty {
-                Text(message.text)
-                    .font(.system(.caption, design: .monospaced))
-                    .lineLimit(isExpanded ? nil : 3)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityLabel("Text: \(message.text)")
-                if isLong {
-                    Button(isExpanded ? "Show Less" : "Show More", action: toggle)
-                        .buttonStyle(.link)
-                        .font(.caption)
+                if isDecoded {
+                    DisclosureGroup("Raw", isExpanded: $showRaw) {
+                        Text(message.text)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityLabel("Raw text: \(message.text)")
+                    }
+                    .font(.caption)
+                } else {
+                    body(message.text, label: "Text")
                 }
             }
         }
@@ -1311,9 +1445,20 @@ private struct AcarsRow: View {
         .accessibilityElement(children: .contain)
     }
 
-    /// More than fits in three lines of the sidebar.
-    private var isLong: Bool {
-        message.text.count > 120 || message.text.split(separator: "\n", omittingEmptySubsequences: false).count > 3
+    /// `text` in monospace, three lines at first with Show More when it's longer.
+    @ViewBuilder private func body(_ text: String, label: String) -> some View {
+        Text(text)
+            .font(.system(.caption, design: .monospaced))
+            .lineLimit(isExpanded ? nil : 3)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel("\(label): \(text)")
+        if text.count > 120 || text.split(separator: "\n", omittingEmptySubsequences: false).count > 3 {
+            Button(isExpanded ? "Show Less" : "Show More", action: toggle)
+                .buttonStyle(.link)
+                .font(.caption)
+        }
     }
 
     private var timeHelp: String {
@@ -1364,31 +1509,42 @@ private struct OOOIRow: View {
     }
 }
 
-/// Route fixes named in the messages, as chips.
+/// The route waypoints the messages name, as chips: solid when placed on the map, dashed when
+/// the name isn't in the bundled navigation data.
 private struct WaypointChips: View {
-    let names: [String]
-    private static let maxShown = 30
+    let waypoints: [RouteWaypoint]
+    private static let maxShown = 40
 
     var body: some View {
+        let placed = waypoints.filter { $0.point != nil }.count
         VStack(alignment: .leading, spacing: 4) {
-            Text("Route fixes").font(.caption).foregroundStyle(.secondary)
+            Text("Route (\(placed) of \(waypoints.count) waypoints located)").font(.caption).foregroundStyle(.secondary)
             FlowLayout(spacing: 4) {
-                ForEach(names.prefix(Self.maxShown), id: \.self) { name in
-                    Text(name)
-                        .font(.caption.monospaced())
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.primary.opacity(0.06)))
-                        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
-                        .textSelection(.enabled)
+                ForEach(Array(waypoints.prefix(Self.maxShown).enumerated()), id: \.offset) { _, w in
+                    chip(w)
                 }
-                if names.count > Self.maxShown {
-                    Text("+\(names.count - Self.maxShown)").font(.caption).foregroundStyle(.secondary).padding(.vertical, 2)
+                if waypoints.count > Self.maxShown {
+                    Text("+\(waypoints.count - Self.maxShown)").font(.caption).foregroundStyle(.secondary).padding(.vertical, 2)
                 }
             }
         }
         .padding(.horizontal, 2)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Route fixes: " + names.joined(separator: ", "))
+        .accessibilityLabel("Route waypoints: " + waypoints.map { $0.point == nil ? "\($0.label), not located" : $0.label }
+            .joined(separator: ", "))
+    }
+
+    private func chip(_ w: RouteWaypoint) -> some View {
+        let placed = w.point != nil
+        return Text(w.label)
+            .font(.caption.monospaced())
+            .foregroundStyle(placed ? .primary : .secondary)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(placed ? Color.accentColor.opacity(0.14) : Color.clear))
+            .overlay(Capsule().strokeBorder(placed ? Color.accentColor.opacity(0.35) : Color.secondary.opacity(0.45),
+                                            style: StrokeStyle(lineWidth: 0.75, dash: placed ? [] : [2, 2])))
+            .help(placed ? w.name : "\(w.name) isn’t in FlightDesk’s navigation data, so it isn’t drawn")
+            .textSelection(.enabled)
     }
 }
 

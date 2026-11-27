@@ -38,6 +38,8 @@ final class RadarModel: ObservableObject {
     /// Recorded tracks by hex, oldest point first. Only the selected aircraft's is fetched (the
     /// OpenSky anonymous quota is small), at most once per selection.
     @Published private(set) var tracks: [String: [GeoPoint]] = [:]
+    /// Routes decoded from ACARS by a detail shown in this window, by hex (kept after it closes).
+    @Published private(set) var acarsRoutes: [String: AcarsRoute] = [:]
     @Published var query = ""
     @Published var sort: FlightSort {
         didSet { UserDefaults.standard.set(sort.rawValue, forKey: Self.sortKey) }
@@ -69,6 +71,7 @@ final class RadarModel: ObservableObject {
     private var poll: Task<Void, Never>?
     private var subscriptions: Set<AnyCancellable> = []
     private var detailSubscription: AnyCancellable?
+    private var acarsRouteSubscription: AnyCancellable?
     /// Sidebar visibility before Settings opened (Settings always shows its sidebar), restored on leaving.
     private var sidebarBeforeSettings: NavigationSplitViewVisibility?
     private var trackTask: Task<Void, Never>?
@@ -266,9 +269,20 @@ final class RadarModel: ObservableObject {
             }
             if self.selection == id, !self.flights.contains(where: { $0.id == id }) { self.selected = f }
         }
+        acarsRouteSubscription = model.$acarsRoute.compactMap { $0 }.sink { [weak self] route in
+            self?.remember(route, for: id)
+        }
         if selection != id { selection = id }
         closeSettings()
         if isActive { model.start() }
+    }
+
+    /// Keeps the newest few decoded routes, so the map can draw the selected aircraft's.
+    private func remember(_ route: AcarsRoute, for id: String) {
+        var routes = acarsRoutes
+        routes[id] = route
+        if routes.count > 20, let oldest = routes.min(by: { $0.value.updated < $1.value.updated })?.key { routes[oldest] = nil }
+        acarsRoutes = routes
     }
 
     /// Back to the map, keeping the selection.
@@ -276,6 +290,7 @@ final class RadarModel: ObservableObject {
         guard let detail else { return }
         detail.stop()
         detailSubscription = nil
+        acarsRouteSubscription = nil
         self.detail = nil
         detailFlight = nil
         loadSelectedTrack()

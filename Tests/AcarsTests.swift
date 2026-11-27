@@ -1,7 +1,7 @@
 import XCTest
 
 /// ACARS from Airframes.io: wire decoding, current-flight selection, label decoding, OOOI,
-/// route fixes, positions, copy merging, noise filtering, the polling policy and the route hint.
+/// positions, copy merging, noise filtering, the polling policy and the route hint.
 ///
 /// Fixtures are trimmed from real Airframes.io responses (November 2026) for N114DU (A03B6D),
 /// with feeder ids, signal details and other per-station fields removed.
@@ -255,34 +255,19 @@ final class AcarsTests: XCTestCase {
 
     // MARK: Route fixes and positions
 
-    func testWaypointsFromWindRequest() {
+    func testWindLevels() {
         // Real BA57K request, reassembled by Airframes.io: ends with "/DQ410/…".
         let full = "REQPWI/TS221328,261126/WQ410.390.360.340:PUMAL.XEPLA.BCN.GARBI.LARPA.TOLSO.LISAS/DQ410/WRFAOR.FALE8E78"
-        XCTAssertEqual(AcarsDecoder.waypoints(in: full), ["PUMAL", "XEPLA", "BCN", "GARBI", "LARPA", "TOLSO", "LISAS"])
         XCTAssertEqual(AcarsDecoder.windLevels(in: full), ["FL410", "FL390", "FL360", "FL340"])
-        // A single block cut mid-route: the last name may be truncated, so it's dropped.
-        XCTAssertEqual(AcarsDecoder.waypoints(in: "REQPWI/TS221328,261126/WQ410:PUMAL.XEPLA.AMR"), ["PUMAL", "XEPLA"])
-        XCTAssertEqual(AcarsDecoder.waypoints(in: "REQPWI/TS221328,261126/WQ410:PUMAL.XEPLA."), ["PUMAL", "XEPLA"])
-        // Coordinates aren't fixes.
-        XCTAssertEqual(AcarsDecoder.waypoints(in: "REQPWI/WQ390.360.340.320:ACK.WHALE.NANSO.RAFIN.4550N/DQ390"),
-                       ["ACK", "WHALE", "NANSO", "RAFIN"])
     }
 
-    func testWaypointsFromPositionReport() {
-        let core = AcarsDecoder.core("#M1BPOSN47144W122283,BREVE,033304,100,NETTZ,033431,KWEST,M8,253042,106,292,281K,242K,730E64")
-        XCTAssertEqual(AcarsDecoder.waypoints(in: core), ["BREVE", "NETTZ", "KWEST"])
-        // Reported as coordinates: nothing to name.
-        XCTAssertEqual(AcarsDecoder.waypoints(in: "POSN47462E000381,N47481E000376,221337,350,N47233E000445,221612,N47000E000509,M54,35373"), [])
-    }
-
-    func testFlightRouteFixesInRouteOrder() throws {
-        let json = #"""
-        {"id":1,"messages":[
-         {"id":2,"timestamp":"2026-11-27T03:40:00.000Z","label":"H1","text":"POSN47144W122283,NETTZ,034004,100,KWEST,034431,ZEBRA,M8,1"},
-         {"id":1,"timestamp":"2026-11-27T03:33:00.000Z","label":"H1","text":"POSN47144W122283,BREVE,033304,100,NETTZ,033431,KWEST,M8,2"}]}
-        """#
-        let f = AcarsFlight(try XCTUnwrap(AirframesAPI.decode(AirframesAPI.Flight.self, from: Data(json.utf8))), aircraftHex: "abc123")
-        XCTAssertEqual(f.waypoints, ["BREVE", "NETTZ", "KWEST", "ZEBRA"])
+    func testPositionReportPositionIsDecoded() throws {
+        // H1 FMS position reports use degrees and minutes to a tenth (verified against the fixes they name).
+        let m = try message(label: "H1", text: "POSN30364W096254,CLL,035728,300,ABI,042705,FAVON,M41,25580,301C3CB")
+        let p = try XCTUnwrap(m.position)
+        XCTAssertEqual(p.lat, 30 + 36.4 / 60, accuracy: 1e-9)
+        XCTAssertEqual(p.lon, -(96 + 25.4 / 60), accuracy: 1e-9)
+        XCTAssertEqual(m.routeReport?.kind, .position)
     }
 
     func testPositionsInUnambiguousFormats() throws {
