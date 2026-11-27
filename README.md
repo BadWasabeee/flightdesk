@@ -69,17 +69,16 @@ To work in Xcode, run `xcodegen generate` and open `FlightDesk.xcodeproj`.
 
 ## Configuration
 
-**Settings** opens inside the main window (**FlightDesk › Settings…** or ⌘, in the app, or **Settings…** in the ✈ menu). Its tabs replace the flight list in the sidebar; **Back** (the toolbar chevron, ⌘[ or Esc) returns to the map or flight you were looking at. Settings controls every widget, the panel and the main window:
+**Settings** opens inside the main window (**FlightDesk › Settings…** or ⌘, in the app, or **Settings…** in the ✈ menu). Its tabs replace the flight list in the sidebar; **Back** (the toolbar chevron, ⌘[ or Esc) returns to the map or flight you were looking at. Settings controls every widget, the panel and the main window. Each widget can also override location, style, colour, radius, units, private/GA traffic, flight list, city names, logos, header, glow and texture: right-click it and choose **Edit “Flights Overhead”**.
 
 | Tab | Options |
 | --- | --- |
-| General | Location (this Mac's location, a city/airport, or `lat, lon`), radius, private/GA traffic, menu bar readout, floating panel, launch at login |
-| Display | Live preview, style (LED Board or Standard), colour, glow, dot-matrix texture, units, header, flight list, city names, logos, rotation |
-| Widget | How to add the widget, how often to update it (15 s – 5 min), refresh now |
+| General | Location (this Mac's location, a city/airport, or `lat, lon`), radius, units, private/GA traffic, menu bar readout, floating panel, launch at login |
+| Widget | How to add the widget, live preview, style (LED Board or Standard), colour, glow, dot-matrix texture, header, flight list, city names, logos, rotation, how often to update (15 s – 5 min), refresh now |
 | Alerts | Notifications for emergency squawks, your watchlist, interesting (military, government) aircraft, heavies and aircraft passing close by; quiet hours |
 | Sources | Your own ADS-B receiver, the data sources in use |
 
-Links of the form `flightdesk://settings/<general|display|widget|alerts|sources>` open a tab directly.
+Links of the form `flightdesk://settings/<general|widget|alerts|sources>` open a tab directly.
 
 **Per-widget overrides:** right-click a widget › *Edit "Flights Overhead"* to set its location, style, radius, colour and units. Everything else follows Settings.
 

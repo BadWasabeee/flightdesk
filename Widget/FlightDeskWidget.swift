@@ -43,6 +43,18 @@ enum WidgetUnits: String, AppEnum {
 }
 
 /// Per-widget overrides shown in "Edit Widget". Everything else comes from FlightDesk Settings.
+/// An on/off option that can also follow the app's setting.
+enum WidgetToggle: String, AppEnum {
+    case app, on, off
+    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Option"
+    static var caseDisplayRepresentations: [WidgetToggle: DisplayRepresentation] = [
+        .app: "Same as FlightDesk Settings", .on: "On", .off: "Off",
+    ]
+    func resolve(_ app: Bool) -> Bool {
+        switch self { case .app: app; case .on: true; case .off: false }
+    }
+}
+
 struct FlightWidgetIntent: WidgetConfigurationIntent {
     static var title: LocalizedStringResource = "Flights Overhead"
     static var description = IntentDescription("Choose what this widget shows. Options left on “Same as FlightDesk Settings” follow the app.")
@@ -64,6 +76,27 @@ struct FlightWidgetIntent: WidgetConfigurationIntent {
     @Parameter(title: "Units", default: .app)
     var unitsChoice: WidgetUnits
 
+    @Parameter(title: "Private & GA", description: "Include light aircraft, helicopters and business jets.", default: .app)
+    var includeGAChoice: WidgetToggle
+
+    @Parameter(title: "Flight List", description: "The list of other nearby flights (Large and Extra Large).", default: .app)
+    var showListChoice: WidgetToggle
+
+    @Parameter(title: "City Names", description: "City names under the airport codes.", default: .app)
+    var showCitiesChoice: WidgetToggle
+
+    @Parameter(title: "Airline Logos", default: .app)
+    var showLogosChoice: WidgetToggle
+
+    @Parameter(title: "Header", description: "Place, aircraft count and update time.", default: .app)
+    var showHeaderChoice: WidgetToggle
+
+    @Parameter(title: "LED Glow", default: .app)
+    var glowChoice: WidgetToggle
+
+    @Parameter(title: "Dot-Matrix Texture", default: .app)
+    var dotMatrixChoice: WidgetToggle
+
     static var parameterSummary: some ParameterSummary {
         // LED Color means nothing to the Standard style, so don't offer it there.
         When(\.$styleChoice, .equalTo, WidgetStyle.standard) {
@@ -72,14 +105,26 @@ struct FlightWidgetIntent: WidgetConfigurationIntent {
                 \.$styleChoice
                 \.$radiusChoice
                 \.$unitsChoice
+                \.$includeGAChoice
+                \.$showListChoice
+                \.$showCitiesChoice
+                \.$showLogosChoice
+                \.$showHeaderChoice
             }
         } otherwise: {
             Summary {
                 \.$location
                 \.$styleChoice
                 \.$colorChoice
+                \.$glowChoice
+                \.$dotMatrixChoice
                 \.$radiusChoice
                 \.$unitsChoice
+                \.$includeGAChoice
+                \.$showListChoice
+                \.$showCitiesChoice
+                \.$showLogosChoice
+                \.$showHeaderChoice
             }
         }
     }
@@ -90,6 +135,13 @@ struct FlightWidgetIntent: WidgetConfigurationIntent {
         s.display.style = styleChoice.resolve(s)
         s.display.theme = colorChoice.resolve(s)
         s.display.units = unitsChoice.resolve(s)
+        s.includeGA = includeGAChoice.resolve(s.includeGA)
+        s.display.showList = showListChoice.resolve(s.display.showList)
+        s.display.showCities = showCitiesChoice.resolve(s.display.showCities)
+        s.display.showLogos = showLogosChoice.resolve(s.display.showLogos)
+        s.display.showHeader = showHeaderChoice.resolve(s.display.showHeader)
+        s.display.glow = glowChoice.resolve(s.display.glow)
+        s.display.dotMatrix = dotMatrixChoice.resolve(s.display.dotMatrix)
         return (s, radiusChoice.resolve(s))
     }
 }

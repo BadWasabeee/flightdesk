@@ -316,7 +316,6 @@ private struct SettingsPane: View {
         Group {
             switch tab {
             case .general: GeneralSettings(store: store)
-            case .display: DisplaySettings(store: store)
             case .widget: WidgetSettings(store: store)
             case .alerts: SpotterSettingsView(store: store)
             case .sources: SourcesSettings(store: store)

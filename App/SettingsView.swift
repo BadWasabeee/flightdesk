@@ -5,12 +5,11 @@ import ServiceManagement
 // MARK: - Tabs
 
 enum SettingsTab: String, CaseIterable, Hashable {
-    case general, display, widget, alerts, sources
+    case general, widget, alerts, sources
 
     var title: String {
         switch self {
         case .general: "General"
-        case .display: "Display"
         case .widget: "Widget"
         case .alerts: "Alerts"
         case .sources: "Sources"
@@ -20,7 +19,6 @@ enum SettingsTab: String, CaseIterable, Hashable {
     var symbol: String {
         switch self {
         case .general: "gearshape"
-        case .display: "paintpalette"
         case .widget: "square.grid.2x2"
         case .alerts: "bell.badge"
         case .sources: "antenna.radiowaves.left.and.right"
@@ -29,13 +27,15 @@ enum SettingsTab: String, CaseIterable, Hashable {
 }
 
 extension SettingsTab {
-    /// flightdesk://settings/<general|display|widget|alerts|sources> (also `receiver`, `data`).
+    /// flightdesk://settings/<general|widget|alerts|sources> (also `receiver`, `data`, and the
+    /// former `display`, now part of Widget).
     init?(url: URL) {
         guard url.scheme == FlightLink.scheme, url.host == "settings" else { return nil }
         let tab = url.lastPathComponent.lowercased()
         switch tab {
         case "", "/": self = .general
         case "receiver", "data": self = .sources
+        case "display", "appearance": self = .widget
         default: self.init(rawValue: tab)
         }
     }
@@ -164,6 +164,10 @@ struct GeneralSettings: View {
                         Text(String(localized: SearchRadius.caseDisplayRepresentations[r]!.title)).tag(r)
                     }
                 }
+                Picker("Units", selection: $store.settings.display.units) {
+                    Text("ft · kt · nm").tag(UnitSystem.imperial)
+                    Text("m · km/h · km").tag(UnitSystem.metric)
+                }
                 Toggle(isOn: $store.settings.includeGA) {
                     Text("Include private and general aviation")
                     Text("Light aircraft, helicopters and business jets")
@@ -233,11 +237,12 @@ struct GeneralSettings: View {
 
 // MARK: - Display
 
-struct DisplaySettings: View {
+/// Preview, look and content of the widget and desktop panel (part of the Widget tab).
+struct WidgetAppearanceSections: View {
     @ObservedObject var store: LiveStore
 
     var body: some View {
-        Form {
+        Group {
             Section {
                 let m = store.model.flights.isEmpty ? PanelModel.sample : store.model
                 PanelContent(model: m, layout: .panel)
@@ -272,11 +277,6 @@ struct DisplaySettings: View {
             }
 
             Section {
-                Picker("Units", selection: $store.settings.display.units) {
-                    Text("ft · kt · nm").tag(UnitSystem.imperial)
-                    Text("m · km/h · km").tag(UnitSystem.metric)
-                }
-                .pickerStyle(.segmented)
                 Toggle("Show location header", isOn: $store.settings.display.showHeader)
                 Toggle("Show flight list", isOn: $store.settings.display.showList)
                 Toggle("Show city names", isOn: $store.settings.display.showCities)
@@ -288,11 +288,10 @@ struct DisplaySettings: View {
             } header: {
                 Text("Content")
             } footer: {
-                Text("Applies to the desktop panel and every widget. Widgets update within a few seconds.")
+                Text("Applies to the desktop panel and every widget. To style one widget differently, right-click it and choose **Edit “Flights Overhead”**.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
-        .formStyle(.grouped)
     }
 
     private func swatch(_ t: LEDTheme) -> some View {
@@ -324,9 +323,11 @@ struct WidgetSettings: View {
             } header: {
                 Text("Add the Widget")
             } footer: {
-                Text("Widgets use these settings. To give one widget its own location, radius, color or units, right-click it and choose **Edit “Flights Overhead”**.")
+                Text("Every option below can also be set per widget: right-click it and choose **Edit “Flights Overhead”**.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+
+            WidgetAppearanceSections(store: store)
 
             Section {
                 Picker("Update widgets every", selection: $store.settings.widgetRefreshSeconds) {
