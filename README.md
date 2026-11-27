@@ -21,7 +21,7 @@
 - **Live data.** Aircraft positions come from real-time ADS-B/MLAT. Between fetches, the widget moves each aircraft along its live heading, speed and climb rate every 15 s.
 - **Verified routes.** Origin and destination come from a public database. Each route is checked against the aircraft's live position and heading, and routes that don't fit are hidden. This catches stale or reused callsigns.
 - **Live progress.** The plane slides along the route line to show how far into the flight it is.
-- **Flight details.** Click a flight in the widget (or the desktop panel) to open a live map with its route, track and full details.
+- **Flight details.** Click a flight in the widget (or the desktop panel) to open a live map with its route, its recorded track since takeoff, every flight within your search radius (drawn as a circle) and full details. Click any other plane on the map to switch to it.
 - **Airline logos.** Downloaded once and cached (can be turned off in Settings).
 - **Two looks.** Choose an LED board (amber, green, red, blue, cyan or white, with optional glow and dot-matrix texture) or **Standard**, which uses system colours and follows Light and Dark Mode. Both work with the macOS *Clear* and *Tinted* widget styles.
 - **Configurable.** Set the location, radius (5–100 nm), units (ft/kt/nm or metric) and which details appear. Each widget can also override the location, radius, style, colour and units.
@@ -103,6 +103,7 @@ Both are free community services. Please be kind to them, and consider supportin
 
 ## Privacy
 
+- The flight detail window looks up the selected aircraft's track on the [OpenSky Network](https://opensky-network.org) by its ICAO address only.
 - Airline logos are fetched by airline code from Kiwi.com's public logo CDN (no location is sent). Turn off **Show airline logos** to disable this.
 
 - Your location stays on your Mac. Requests to adsb.lol include only a **rounded** position (about 1 km).

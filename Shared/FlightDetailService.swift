@@ -153,6 +153,27 @@ enum FlightDetailService {
         return records.lazy.compactMap { AircraftReport(record: $0, observer: observer) }.first
     }
 
+    /// The aircraft's track for its current flight from the OpenSky Network (anonymous, rate-limited),
+    /// oldest first. Nil when unavailable, or when the track doesn't end near `current`
+    /// (e.g. it belongs to an earlier leg).
+    static func track(hex: String, current: GeoPoint?) async -> [GeoPoint]? {
+        let id = hex.lowercased().replacingOccurrences(of: "~", with: "")
+        guard id.count == 6, let url = URL(string: "https://opensky-network.org/api/tracks/all?icao24=\(id)&time=0"),
+              let (data, resp) = try? await FlightService.session.data(from: url),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let path = obj["path"] as? [[Any]] else { return nil }
+        // Waypoints: [time, lat, lon, baro altitude m, true track, on ground]
+        let points = path.compactMap { w -> GeoPoint? in
+            guard w.count >= 3, let lat = w[1] as? Double, let lon = w[2] as? Double else { return nil }
+            return GeoPoint(lat: lat, lon: lon)
+        }
+        guard points.count > 1, let last = points.last else { return nil }
+        if let end = obj["endTime"] as? Double, Date().timeIntervalSince1970 - end > 30 * 60 { return nil }
+        if let c = current, FlightService.gcDistance(c.lat, c.lon, last.lat, last.lon) > 60 { return nil }
+        return points
+    }
+
     /// Route and aircraft details for a flight from the shared lookup cache. The route is returned
     /// unchecked; callers verify it against each live position with `FlightService.isPlausible`.
     static func enrichment(for f: Flight) async -> (route: RouteInfo?, aircraft: AircraftInfo?) {

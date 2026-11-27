@@ -20,8 +20,18 @@ final class FlightDetailModel: ObservableObject {
     @Published private(set) var lastSeen: Date?
     /// Positions observed while the window has been open, oldest first.
     @Published private(set) var trail: [GeoPoint] = []
+    /// The flight's recorded track from OpenSky, when available.
+    @Published private(set) var history: [GeoPoint] = []
+    /// Other aircraft within the user's search radius.
+    @Published private(set) var nearby: [Flight] = []
+    /// The user's search radius, drawn around their location.
+    let radiusNM: Int
+    private let includeGA: Bool
 
     private static let pollInterval: Duration = .seconds(5)
+    private static let nearbyInterval: Duration = .seconds(15)
+    /// OpenSky's anonymous quota is small, so the recorded track is refreshed sparingly.
+    private static let historyInterval: Duration = .seconds(180)
     /// A position older than this counts as no longer live.
     private static let staleAfter: TimeInterval = 60
 
@@ -30,12 +40,17 @@ final class FlightDetailModel: ObservableObject {
     private var aircraftInfo: AircraftInfo?
     private var enrichedCallsign: String?
     private var poller: Task<Void, Never>?
+    private var nearbyPoller: Task<Void, Never>?
+    private var historyPoller: Task<Void, Never>?
 
     init(hex: String, snapshot: Flight?) {
         self.hex = hex
-        var display = AppSettings.load().display
+        let settings = AppSettings.load()
+        var display = settings.display
         display.style = .standard
         self.display = display
+        radiusNM = settings.radius.nm
+        includeGA = settings.includeGA
         flight = snapshot
         candidateRoute = snapshot?.route
         aircraftInfo = snapshot?.aircraft
@@ -43,7 +58,11 @@ final class FlightDetailModel: ObservableObject {
         if let snapshot { trail = [snapshot.geoPoint] }
     }
 
-    deinit { poller?.cancel() }
+    deinit {
+        poller?.cancel()
+        nearbyPoller?.cancel()
+        historyPoller?.cancel()
+    }
 
     func start() {
         guard poller == nil else { return }
@@ -53,11 +72,42 @@ final class FlightDetailModel: ObservableObject {
                 try? await Task.sleep(for: Self.pollInterval)
             }
         }
+        nearbyPoller = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.pollNearby()
+                try? await Task.sleep(for: Self.nearbyInterval)
+            }
+        }
+        historyPoller = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))   // let the first live position arrive
+            while !Task.isCancelled {
+                await self?.pollHistory()
+                try? await Task.sleep(for: Self.historyInterval)
+            }
+        }
     }
 
     func stop() {
-        poller?.cancel()
-        poller = nil
+        [poller, nearbyPoller, historyPoller].forEach { $0?.cancel() }
+        poller = nil; nearbyPoller = nil; historyPoller = nil
+    }
+
+    private func pollNearby() async {
+        guard let loc = Shared.location,
+              let list = try? await FlightService.nearby(lat: loc.lat, lon: loc.lon, radiusNM: radiusNM,
+                                                         includeGA: includeGA, limit: 250, enrich: 0),
+              !Task.isCancelled else { return }
+        nearby = list.filter { $0.id != hex }
+    }
+
+    private func pollHistory() async {
+        guard let track = await FlightDetailService.track(hex: hex, current: flight?.geoPoint),
+              !Task.isCancelled else { return }
+        history = track
+        // Live positions from before the recorded track ended are now redundant.
+        if let end = track.last, let i = trail.lastIndex(where: { FlightService.gcDistance($0.lat, $0.lon, end.lat, end.lon) < 2 }) {
+            trail.removeFirst(i)
+        }
     }
 
     private func poll() async {
@@ -129,8 +179,10 @@ final class FlightDetailModel: ObservableObject {
         return FlightMath.greatCircle(from: r.from.geoPoint, to: r.to.geoPoint)
     }
 
-    /// Flown track: great circle from the origin to the first observed position, then the observed trail.
+    /// Flown track: the recorded track plus live positions since, or (without a recorded track)
+    /// a great circle from the origin to the first observed position, then the observed trail.
     var flownPath: [GeoPoint] {
+        if !history.isEmpty { return history + trail }
         guard let r = flight?.route, let first = trail.first else { return trail }
         return FlightMath.greatCircle(from: r.from.geoPoint, to: first).dropLast() + trail
     }
@@ -164,12 +216,13 @@ struct FlightDetailView: View {
 private struct FlightDetailMap: View {
     @ObservedObject var model: FlightDetailModel
     @State private var camera: MapCameraPosition = .automatic
+    @Environment(\.openFlightDetail) private var openFlight
     private let observer = Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) }
 
     /// Changes when the set of things worth framing changes (first data, route found).
     private var framingKey: String {
         let r = model.flight?.route
-        return "\(model.flight != nil)|\(r?.from.code ?? "")|\(r?.to.code ?? "")"
+        return "\(model.flight != nil)|\(r?.from.code ?? "")|\(r?.to.code ?? "")|\(model.history.isEmpty)"
     }
 
     var body: some View {
@@ -183,6 +236,37 @@ private struct FlightDetailMap: View {
             if model.flownPath.count > 1 {
                 MapPolyline(coordinates: model.flownPath.map(\.coordinate), contourStyle: .geodesic)
                     .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+            }
+            if let observer {
+                MapCircle(center: observer.coordinate, radius: Double(model.radiusNM) * 1852)
+                    .foregroundStyle(Color.blue.opacity(0.06))
+                    .stroke(Color.blue.opacity(0.6), lineWidth: 1.5)
+                // Radius label on the circle's northern edge.
+                Annotation("", coordinate: CLLocationCoordinate2D(latitude: observer.lat + Double(model.radiusNM) / 60,
+                                                                  longitude: observer.lon), anchor: .center) {
+                    Text(model.display.radius(model.radiusNM))
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.blue.opacity(0.8)))
+                }
+            }
+            ForEach(model.nearby) { other in
+                Annotation("", coordinate: other.geoPoint.coordinate, anchor: .center) {
+                    Button { openFlight(other) } label: {
+                        VStack(spacing: 1) {
+                            Image(systemName: "airplane")
+                                .font(.system(size: 13, weight: .semibold))
+                                .rotationEffect(.degrees((other.track ?? 90) - 90))
+                            Text(other.displayNumber)
+                                .font(.system(size: 9, weight: .medium))
+                        }
+                        .foregroundStyle(.secondary)
+                        .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Show \(other.displayNumber)")
+                }
             }
             if let observer {
                 Annotation("You", coordinate: observer.coordinate, anchor: .center) {
@@ -211,10 +295,14 @@ private struct FlightDetailMap: View {
             MapScaleView()
         }
         .overlay(alignment: .topLeading) {
-            Button(action: frameFlight) {
-                Image(systemName: "scope")
+            HStack(spacing: 6) {
+                Button(action: frameFlight) { Image(systemName: "scope") }
+                    .help("Show the whole flight")
+                if observer != nil {
+                    Button(action: frameNearby) { Image(systemName: "circle.dashed") }
+                        .help("Show flights near you (\(model.display.radius(model.radiusNM)))")
+                }
             }
-            .help("Show the whole flight")
             .padding(10)
         }
         .onChange(of: framingKey, initial: true) {
@@ -231,6 +319,14 @@ private struct FlightDetailMap: View {
         }
     }
 
+    /// Fits the search-radius circle around the user.
+    private func frameNearby() {
+        guard let observer else { return }
+        let d = Double(model.radiusNM) / 60 * 1.15
+        let span = MKCoordinateSpan(latitudeDelta: d * 2, longitudeDelta: d * 2 / max(0.2, cos(observer.lat * .pi / 180)))
+        withAnimation { camera = .region(MKCoordinateRegion(center: observer.coordinate, span: span)) }
+    }
+
     /// Fits origin, destination (including the arc between them) and the aircraft, or the aircraft
     /// and the observer when the route is unknown.
     private func frameFlight() {
@@ -242,6 +338,7 @@ private struct FlightDetailMap: View {
             } else if let observer, FlightService.gcDistance(observer.lat, observer.lon, f.lat, f.lon) < 300 {
                 points.append(observer)
             }
+            points += model.history
         } else if let observer {
             points.append(observer)
         }
@@ -403,5 +500,19 @@ private struct FlightDetailSidebar: View {
             LabeledContent("ICAO hex", value: f.id.uppercased())
             if let owner = f.aircraft?.owner, owner != f.airlineName { LabeledContent("Operator", value: owner) }
         }
+    }
+}
+
+// MARK: - Opening other flights
+
+private struct OpenFlightDetailKey: EnvironmentKey {
+    static let defaultValue: @MainActor (Flight) -> Void = { FlightDetail.show(hex: $0.id, snapshot: $0) }
+}
+
+extension EnvironmentValues {
+    /// Opens another aircraft's detail window (clicking a nearby flight on the map).
+    var openFlightDetail: @MainActor (Flight) -> Void {
+        get { self[OpenFlightDetailKey.self] }
+        set { self[OpenFlightDetailKey.self] = newValue }
     }
 }
