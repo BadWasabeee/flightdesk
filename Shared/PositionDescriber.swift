@@ -53,7 +53,7 @@ enum PositionDescriber {
         return PositionDescription(
             phase: phase.map { phaseText($0, airborne: !grounded, text: text, now: now) },
             vertical: grounded ? nil : verticalText(f, text: text),
-            location: nearest.flatMap { locationText(f, airport: $0, grounded: grounded, text: text) },
+            location: nearest.flatMap { location(of: f.geoPoint, airport: $0, grounded: grounded, options: sentence, locale: locale) },
             next: nextFix.map { "Next waypoint \($0.name) · \(text.distance($0.distanceNM))" },
             phaseIsCurrent: phase?.isCurrent ?? false)
     }
@@ -118,11 +118,76 @@ enum PositionDescriber {
         return rounded >= flightLevelFromFt ? "Cruising at \(level)" : "Level at \(level)"
     }
 
-    private static func locationText(_ f: Flight, airport: Airport, grounded: Bool, text: Formatter) -> String? {
-        let d = FlightService.gcDistance(airport.lat, airport.lon, f.lat, f.lon)
+    // MARK: - Shared pieces
+
+    /// "12 nm NW of ORD", or "Over ORD" / "At ORD" (`grounded`) within 2 nm; nil beyond `nearbyAirportNM`.
+    static func location(of p: GeoPoint, airport: Airport, grounded: Bool = false, options: DisplayOptions = DisplayOptions(),
+                         locale: Locale = .autoupdatingCurrent) -> String? {
+        let d = FlightService.gcDistance(airport.lat, airport.lon, p.lat, p.lon)
         guard d <= nearbyAirportNM else { return nil }
         if d < 2 { return grounded ? "At \(airport.code)" : "Over \(airport.code)" }
-        let direction = FlightMath.compassPoint(FlightService.initialBearing(airport.lat, airport.lon, f.lat, f.lon))
-        return "\(text.distance(d)) \(direction) of \(airport.code)"
+        let direction = FlightMath.compassPoint(FlightService.initialBearing(airport.lat, airport.lon, p.lat, p.lon))
+        return "\(DetailFormat.distance(d, units: options.units, locale: locale)) \(direction) of \(airport.code)"
+    }
+
+    /// `location(of:airport:…)` relative to the nearest airport in the bundled table.
+    static func location(of p: GeoPoint, options: DisplayOptions = DisplayOptions()) -> String? {
+        AirportDB.nearest(to: p, within: nearbyAirportNM).flatMap { location(of: p, airport: $0, options: options) }
+    }
+
+    /// "Touchdown ≈ 21:42 (in 2 m)": when the aircraft reaches the threshold at its current ground speed.
+    /// - Parameter now: when `approach` was worked out.
+    static func touchdown(_ approach: FinalApproach, now: Date = Date(), locale: Locale = .autoupdatingCurrent,
+                          timeZone: TimeZone = .autoupdatingCurrent) -> String {
+        var style = Date.FormatStyle(date: .omitted, time: .shortened, locale: locale)
+        style.timeZone = timeZone
+        let time = now.addingTimeInterval(approach.eta).formatted(style)
+        return "Touchdown ≈ \(time) (in \(FlightMath.durationText(approach.eta)))"
+    }
+}
+
+// MARK: - Compact tags
+
+extension RunwayPhase {
+    /// A short label for list rows, the widget, the panel and the menu: "Final 28C · 6 nm" (LED
+    /// "6NM"; the board uppercases the rest), "Landed 28C", "Departing 10L", "Go-around 28C",
+    /// "Taxiing". Nil for `.departed`, which is history. Without `distance` a final is just "Final 28C".
+    func tag(_ o: DisplayOptions, distance: Bool = true) -> String? {
+        switch self {
+        case .finalApproach(let f):
+            let base = "Final \(f.runway)"
+            return distance ? "\(base) · \(Self.compactDistance(f.distanceNM, o))" : base
+        case .landed(_, let r): return "Landed \(r)"
+        case .onRunway(_, let r): return "Runway \(r)"
+        case .taxiing: return "Taxiing"
+        case .takingOff(_, let r): return "Departing \(r)"
+        case .goAround(_, let r): return "Go-around \(r)"
+        case .departed: return nil
+        }
+    }
+
+    /// SF Symbol for labels.
+    var symbol: String {
+        switch self {
+        case .finalApproach, .landed, .onRunway: return "airplane.arrival"
+        case .takingOff, .departed: return "airplane.departure"
+        case .goAround: return "arrow.uturn.up"
+        case .taxiing: return "road.lanes"
+        }
+    }
+
+    /// Go-arounds are worth a caution colour; everything else is routine.
+    var isCaution: Bool {
+        if case .goAround = self { return true }
+        return false
+    }
+
+    /// "6 nm" / "6NM", with one decimal under 2 ("1.4 nm").
+    private static func compactDistance(_ nm: Double, _ o: DisplayOptions) -> String {
+        let metric = o.units == .metric
+        let value = max(0, metric ? nm * 1.852 : nm)
+        let number = value < 1.95 ? String(format: "%.1f", value) : "\(Int(value.rounded()))"
+        let unit = metric ? "km" : "nm"
+        return o.isStandard ? "\(number) \(unit)" : number + unit.uppercased()
     }
 }

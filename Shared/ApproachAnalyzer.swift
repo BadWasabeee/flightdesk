@@ -3,21 +3,6 @@
 
 import Foundation
 
-/// A recorded position, oldest first in a trail.
-struct TrailSample: Equatable, Sendable {
-    var point: GeoPoint
-    var time: Date
-    /// Barometric altitude in feet, when recorded.
-    var altitudeFt: Double?
-}
-
-extension FlightTrack {
-    /// The track as trail samples; only the first carries an altitude (`startAltitudeFt`).
-    var trailSamples: [TrailSample] {
-        points.enumerated().map { i, p in TrailSample(point: p.point, time: p.time, altitudeFt: i == 0 ? startAltitudeFt : nil) }
-    }
-}
-
 /// Where the aircraft sits relative to a 3° glidepath.
 enum GlidepathStatus: Equatable, Sendable {
     case onPath, high, low
@@ -103,9 +88,10 @@ struct ApproachAnalyzer {
     /// The current runway phase, else the departure runway from the trail, else nil.
     /// - Parameters:
     ///   - onGround: the feed's ground flag (`AircraftReport.onGround`).
-    ///   - trail: recorded positions, oldest first; needed for go-arounds and departures.
+    ///   - trail: recorded positions, oldest first, ideally with altitudes and ground flags; needed for
+    ///     go-arounds and departures.
     ///   - qnhHPa: the aircraft's selected altimeter setting, when the feed reports it.
-    func phase(of f: Flight, onGround: Bool = false, trail: [TrailSample] = [], qnhHPa: Double? = nil) -> RunwayPhase? {
+    func phase(of f: Flight, onGround: Bool = false, trail: [TimedPoint] = [], qnhHPa: Double? = nil) -> RunwayPhase? {
         let frames = self.frames
         guard !frames.isEmpty else { return nil }
         let altitude = Double(f.altitude) + (qnhHPa.map { ($0 - 1013.25) * 27.3 } ?? 0)
@@ -124,7 +110,7 @@ struct ApproachAnalyzer {
     }
 
     /// The runway the trail shows the aircraft taking off from, when the trail starts at an airport.
-    func departure(trail: [TrailSample]) -> RunwayPhase? {
+    func departure(trail: [TimedPoint]) -> RunwayPhase? {
         departure(trail: trail, frames: frames)
     }
 
@@ -172,7 +158,7 @@ struct ApproachAnalyzer {
     }
 
     /// Landed, takeoff roll or lined up when on a runway centreline and aligned with it; taxiing when slow elsewhere.
-    private func groundPhase(_ s: State, nearest: RunwayFrame, frames: [RunwayFrame], trail: [TrailSample]) -> RunwayPhase? {
+    private func groundPhase(_ s: State, nearest: RunwayFrame, frames: [RunwayFrame], trail: [TimedPoint]) -> RunwayPhase? {
         let onCentreline = frames.compactMap { frame -> (RunwayFrame, Double)? in
             let (along, cross) = frame.locate(s.position)
             guard abs(cross) <= 0.04, along >= -0.05, along <= frame.lengthNM + 0.05,
@@ -223,7 +209,7 @@ struct ApproachAnalyzer {
                              eta: distance / s.speed * 3_600)
     }
 
-    private func takingOff(_ s: State, track: Double, frames: [RunwayFrame], trail: [TrailSample]) -> RunwayPhase? {
+    private func takingOff(_ s: State, track: Double, frames: [RunwayFrame], trail: [TimedPoint]) -> RunwayPhase? {
         guard s.speed >= 60, s.verticalRate > 300 else { return nil }
         let candidates = frames.compactMap { frame -> Candidate<Void>? in
             let (along, cross) = frame.locate(s.position)
@@ -240,7 +226,7 @@ struct ApproachAnalyzer {
         return .takingOff(airport: best.airport, runway: best.end.ident)
     }
 
-    private func goAround(_ s: State, track: Double, frames: [RunwayFrame], trail: [TrailSample]) -> RunwayPhase? {
+    private func goAround(_ s: State, track: Double, frames: [RunwayFrame], trail: [TimedPoint]) -> RunwayPhase? {
         guard !trail.isEmpty, s.speed >= 60, s.verticalRate > 500 else { return nil }
         let candidates = frames.compactMap { frame -> Candidate<Void>? in
             let (along, cross) = frame.locate(s.position)
@@ -253,10 +239,10 @@ struct ApproachAnalyzer {
         return .goAround(airport: best.airport, runway: best.end.ident)
     }
 
-    /// Whether a trail sample from the last 15 minutes was on this runway's final, heading in.
-    private func wasOnFinal(_ trail: [TrailSample], frame: RunwayFrame) -> Bool {
+    /// Whether an airborne trail sample from the last 15 minutes was on this runway's final, heading in.
+    private func wasOnFinal(_ trail: [TimedPoint], frame: RunwayFrame) -> Bool {
         guard let latest = trail.last?.time else { return false }
-        for (i, sample) in trail.enumerated() where latest.timeIntervalSince(sample.time) <= 15 * 60 {
+        for (i, sample) in trail.enumerated() where !sample.onGround && latest.timeIntervalSince(sample.time) <= 15 * 60 {
             let (along, cross) = frame.locate(sample.point)
             let distance = -along
             guard distance >= 0.3, distance <= Self.finalMaxNM, abs(cross) <= Self.finalCrossLimit(distance) else { continue }
@@ -267,11 +253,11 @@ struct ApproachAnalyzer {
         return false
     }
 
-    private func departure(trail: [TrailSample], frames: [RunwayFrame]) -> RunwayPhase? {
+    private func departure(trail: [TimedPoint], frames: [RunwayFrame]) -> RunwayPhase? {
         guard trail.count > 1, let first = trail.first else { return nil }
         let candidates = frames.compactMap { frame -> Candidate<Date>? in
             guard frame.distance(from: first.point) <= 6 else { return nil }
-            if let alt = first.altitudeFt, alt - frame.runway.elevationFt > 3_000 { return nil }
+            if !first.onGround, let alt = first.altitudeFt, alt - frame.runway.elevationFt > 3_000 { return nil }
             for (i, sample) in trail.enumerated() {
                 guard frame.distance(from: sample.point) <= 8 else { break }
                 guard let direction = Self.direction(from: i, in: trail) else { continue }
@@ -304,7 +290,7 @@ struct ApproachAnalyzer {
     }
 
     /// Direction of travel from trail sample `i` to the next one at least 0.2 nm (and at most 10 nm) away.
-    private static func direction(from i: Int, in trail: [TrailSample]) -> Double? {
+    private static func direction(from i: Int, in trail: [TimedPoint]) -> Double? {
         let a = trail[i].point
         for b in trail[(i + 1)...].lazy.map(\.point) {
             let d = FlightService.gcDistance(a.lat, a.lon, b.lat, b.lon)
@@ -351,5 +337,45 @@ private struct RunwayFrame {
     /// Distance from `p` to this end's threshold.
     func distance(from p: GeoPoint) -> Double {
         FlightService.gcDistance(p.lat, p.lon, end.threshold.lat, end.threshold.lon)
+    }
+}
+
+// MARK: - Lists
+
+extension RunwayPhase {
+    /// Phases worth a tag on a flight list: taxiing and "on the runway" from an airborne-looking
+    /// report are more likely noise (a slow helicopter over the field), and a departure is history.
+    var isListed: Bool {
+        switch self {
+        case .finalApproach, .landed, .takingOff, .goAround: return true
+        case .onRunway, .taxiing, .departed: return false
+        }
+    }
+
+    /// Smooths a list phase from one refresh to the next. Over the runway a landing aircraft is
+    /// neither on final nor (yet) reported on the ground, so its tag would vanish for a refresh
+    /// before the aircraft leaves the feed; instead, one that was on short final (within 2 nm), or
+    /// already shown as landed, and is now unclassified, not climbing and near that airport stays
+    /// "Landed".
+    static func listed(_ current: RunwayPhase?, previous: RunwayPhase?, flight f: Flight) -> RunwayPhase? {
+        guard current == nil, let previous, f.verticalRate <= 300 else { return current }
+        let landing: (airport: Airport, runway: String)
+        switch previous {
+        case .finalApproach(let fa) where fa.distanceNM <= 2: landing = (fa.airport, fa.runway)
+        case .landed(let a, let r): landing = (a, r)
+        default: return nil
+        }
+        guard FlightService.gcDistance(f.lat, f.lon, landing.airport.lat, landing.airport.lon) <= 5 else { return nil }
+        return .landed(airport: landing.airport, runway: landing.runway)
+    }
+
+    /// `listed` for every flight in `flights` that `phase` classifies, keyed by flight ID.
+    static func listPhases(for flights: [Flight], previous: [String: RunwayPhase],
+                           phase: (Flight) -> RunwayPhase?) -> [String: RunwayPhase] {
+        var out: [String: RunwayPhase] = [:]
+        for f in flights {
+            if let p = listed(phase(f), previous: previous[f.id], flight: f) { out[f.id] = p }
+        }
+        return out
     }
 }

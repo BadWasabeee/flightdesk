@@ -620,11 +620,53 @@ struct SituationBadge: View {
     }
 }
 
+/// A featured flight's runway phase ("FINAL 28C · 6NM" / "Final 28C · 6 nm"): an outlined block of
+/// lit segments on the LED board, a tinted capsule in the Standard style, orange for a go-around.
+/// Quieter than `SituationBadge`, which takes its place when both apply.
+struct ApproachTag: View {
+    let phase: RunwayPhase
+    let size: CGFloat
+    /// Include the distance to the threshold on final (left out where space is tight).
+    var distance = true
+    @Environment(\.displayOptions) private var o
+
+    private var tint: Color {
+        if phase.isCaution { return FlightSituation.holding.color(o) }     // the board's caution orange
+        return o.isStandard ? .blue : o.theme.color
+    }
+
+    var body: some View {
+        if let text = phase.tag(o, distance: distance) {
+            let c = tint
+            Text(o.isStandard ? text : text.uppercased())
+                .font(.system(size: size, weight: o.isStandard ? .semibold : .heavy, design: o.isStandard ? .default : .monospaced))
+                .monospacedDigit()
+                .lineLimit(1)
+                .foregroundStyle(c)
+                .padding(.horizontal, size * 0.45)
+                .padding(.vertical, size * 0.18)
+                .background {
+                    if o.isStandard {
+                        Capsule().fill(c.opacity(0.15))
+                    } else {
+                        RoundedRectangle(cornerRadius: size * 0.15, style: .continuous).strokeBorder(c, lineWidth: 1)
+                    }
+                }
+                .shadow(color: o.glowEnabled ? c.opacity(0.5) : .clear, radius: 2.5)
+                .widgetAccentable()
+                .fixedSize()
+                .accessibilityLabel(text)
+        }
+    }
+}
+
 // MARK: - Featured flight
 
 struct FeaturedView: View {
     let f: Flight
     let layout: PanelLayout
+    /// What the flight is doing at a runway, shown when it has no situation label.
+    var phase: RunwayPhase? = nil
     /// The flight has the whole widget (list hidden): bigger codes, full stats.
     var hero = false
     @Environment(\.displayOptions) private var o
@@ -636,7 +678,7 @@ struct FeaturedView: View {
     var body: some View {
         Group { if layout == .small { small } else { regular } }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(BoardFormat.spoken(f, o))
+            .accessibilityLabel([BoardFormat.spoken(f, o), phase?.tag(o.withStandardStyle)].compactMap { $0 }.joined(separator: ", "))
     }
 
     /// Shown under a route-less flight's callsign.
@@ -651,9 +693,11 @@ struct FeaturedView: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 5) {
                 FlightMark(flight: f, size: 13)
-                // No room for both: the situation replaces the operator.
+                // No room for both: the situation (else the runway phase) replaces the operator.
                 if let s = f.situation {
                     SituationBadge(situation: s, style: .pill(8.5))
+                } else if let phase, phase.tag(o) != nil {
+                    ApproachTag(phase: phase, size: 8.5, distance: false)
                 } else {
                     LEDText(BoardFormat.operatorName(f), m.identitySize, dim: true)
                 }
@@ -708,7 +752,11 @@ struct FeaturedView: View {
             FlightMark(flight: f, size: m.identitySize + 4)
             LEDText(BoardFormat.operatorName(f), m.identitySize, dim: true)
             Spacer(minLength: 6)
-            if let s = f.situation { SituationBadge(situation: s, style: .pill(m.identitySize - 2)) }
+            if let s = f.situation {
+                SituationBadge(situation: s, style: .pill(m.identitySize - 2))
+            } else if let phase {
+                ApproachTag(phase: phase, size: m.identitySize - 2)
+            }
             LEDText(f.displayNumber, m.identitySize).fixedSize()
         }
     }
@@ -1030,7 +1078,7 @@ struct PanelContent: View {
     private var rule: some View { Rectangle().fill(o.ruleColor).frame(height: 1) }
 
     private func featured(_ f: Flight) -> some View {
-        FeaturedView(f: f, layout: layout)
+        FeaturedView(f: f, layout: layout, phase: model.runwayPhases[f.id])
             .modifier(FlightTarget(flight: f))
             .id(f.id)
             .transition(.opacity)
@@ -1040,7 +1088,7 @@ struct PanelContent: View {
     private func hero(_ f: Flight) -> some View {
         VStack {
             Spacer(minLength: 0)
-            FeaturedView(f: f, layout: layout, hero: true)
+            FeaturedView(f: f, layout: layout, phase: model.runwayPhases[f.id], hero: true)
                 .frame(maxWidth: layout == .extraLarge ? 560 : .infinity)
                 .modifier(FlightTarget(flight: f))
                 .id(f.id)
@@ -1170,6 +1218,19 @@ extension PanelModel {
                                   ("Southwest Airlines", "WN1984", "WN", bwi, las), "Boeing 737 MAX 8", squawk: "7700")
         var m = gallery
         m.flights = [diverting, mayday] + gallery.flights.prefix(10)
+        return m
+    }()
+
+    /// The gallery sky with a flight 6 nm out on final for Denver's runway 16R (featured), for
+    /// snapshot renders of the runway tag. The phase comes from the real analysis and runway table.
+    static let approach: PanelModel = {
+        let ord = Airport(code: "ORD", city: "Chicago", lat: 41.98, lon: -87.90)
+        let den = Airport(code: "DEN", city: "Denver", lat: 39.86, lon: -104.67)
+        let onFinal = sampleFlight("af0d1e", "UAL1543", "N76508", "B738", 7_300, -800, 145, 181, 10.6, 352, 39.9958, -104.6937,
+                                   ("United Airlines", "UA1543", "UA", ord, den), "Boeing 737-800")
+        var m = gallery
+        m.flights = [onFinal] + gallery.flights.prefix(10)
+        m.runwayPhases = RunwayPhase.listPhases(for: m.flights, previous: [:], phase: ApproachAnalyzer.listPhase)
         return m
     }()
     #endif

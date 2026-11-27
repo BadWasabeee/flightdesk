@@ -149,8 +149,8 @@ final class ApproachTests: XCTestCase {
         let f = flight(at: p, track: 270, alt: 650, gs: 110)
         XCTAssertEqual(analyzer(origin: den, destination: ord).phase(of: f, onGround: true), .landed(airport: ord, runway: "28C"))
         // Without a route, a trail from far away shows it arrived.
-        let trail = [TrailSample(point: move(threshold28C, 90, 30), time: t0, altitudeFt: 9_000),
-                     TrailSample(point: move(threshold28C, 90, 5), time: t0 + 600, altitudeFt: nil)]
+        let trail = [TimedPoint(point: move(threshold28C, 90, 30), time: t0, altitudeFt: 9_000),
+                     TimedPoint(point: move(threshold28C, 90, 5), time: t0 + 600, altitudeFt: nil)]
         XCTAssertEqual(analyzer().phase(of: f, onGround: true, trail: trail), .landed(airport: ord, runway: "28C"))
         // Low and slow counts as on the ground even without the flag.
         XCTAssertEqual(analyzer(destination: ord).phase(of: flight(at: p, track: 270, alt: 700, gs: 60)), .landed(airport: ord, runway: "28C"))
@@ -184,32 +184,32 @@ final class ApproachTests: XCTestCase {
 
     func testDepartedFromTrail() {
         let start = rwy10L28R.low.threshold
-        let trail = [TrailSample(point: move(start, 90, 0.1), time: t0, altitudeFt: 670),
-                     TrailSample(point: move(start, 90, 0.8), time: t0 + 20, altitudeFt: nil),
-                     TrailSample(point: move(start, 90, 2.0), time: t0 + 40, altitudeFt: nil),
-                     TrailSample(point: move(start, 92, 5.5), time: t0 + 90, altitudeFt: nil),
-                     TrailSample(point: move(start, 110, 20), time: t0 + 300, altitudeFt: nil)]
+        let trail = [TimedPoint(point: move(start, 90, 0.1), time: t0, altitudeFt: 670),
+                     TimedPoint(point: move(start, 90, 0.8), time: t0 + 20, altitudeFt: nil),
+                     TimedPoint(point: move(start, 90, 2.0), time: t0 + 40, altitudeFt: nil),
+                     TimedPoint(point: move(start, 92, 5.5), time: t0 + 90, altitudeFt: nil),
+                     TimedPoint(point: move(start, 110, 20), time: t0 + 300, altitudeFt: nil)]
         let cruising = flight(at: move(start, 240, 300), track: 240, alt: 37_000, gs: 460)
         XCTAssertEqual(analyzer(origin: ord).phase(of: cruising, trail: trail), .departed(airport: ord, runway: "10L", time: t0))
         XCTAssertEqual(analyzer(origin: ord).departure(trail: trail), .departed(airport: ord, runway: "10L", time: t0))
         // A trail that starts in the air far away says nothing about the departure.
-        XCTAssertNil(analyzer().departure(trail: Array(trail.dropFirst(4)) + [TrailSample(point: move(start, 110, 40), time: t0 + 400)]))
+        XCTAssertNil(analyzer().departure(trail: Array(trail.dropFirst(4)) + [TimedPoint(point: move(start, 110, 40), time: t0 + 400)]))
     }
 
     func testTaxiOnAParallelTaxiwayIsNotATakeoff() {
         // 0.1 nm north of 10L, moving east, then turning off.
         let start = move(rwy10L28R.low.threshold, 0, 0.1)
-        let trail = [TrailSample(point: start, time: t0), TrailSample(point: move(start, 90, 0.5), time: t0 + 120),
-                     TrailSample(point: move(move(start, 90, 0.5), 0, 0.5), time: t0 + 240)]
+        let trail = [TimedPoint(point: start, time: t0), TimedPoint(point: move(start, 90, 0.5), time: t0 + 120),
+                     TimedPoint(point: move(move(start, 90, 0.5), 0, 0.5), time: t0 + 240)]
         XCTAssertNil(analyzer(origin: ord).departure(trail: trail))
     }
 
     // MARK: Go-around
 
     func testGoAround() {
-        let trail = [TrailSample(point: move(threshold28C, 90, 5), time: t0, altitudeFt: 2_300),
-                     TrailSample(point: move(threshold28C, 90, 3), time: t0 + 50, altitudeFt: 1_650),
-                     TrailSample(point: move(threshold28C, 90, 1.5), time: t0 + 90, altitudeFt: 1_150)]
+        let trail = [TimedPoint(point: move(threshold28C, 90, 5), time: t0, altitudeFt: 2_300),
+                     TimedPoint(point: move(threshold28C, 90, 3), time: t0 + 50, altitudeFt: 1_650),
+                     TimedPoint(point: move(threshold28C, 90, 1.5), time: t0 + 90, altitudeFt: 1_150)]
         let f = flight(at: move(threshold28C, 270, 0.5), track: 270, alt: 1_600, vr: 1_500, gs: 140)
         XCTAssertEqual(analyzer(destination: ord).phase(of: f, trail: trail), .goAround(airport: ord, runway: "28C"))
         // The same climb without a trail is not called a go-around.

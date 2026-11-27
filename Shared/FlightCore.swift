@@ -124,6 +124,9 @@ struct DisplayOptions: Codable, Equatable {
     func radius(_ nm: Int) -> String {
         metric ? unit("\(Int((Double(nm) * 1.852).rounded()))", "KM", "km") : unit("\(nm)", "NM", "nm")
     }
+
+    /// The same options with the plain (non-LED) style, for text outside the board.
+    var withStandardStyle: DisplayOptions { var d = self; d.style = .standard; return d }
 }
 
 extension DisplayOptions {
@@ -279,6 +282,8 @@ struct PanelModel: Equatable {
     var placeName = ""
     var radiusNM = 25
     var updated: Date?
+    /// Runway phases of low flights (`ApproachAnalyzer.listPhase`), by flight ID.
+    var runwayPhases: [String: RunwayPhase] = [:]
 
     var featured: Flight? { flights.isEmpty ? nil : flights[min(featuredIndex, flights.count - 1)] }
     var others: [Flight] { flights.filter { $0.id != featured?.id } }

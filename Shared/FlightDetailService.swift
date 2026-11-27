@@ -92,6 +92,8 @@ struct AircraftReport: Equatable {
     var positionTime: Date
     /// Year the airframe was built, when the feed's aircraft database knows it.
     var year: Int? = nil
+    /// The altimeter setting selected in the cockpit (hPa), when reported; corrects pressure altitude.
+    var qnhHPa: Double? = nil
 }
 
 /// adsb.lol record for the per-aircraft endpoint. Unlike the point query it has no observer
@@ -117,6 +119,8 @@ struct DetailAircraftRecord: Decodable {
     let lastPosition: LastPosition?
     /// Build year; feeds send it as a string ("2019"), occasionally as a number.
     let year: BuildYear?
+    /// Selected altimeter setting in hPa.
+    let nav_qnh: Double?
 
     /// Decodes a year from a string or number, never failing the enclosing record.
     struct BuildYear: Decodable {
@@ -164,6 +168,7 @@ extension AircraftReport {
         if case .ground? = a.alt_baro { onGround = true } else { onGround = false }
         positionTime = now.addingTimeInterval(-pos.age)
         year = a.year?.value
+        qnhHPa = a.nav_qnh.flatMap { (900...1_100).contains($0) ? $0 : nil }
     }
 }
 
@@ -235,31 +240,37 @@ enum FlightDetailService {
     }
 }
 
-/// A position with the time it was reported.
+/// A position with the time it was reported, and the altitude and ground state when known.
 struct TimedPoint: Equatable, Sendable {
     var point: GeoPoint
     var time: Date
+    /// Barometric altitude in feet, when reported.
+    var altitudeFt: Double? = nil
+    /// The source flagged the aircraft as on the ground.
+    var onGround = false
 }
 
 /// A recorded track, oldest first.
 struct FlightTrack: Equatable, Sendable {
     var points: [TimedPoint]
+
     /// Altitude of the first waypoint in feet (low means the track starts at the departure airport).
-    var startAltitudeFt: Double?
+    var startAltitudeFt: Double? { points.first?.altitudeFt }
 
     /// Parses OpenSky waypoints `[time, lat, lon, baro altitude m, true track, on ground]`.
     /// Returns nil for tracks that are too short, stale (> 30 min old) or don't end near `current`.
     init?(waypoints: [[Any]], current: GeoPoint?, now: Date = Date()) {
-        let parsed = waypoints.compactMap { w -> (TimedPoint, Double?)? in
+        let parsed = waypoints.compactMap { w -> TimedPoint? in
             guard w.count >= 3, let t = (w[0] as? NSNumber)?.doubleValue,
                   let lat = (w[1] as? NSNumber)?.doubleValue, let lon = (w[2] as? NSNumber)?.doubleValue else { return nil }
-            let alt = w.count > 3 ? (w[3] as? NSNumber)?.doubleValue : nil
-            return (TimedPoint(point: GeoPoint(lat: lat, lon: lon), time: Date(timeIntervalSince1970: t)), alt)
+            let altitude = w.count > 3 ? (w[3] as? NSNumber).map { $0.doubleValue * 3.28084 } : nil
+            let onGround = w.count > 5 ? (w[5] as? Bool) ?? false : false
+            return TimedPoint(point: GeoPoint(lat: lat, lon: lon), time: Date(timeIntervalSince1970: t),
+                              altitudeFt: altitude, onGround: onGround)
         }
-        guard parsed.count > 1, let last = parsed.last?.0, now.timeIntervalSince(last.time) < 30 * 60 else { return nil }
+        guard parsed.count > 1, let last = parsed.last, now.timeIntervalSince(last.time) < 30 * 60 else { return nil }
         if let c = current, FlightService.gcDistance(c.lat, c.lon, last.point.lat, last.point.lon) > 60 { return nil }
-        points = parsed.map(\.0)
-        startAltitudeFt = parsed.first?.1.map { $0 * 3.28084 }
+        points = parsed
     }
 }
 

@@ -63,12 +63,17 @@ enum RouteGeometry {
     /// great-circle line from its position; empty when it's too slow for a meaningful vector.
     static func headingVector(from p: GeoPoint, track: Double, speedKT: Double, minutes: Double = 10) -> [GeoPoint] {
         guard speedKT > 50, minutes > 0, track.isFinite else { return [] }
-        let δ = speedKT * minutes / 60 / earthRadiusNM, θ = track * .pi / 180
+        let end = destination(from: p, bearing: track, distanceNM: speedKT * minutes / 60)
+        return FlightMath.removingRepeats(FlightMath.greatCircle(from: p, to: end, count: 8))
+    }
+
+    /// The point `distanceNM` from `p` along the great circle starting at `bearing` (degrees true).
+    static func destination(from p: GeoPoint, bearing: Double, distanceNM: Double) -> GeoPoint {
+        let δ = distanceNM / earthRadiusNM, θ = bearing * .pi / 180
         let φ1 = p.lat * .pi / 180, λ1 = p.lon * .pi / 180
         let φ2 = asin(sin(φ1) * cos(δ) + cos(φ1) * sin(δ) * cos(θ))
         let λ2 = λ1 + atan2(sin(θ) * sin(δ) * cos(φ1), cos(δ) - sin(φ1) * sin(φ2))
-        let end = GeoPoint(lat: φ2 * 180 / .pi, lon: (λ2 * 180 / .pi + 540).truncatingRemainder(dividingBy: 360) - 180)
-        return FlightMath.removingRepeats(FlightMath.greatCircle(from: p, to: end, count: 8))
+        return GeoPoint(lat: φ2 * 180 / .pi, lon: (λ2 * 180 / .pi + 540).truncatingRemainder(dividingBy: 360) - 180)
     }
 
     /// Breaks a line where it crosses the antimeridian (a longitude jump of more than 180°) into

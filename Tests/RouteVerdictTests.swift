@@ -82,7 +82,7 @@ final class RouteVerdictTests: XCTestCase {
                                             current: nil, now: t))
         XCTAssertEqual(RouteResolver.departure(of: low)?.airport.code, "SLC")
         var high = low
-        high.startAltitudeFt = 30_000
+        high.points[0].altitudeFt = 30_000
         XCTAssertNil(RouteResolver.departure(of: high), "a track picked up in cruise says nothing about the origin")
     }
 

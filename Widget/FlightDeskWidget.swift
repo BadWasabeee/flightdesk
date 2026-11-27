@@ -209,11 +209,18 @@ struct Provider: AppIntentTimelineProvider {
         let rotateCount = settings.rotate ? min(5, model.flights.count) : 1
         let step = 15.0, frames = 20
         var entries: [FlightEntry] = []
+        // Runway phase of the featured flight only, per frame (it moves along final); the runway
+        // table is only read when a featured flight is low enough (see `listPhase`).
+        var phases: [String: RunwayPhase] = [:]
         for i in 0..<frames {
             let t = Double(i) * step
             var m = model
             m.flights = model.flights.map { $0.projected(by: t, observerLat: loc.lat, observerLon: loc.lon) }
             m.featuredIndex = rotateCount > 1 ? (i / 2) % rotateCount : 0
+            if let f = m.featured {
+                phases[f.id] = RunwayPhase.listed(ApproachAnalyzer.listPhase(of: f), previous: phases[f.id], flight: f)
+                m.runwayPhases = phases[f.id].map { [f.id: $0] } ?? [:]
+            }
             entries.append(FlightEntry(date: now.addingTimeInterval(t), model: m, options: opts))
         }
         return Timeline(entries: entries, policy: .after(now + Double(frames) * step))

@@ -339,8 +339,3 @@ struct SpotterSettingsView: View {
             })
     }
 }
-
-extension DisplayOptions {
-    /// The same options with the plain (non-LED) style, for text outside the board.
-    var withStandardStyle: DisplayOptions { var d = self; d.style = .standard; return d }
-}

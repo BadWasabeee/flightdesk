@@ -209,7 +209,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 menu.addItem(withTitle: status, action: nil, keyEquivalent: "").isEnabled = false
             }
             for f in nearest {
-                let item = add(Self.menuTitle(for: f, display: store.settings.display), #selector(openFlightFromMenu(_:)))
+                let item = add(Self.menuTitle(for: f, phase: store.model.runwayPhases[f.id], display: store.settings.display),
+                               #selector(openFlightFromMenu(_:)))
                 item.representedObject = f.id
                 item.image = symbol("airplane")
                 item.toolTip = [f.airlineName, f.typeCode].filter { !$0.isEmpty }.joined(separator: " · ")
@@ -226,13 +227,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         add("Quit FlightDesk", #selector(quit), "q")
     }
 
-    /// "DL1342  MKE→BOS · 4.0 nm NE" (route only when known), with any situation: "· DIVERT MKE".
-    static func menuTitle(for f: Flight, display: DisplayOptions) -> String {
+    /// "DL1342  MKE→BOS · 4.0 nm NE" (route only when known), with any situation ("· DIVERT MKE")
+    /// and runway phase ("· Final 28C").
+    static func menuTitle(for f: Flight, phase: RunwayPhase? = nil, display: DisplayOptions) -> String {
         let d = display.withStandardStyle
         var parts: [String] = []
         if let r = f.route, let to = f.destination, !r.from.code.isEmpty, !to.code.isEmpty { parts.append("\(r.from.code)→\(to.code)") }
         else if !f.typeCode.isEmpty { parts.append(f.typeCode) }
         if let s = f.situation { parts.append(s.tag) }
+        if let tag = phase?.tag(d, distance: false) { parts.append(tag) }
         parts.append("\(d.distance(f.distance)) \(f.direction)")
         return "\(f.displayNumber)  " + parts.joined(separator: " · ")
     }
@@ -339,7 +342,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     #if DEBUG
     /// FLIGHTDESK_SNAPSHOT_DIR=/path renders every widget size, the designed empty/error states
-    /// the situation labels (a diversion and an emergency, `alert-*`) and the floating panel to PNGs,
+    /// the situation labels (a diversion and an emergency, `alert-*`), a flight on final (`approach-*`)
+    /// and the floating panel to PNGs,
     /// then quits. FLIGHTDESK_SNAPSHOT_SAMPLE=1 uses the gallery sky;
     /// FLIGHTDESK_SNAPSHOT_STYLE=led|standard and FLIGHTDESK_SNAPSHOT_SCHEME=light|dark override the look.
     /// Debug builds only; under the App Sandbox the directory must be inside the app's container
@@ -349,7 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         let alerts = PanelModel.situations
         var emergency = alerts
         emergency.featuredIndex = 1
-        Task { await AirlineLogos.prefetch(Set((alerts.flights + PanelModel.sample.flights).compactMap(\.logoKey))) }
+        Task { await AirlineLogos.prefetch(Set((alerts.flights + PanelModel.approach.flights + PanelModel.sample.flights).compactMap(\.logoKey))) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
             guard let self else { return }
             let env = ProcessInfo.processInfo.environment
@@ -387,6 +391,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 ("alert-large-emergency", emergency, .large, large, o),
                 ("alert-xlarge", alerts, .extraLarge, xlarge, o),
                 ("alert-large-nolist", alerts, .large, large, noList),
+                ("approach-small", PanelModel.approach, .small, small, o),
+                ("approach-medium", PanelModel.approach, .medium, medium, o),
+                ("approach-large", PanelModel.approach, .large, large, o),
+                ("approach-xlarge", PanelModel.approach, .extraLarge, xlarge, o),
             ]
             for (name, model, layout, size, opts) in shots {
                 self.render(PanelContent(model: model, layout: layout, accessory: AnyView(RefreshGlyph()))
@@ -411,6 +419,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 .modifier(PanelChrome(options: o))
                 .padding(20)
                 .environment(\.colorScheme, scheme), to: "\(dir)/alert-panel.png")
+            self.render(PanelContent(model: PanelModel.approach, layout: .panel)
+                .environment(\.displayOptions, o)
+                .frame(width: 460)
+                .fixedSize(horizontal: false, vertical: true)
+                .modifier(PanelChrome(options: o))
+                .padding(20)
+                .environment(\.colorScheme, scheme), to: "\(dir)/approach-panel.png")
             NSApp.terminate(nil)
         }
     }

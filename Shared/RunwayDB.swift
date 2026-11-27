@@ -56,6 +56,15 @@ enum RunwayDB {
         return icaoByIATA[code].flatMap { byICAO[$0] } ?? []
     }
 
+    /// The runway end `ident` at an airport, with the threshold at its far end.
+    static func runwayEnd(_ ident: String, code: String) -> (end: RunwayEnd, far: RunwayEnd)? {
+        for r in runways(code: code) {
+            if r.low.ident == ident { return (r.low, r.high) }
+            if r.high.ident == ident { return (r.high, r.low) }
+        }
+        return nil
+    }
+
     /// Airports with a runway threshold within `nm` of `p`, nearest first.
     static func airports(near p: GeoPoint, within nm: Double) -> [AirportRunways] {
         let latWindow = nm / 60 + 0.1
@@ -116,4 +125,45 @@ extension ApproachAnalyzer {
         }
         self.init(airports: airports, origin: origin, destination: destination)
     }
+}
+
+extension ApproachAnalyzer {
+    /// Feed flights above this aren't analysed for lists, the widget, the panel and the menu: no
+    /// runway phase applies, and skipping them keeps each refresh cheap.
+    static let listCeilingFt = 15_000
+
+    /// The runway phase a list, the widget, the panel or the menu shows for an airborne feed flight:
+    /// final approach, a landing rollout, a takeoff or go-around; nil at or above `listCeilingFt` (the
+    /// bundled runways are only loaded once a lower flight asks) and for ground or past phases.
+    static func listPhase(of f: Flight) -> RunwayPhase? {
+        guard f.altitude < listCeilingFt else { return nil }
+        let phase = ApproachAnalyzer(around: f.geoPoint, origin: f.route?.from, destination: f.destination).phase(of: f)
+        return phase.flatMap(\.isListed) == true ? phase : nil
+    }
+}
+
+/// What the detail map highlights for a runway phase: the runway (threshold to threshold) and, on
+/// final, its extended centreline out to `centrelineNM`. Empty when the phase names no current
+/// runway or the runway isn't in the table. Lines never repeat a vertex (MapKit stops drawing).
+struct RunwayHighlight: Equatable {
+    static let centrelineNM = 10.0
+
+    var runway: [GeoPoint] = []
+    var centreline: [GeoPoint] = []
+
+    init() {}
+
+    /// - Parameter lookup: finds a runway end and its opposite by ident and airport code.
+    init(phase: RunwayPhase?, lookup: (_ ident: String, _ code: String) -> (end: RunwayEnd, far: RunwayEnd)? = RunwayDB.runwayEnd) {
+        guard let phase, phase.isCurrent, let ident = phase.runway, let r = lookup(ident, phase.airport.code) else { return }
+        runway = FlightMath.removingRepeats([r.end.threshold, r.far.threshold])
+        if case .finalApproach = phase {
+            let out = RouteGeometry.destination(from: r.end.threshold, bearing: r.end.heading + 180, distanceNM: Self.centrelineNM)
+            centreline = FlightMath.removingRepeats([out, r.end.threshold])
+        }
+        if runway.count < 2 { runway = [] }
+        if centreline.count < 2 { centreline = [] }
+    }
+
+    var isEmpty: Bool { runway.isEmpty && centreline.isEmpty }
 }

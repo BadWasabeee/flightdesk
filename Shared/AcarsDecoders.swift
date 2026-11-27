@@ -391,14 +391,10 @@ enum AcarsContentDecoder {
 
     // MARK: Helpers
 
-    /// "42.475° N, 87.807° W (2 nm N of PWK)".
+    /// "42.475° N, 87.807° W (2.0 nm N of PWK)", placed with `PositionDescriber` in nautical miles.
     static func describe(_ p: GeoPoint) -> String {
         let base = AcarsDecoder.format(p)
-        guard let a = AirportDB.nearest(to: p, within: 60) else { return base }
-        let d = FlightService.gcDistance(a.lat, a.lon, p.lat, p.lon)
-        if d < 1 { return "\(base) (at \(a.code))" }
-        let bearing = FlightMath.compassPoint(FlightService.initialBearing(a.lat, a.lon, p.lat, p.lon))
-        return "\(base) (\(Int(d.rounded())) nm \(bearing) of \(a.code))"
+        return PositionDescriber.location(of: p).map { "\(base) (\($0))" } ?? base
     }
 
     /// "03:51:13Z".

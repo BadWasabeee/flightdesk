@@ -74,6 +74,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             let keepID = model.featured?.id
             var m = PanelModel(flights: flights, placeName: loc.name, radiusNM: settings.radius.nm, updated: Date())
             m.featuredIndex = flights.firstIndex { $0.id == keepID } ?? 0
+            m.runwayPhases = RunwayPhase.listPhases(for: flights, previous: model.runwayPhases, phase: ApproachAnalyzer.listPhase)
             m.status = flights.isEmpty ? "Quiet skies — nothing within \(settings.display.radius(settings.radius.nm))" : ""
             model = m
             onFlights?(flights)

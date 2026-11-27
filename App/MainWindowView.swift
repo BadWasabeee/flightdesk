@@ -199,7 +199,7 @@ private struct FlightList: View {
             List(selection: $radar.selection) {
                 if !flights.isEmpty {
                     Section {
-                        ForEach(flights) { FlightRow(f: $0).tag($0.id) }
+                        ForEach(flights) { FlightRow(f: $0, phase: radar.runwayPhases[$0.id]).tag($0.id) }
                     } header: {
                         header
                     }
@@ -355,7 +355,15 @@ private struct FlightMenu: View {
 
 private struct FlightRow: View {
     let f: Flight
+    let phase: RunwayPhase?
     @Environment(\.displayOptions) private var o
+
+    /// The second line: the runway phase (tinted) ahead of the route, or the usual subtitle.
+    private var subtitle: Text {
+        guard let p = FlightRowText.phaseSubtitle(f, phase: phase, options: o) else { return Text(FlightRowText.subtitle(f)) }
+        let tag = Text(p.tag).foregroundStyle(phase?.isCaution == true ? Color.orange : Color.accentColor)
+        return p.rest.isEmpty ? tag : tag + Text(" · \(p.rest)")
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -365,7 +373,7 @@ private struct FlightRow: View {
                     Text(f.displayNumber).font(.headline).lineLimit(1)
                     if let s = f.situation { SituationChip(situation: s) }
                 }
-                Text(FlightRowText.subtitle(f))
+                subtitle
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -389,7 +397,7 @@ private struct FlightRow: View {
         .padding(.vertical, 3)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(FlightRowText.accessibilityLabel(f))
-        .accessibilityValue(FlightRowText.accessibilityValue(f, units: o.units))
+        .accessibilityValue([FlightRowText.accessibilityValue(f, units: o.units), phase?.tag(o)].compactMap { $0 }.joined(separator: ", "))
         .accessibilityAction(named: "Open Details") { FlightDetail.show(hex: f.id, snapshot: f) }
     }
 }
@@ -882,6 +890,7 @@ private struct FlightInspector: View {
                                 .accessibilityLabel(s.spoken)
                         }
                     }
+                    position(f)
                     if let r = f.route { Section("Route") { route(r, f) } }
                     Section("Flight") {
                         fact("Altitude", o.altitude(f.altitude))
@@ -924,6 +933,25 @@ private struct FlightInspector: View {
         } else {
             ContentUnavailableView("No Selection", systemImage: "airplane",
                                    description: Text("Select an aircraft in the list or on the map."))
+        }
+    }
+
+    /// The position headline ("Final RWY 28C at ORD · 6.0 nm · on glidepath", "Descending through
+    /// 6,000 ft") and, on final, the touchdown time; from the phase worked out at the last fetch.
+    @ViewBuilder private func position(_ f: Flight) -> some View {
+        let phase = radar.runwayPhases[f.id]
+        let headline = PositionDescriber.describe(f, phase: phase, options: o).headline
+        if !headline.isEmpty {
+            Section("Position") {
+                Label(headline, systemImage: phase?.symbol ?? "location")
+                    .foregroundStyle(phase?.isCaution == true ? Color.orange : Color.primary)
+                    .textSelection(.enabled)
+                if case .finalApproach(let fa)? = phase {
+                    Text(PositionDescriber.touchdown(fa, now: radar.runwayPhasesTime))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 

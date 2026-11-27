@@ -43,6 +43,10 @@ final class FlightDetailModel: ObservableObject {
     @Published private(set) var acars: AcarsState = .loading
     /// The route the aircraft reported over ACARS, with its names placed.
     @Published private(set) var acarsRoute: AcarsRoute? { didSet { updatePaths() } }
+    /// What the aircraft is doing on or around a runway, or the runway it departed from.
+    @Published private(set) var runwayPhase: RunwayPhase?
+    /// Plain-language position: runway phase, nearest airport and next waypoint.
+    @Published private(set) var position: PositionDescription?
 
     /// Planned great-circle route, origin to destination (cached; recomputed when data changes).
     private(set) var plannedPath: [GeoPoint] = []
@@ -57,6 +61,10 @@ final class FlightDetailModel: ObservableObject {
     private(set) var routePlan: AcarsRoutePlan?
     /// Placed ACARS route waypoints still ahead, for the map.
     private(set) var waypointMarks: [WaypointMark] = []
+    /// The runway (and on final its extended centreline) highlighted on the map (cached with the paths).
+    private(set) var runwayHighlight = RunwayHighlight()
+    /// When `runwayPhase` was worked out (the reference for the touchdown time).
+    private(set) var runwayPhaseTime = Date()
 
     /// Progress of the airframe photo lookup.
     enum PhotoState {
@@ -93,6 +101,8 @@ final class FlightDetailModel: ObservableObject {
     private var acarsEndpoints: RouteInfo?
     /// What `acarsRoute` was last decoded from.
     private var acarsRouteInput: AcarsRouteInput?
+    /// The cockpit altimeter setting from the latest report, for the approach analysis.
+    private var qnhHPa: Double?
 
     /// `nearby` seeds the map's other aircraft (when switching planes) until the next refresh.
     init(hex: String, snapshot: Flight?, nearby: [Flight] = []) {
@@ -285,6 +295,9 @@ final class FlightDetailModel: ObservableObject {
             isLive = false
             return
         }
+        // A cached nearby list can be older than the last report shown (and never has ground
+        // traffic): skip it rather than step back, e.g. from "Landed" to "Final".
+        if let seen = lastSeen, report.positionTime < seen { return }
 
         var f = report.flight
         if f.callsign != enrichedCallsign {
@@ -304,9 +317,13 @@ final class FlightDetailModel: ObservableObject {
 
         var newTrail = trail.filter { $0.time != .distantPast }
         let moved = newTrail.last.map { FlightService.gcDistance($0.point.lat, $0.point.lon, f.lat, f.lon) >= 0.05 } ?? true
-        if moved { newTrail.append(TimedPoint(point: f.geoPoint, time: report.positionTime)) }
+        if moved {
+            newTrail.append(TimedPoint(point: f.geoPoint, time: report.positionTime,
+                                       altitudeFt: report.onGround ? nil : Double(f.altitude), onGround: report.onGround))
+        }
         if newTrail != trail { trail = newTrail }
         isHolding = !report.onGround && FlightSituation.isHolding(trail: newTrail, now: report.positionTime)
+        qnhHPa = report.qnhHPa
         flight = f
         squawk = report.squawk
         onGround = report.onGround
@@ -332,6 +349,12 @@ final class FlightDetailModel: ObservableObject {
         FlightSituation.squawk(squawk) ?? flight?.pathSituation ?? (isHolding && isLive ? .holding : nil)
     }
 
+    /// The runway the aircraft has just landed on, while on it.
+    var landedRunway: String? {
+        if case .landed(_, let runway)? = runwayPhase { return runway }
+        return nil
+    }
+
     var flownNM: Double? {
         guard let f = flight, let r = f.route else { return nil }
         return FlightService.gcDistance(r.from.lat, r.from.lon, f.lat, f.lon)
@@ -352,9 +375,11 @@ final class FlightDetailModel: ObservableObject {
         return parts.isEmpty ? nil : parts.joined(separator: " ")
     }
 
-    /// Arrival state while live: landed, landing, or an estimate at the current ground speed.
+    /// Arrival state while live: landed, landing, or an estimate at the current ground speed. Nil on
+    /// final approach, where the position card gives the touchdown time instead.
     var arrival: DetailFormat.Arrival? {
         guard isLive, let f = flight, let left = remainingNM else { return nil }
+        if case .finalApproach? = runwayPhase { return nil }
         return DetailFormat.arrival(remainingNM: left, speedKT: f.speed, altitudeFt: f.altitude,
                                     verticalRate: f.verticalRate, onGround: onGround)
     }
@@ -388,6 +413,7 @@ final class FlightDetailModel: ObservableObject {
         let live = trail.filter { $0.time > end }
         let firstLive = live.first?.time ?? .distantFuture
         let recorded = history.isEmpty ? (acarsRoute?.positions ?? []).filter { $0.time < firstLive } : history
+        updatePosition(trail: recorded + live)
         var points = recorded.map(\.point) + live.map(\.point)
         if let f = flight, points.last != f.geoPoint { points.append(f.geoPoint) }
         // Without a recorded track, join the origin to the first observed position.
@@ -412,6 +438,29 @@ final class FlightDetailModel: ObservableObject {
         } else {
             headingLines = []
         }
+    }
+
+    /// Works out the runway phase and position description from the live report and `samples`
+    /// (recorded track, then live positions, oldest first). A stale position only keeps the departure.
+    private func updatePosition(trail samples: [TimedPoint]) {
+        guard let f = flight else {
+            runwayPhase = nil
+            position = nil
+            runwayHighlight = RunwayHighlight()
+            return
+        }
+        let analyzer = ApproachAnalyzer(around: f.geoPoint, origin: f.route?.from ?? departedFrom, destination: f.destination)
+        let phase = isLive ? analyzer.phase(of: f, onGround: onGround, trail: samples, qnhHPa: qnhHPa)
+                           : analyzer.departure(trail: samples)
+        let next = routePlan?.ahead.first.flatMap { w in
+            w.point.map { NextFix(name: w.label, distanceNM: FlightService.gcDistance(f.lat, f.lon, $0.lat, $0.lon)) }
+        }
+        let now = Date()
+        runwayPhaseTime = now
+        runwayHighlight = RunwayHighlight(phase: phase)
+        if phase != runwayPhase { runwayPhase = phase }
+        let described = PositionDescriber.describe(f, phase: phase, onGround: onGround, nextFix: next, options: display, now: now)
+        if described != position { position = described }
     }
 
     var adsbLolURL: URL? {
@@ -673,6 +722,17 @@ private struct FlightDetailMap: View {
                 MapPolyline(coordinates: line.map(\.coordinate))
                     .stroke(Color.accentColor.opacity(0.9), style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [0.5, 5]))
             }
+            // The runway being used, and on final its extended centreline: under the track, which runs along them.
+            if model.runwayHighlight.centreline.count > 1 {
+                MapPolyline(coordinates: model.runwayHighlight.centreline.map(\.coordinate))
+                    .stroke(Color.primary.opacity(0.65), style: StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
+            }
+            if model.runwayHighlight.runway.count > 1 {
+                MapPolyline(coordinates: model.runwayHighlight.runway.map(\.coordinate))
+                    .stroke(Color.white, style: StrokeStyle(lineWidth: 9, lineCap: .butt))
+                MapPolyline(coordinates: model.runwayHighlight.runway.map(\.coordinate))
+                    .stroke(Color(white: 0.25), style: StrokeStyle(lineWidth: 6, lineCap: .butt))
+            }
             // A dark casing under the flown track keeps it legible over any terrain.
             ForEach(Array(model.flownLines.enumerated()), id: \.offset) { _, line in
                 MapPolyline(coordinates: line.map(\.coordinate))
@@ -893,6 +953,7 @@ private struct FlightDetailSidebar: View {
                 VStack(alignment: .leading, spacing: 18) {
                     header(f)
                     photoSection
+                    positionCard
                     if let r = f.route {
                         routeCard(f, from: r.from, to: f.destination ?? r.to,
                                   replaced: f.pathSituation?.newDestination == nil ? nil : r.to)
@@ -946,14 +1007,35 @@ private struct FlightDetailSidebar: View {
             }
             .accessibilityElement(children: .combine)
             .accessibilityAddTraits(.isHeader)
-            HStack(spacing: 6) {
-                StatusPill(model: model)
-                if let s = model.situation {
-                    Pill(text: s.title, symbol: s.symbol, tint: s.tint)
-                        .accessibilityElement(children: .ignore)
-                        .accessibilityLabel(s.spoken)
-                }
+            // The runway phase is secondary: it's the first thing dropped when the row runs out of room.
+            ViewThatFits(in: .horizontal) {
+                pills(approach: true).fixedSize()
+                pills(approach: false)
             }
+        }
+    }
+
+    private func pills(approach: Bool) -> some View {
+        HStack(spacing: 6) {
+            StatusPill(model: model)
+            if let s = model.situation {
+                Pill(text: s.title, symbol: s.symbol, tint: s.tint)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(s.spoken)
+            }
+            if approach, let p = airbornePhase, let tag = p.tag(o, distance: false) {
+                Pill(text: tag, symbol: p.symbol, tint: p.isCaution ? .orange : .blue)
+                    .help(model.position?.phase ?? tag)
+            }
+        }
+    }
+
+    /// A live airborne runway phase for the header (landed and taxiing are the status pill's).
+    private var airbornePhase: RunwayPhase? {
+        guard model.isLive, !model.onGround, let p = model.runwayPhase else { return nil }
+        switch p {
+        case .finalApproach, .takingOff, .goAround: return p
+        default: return nil
         }
     }
 
@@ -1023,6 +1105,50 @@ private struct FlightDetailSidebar: View {
         }
     }
 
+    // MARK: Position
+
+    /// Where the aircraft is in words: what it's doing at a runway, touchdown time on final, the
+    /// nearest airport and the next waypoint. The departure runway shows here only when the route
+    /// card has no departure time to attach it to.
+    @ViewBuilder private var positionCard: some View {
+        let lines = positionLines
+        if !lines.isEmpty {
+            DetailCard("Position") {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(Array(lines.enumerated()), id: \.offset) { i, line in
+                        if i == 0, let p = model.runwayPhase, p.isCurrent {
+                            Label(line, systemImage: p.symbol)
+                                .font(.callout.weight(.semibold))
+                                .foregroundStyle(p.isCaution ? Color.orange : Color.primary)
+                        } else {
+                            Text(line)
+                                .font(.callout)
+                                .foregroundStyle(i == 0 ? .primary : .secondary)
+                        }
+                    }
+                }
+                .monospacedDigit()
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.vertical, 2)
+                .opacity(model.isLive ? 1 : 0.6)
+            }
+        }
+    }
+
+    private var positionLines: [String] {
+        guard let d = model.position else { return [] }
+        var lines: [String] = []
+        if d.phaseIsCurrent, let phase = d.phase { lines.append(phase) }
+        if model.isLive, case .finalApproach(let fa)? = model.runwayPhase {
+            lines.append(PositionDescriber.touchdown(fa, now: model.runwayPhaseTime))
+        }
+        if let location = d.location { lines.append(location) }
+        if let next = d.next { lines.append(next) }
+        if !d.phaseIsCurrent, model.departureTime == nil, let departed = d.phase { lines.append(departed) }
+        return lines
+    }
+
     // MARK: Route
 
     /// `replaced`: the scheduled destination when the flight is diverting or returning instead (shown struck through).
@@ -1067,7 +1193,7 @@ private struct FlightDetailSidebar: View {
             VStack(spacing: 0) {
                 if let departed {
                     TimingRow(label: "Departed", time: departed.formatted(date: .omitted, time: .shortened),
-                              detail: DetailFormat.ago(departed))
+                              detail: departureRunway.map { "\(DetailFormat.ago(departed)) · RWY \($0)" } ?? DetailFormat.ago(departed))
                 }
                 switch arrival {
                 case .landed?:
@@ -1083,6 +1209,12 @@ private struct FlightDetailSidebar: View {
                 }
             }
         }
+    }
+
+    /// The runway the recorded track shows the flight taking off from.
+    private var departureRunway: String? {
+        if case .departed(_, let runway, _)? = model.runwayPhase { return runway }
+        return nil
     }
 
     /// "~~DEN~~ MKE": the new destination in the situation's colour beside the struck-through scheduled one.
@@ -1591,10 +1723,11 @@ private struct StatusPill: View {
 
     var body: some View {
         if model.isLive {
-            if model.arrival == .landed {
-                Pill(text: "Landed", symbol: "airplane.arrival", tint: .secondary)
+            if model.arrival == .landed || model.landedRunway != nil {
+                Pill(text: model.landedRunway.map { "Landed \($0)" } ?? "Landed", symbol: "airplane.arrival", tint: .secondary)
             } else if model.onGround {
-                Pill(text: "On Ground", symbol: "road.lanes", tint: .secondary)
+                Pill(text: model.runwayPhase?.tag(model.display, distance: false) ?? "On Ground",
+                     symbol: model.runwayPhase?.symbol ?? "road.lanes", tint: .secondary)
             } else {
                 LivePill()
             }

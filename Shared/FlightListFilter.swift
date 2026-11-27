@@ -98,6 +98,15 @@ enum FlightRowText {
         return [lead, f.typeCode].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
+    /// Second line of a list row for a flight with a runway phase: the compact phase ("Final 28C ·
+    /// 6 nm") and what's left room for (the route, else the type, else the airline). Nil without a tag.
+    static func phaseSubtitle(_ f: Flight, phase: RunwayPhase?, options: DisplayOptions) -> (tag: String, rest: String)? {
+        guard let tag = phase?.tag(options.withStandardStyle) else { return nil }
+        let rest = f.route.map { "\($0.from.code) → \(f.destination?.code ?? $0.to.code)" }
+            ?? (f.typeCode.isEmpty ? f.airlineName : f.typeCode)
+        return (tag, rest)
+    }
+
     /// Who's flying it: the airline or owner, else "Private" for non-airline callsigns.
     static func operatorName(_ f: Flight) -> String {
         if !f.airlineName.isEmpty { return f.airlineName }

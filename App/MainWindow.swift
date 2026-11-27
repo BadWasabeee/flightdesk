@@ -38,6 +38,11 @@ final class RadarModel: ObservableObject {
     /// Recorded tracks by hex, oldest point first. Only the selected aircraft's is fetched (the
     /// OpenSky anonymous quota is small), at most once per selection.
     @Published private(set) var tracks: [String: [GeoPoint]] = [:]
+    /// Runway phases of flights below `ApproachAnalyzer.listCeilingFt`, by hex, worked out once per
+    /// fetch (not per dead-reckoned frame).
+    @Published private(set) var runwayPhases: [String: RunwayPhase] = [:]
+    /// When `runwayPhases` was worked out (the reference for touchdown times).
+    private(set) var runwayPhasesTime = Date()
     /// Routes decoded from ACARS by a detail shown in this window, by hex (kept after it closes).
     @Published private(set) var acarsRoutes: [String: AcarsRoute] = [:]
     @Published var query = ""
@@ -164,6 +169,10 @@ final class RadarModel: ObservableObject {
             tracks = tracks.filter { ids.contains($0.key) || $0.key == selection }
             updated = Date()
             feed = fresh.isEmpty ? .empty : .live
+            let phases = RunwayPhase.listPhases(for: FlightListFilter.merging(fresh, known: known), previous: runwayPhases,
+                                                phase: ApproachAnalyzer.listPhase)
+            runwayPhasesTime = liveTime
+            if phases != runwayPhases { runwayPhases = phases }
             if let id = selection, let f = fresh.first(where: { $0.id == id }), trail.last != f.geoPoint {
                 trail = Array((trail + [f.geoPoint]).suffix(Self.trailLimit))
             }
