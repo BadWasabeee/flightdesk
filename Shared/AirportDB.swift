@@ -18,6 +18,15 @@ enum AirportDB {
     private static let byICAO: [String: Airport] = Dictionary(rows { icao, airport in icao.isEmpty ? nil : (icao, airport) },
                                                               uniquingKeysWith: { first, _ in first })
 
+    /// ICAO codes by IATA code, built on first use (airport weather is keyed by ICAO station).
+    private static let icaoByIATA: [String: String] = Dictionary(rows { icao, airport in icao.isEmpty ? nil : (airport.code, icao) },
+                                                                 uniquingKeysWith: { first, _ in first })
+
+    /// The ICAO code of the airport with this IATA (3-letter) code, if it has scheduled service.
+    static func icao(iata raw: String) -> String? {
+        icaoByIATA[raw.trimmingCharacters(in: .whitespaces).uppercased()]
+    }
+
     /// The airport with this IATA (3-letter) or ICAO (4-letter) code, if it has scheduled service.
     static func airport(code raw: String) -> Airport? {
         let code = raw.trimmingCharacters(in: .whitespaces).uppercased()

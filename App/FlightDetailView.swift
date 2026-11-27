@@ -47,6 +47,9 @@ final class FlightDetailModel: ObservableObject {
     @Published private(set) var runwayPhase: RunwayPhase?
     /// Plain-language position: runway phase, nearest airport and next waypoint.
     @Published private(set) var position: PositionDescription?
+    /// METARs (and the arrival TAF) for the departure and arrival airports, from aviationweather.gov.
+    @Published private(set) var departureWeather: AirportConditions?
+    @Published private(set) var arrivalWeather: AirportConditions?
 
     /// Planned great-circle route, origin to destination (cached; recomputed when data changes).
     private(set) var plannedPath: [GeoPoint] = []
@@ -88,6 +91,8 @@ final class FlightDetailModel: ObservableObject {
     private static let staleAfter: TimeInterval = 60
     /// Airframes.io is a community service, so ACARS is checked every couple of minutes.
     private static let acarsInterval: Duration = .seconds(120)
+    /// Weather is cached by `WeatherService` (METARs 10 min, TAFs 30), so this only picks up route changes.
+    private static let weatherInterval: Duration = .seconds(60)
 
     /// Route from the lookup cache, re-verified against every live position.
     private var candidateRoute: RouteInfo?
@@ -137,6 +142,7 @@ final class FlightDetailModel: ObservableObject {
         tasks.append(Self.loop(every: Self.nearbyInterval) { [weak self] in await self?.pollNearby() != nil })
         tasks.append(Self.loop(every: Self.historyInterval, delay: .seconds(1)) { [weak self] in await self?.pollHistory() != nil })
         tasks.append(Self.loop(every: Self.acarsInterval, delay: .seconds(3)) { [weak self] in await self?.pollAcars() != nil })
+        tasks.append(Self.loop(every: Self.weatherInterval, delay: .seconds(2)) { [weak self] in await self?.pollWeather() != nil })
         if case .loading = photo {
             tasks.append(Task { [weak self] in await self?.loadPhoto() })
         }
@@ -241,6 +247,32 @@ final class FlightDetailModel: ObservableObject {
             fdLog.info("ACARS for \(self.hex, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
             if acars == .loading { acars = .unavailable }
         }
+    }
+
+    /// Refreshes the departure and arrival weather: one batched METAR request for both airports
+    /// and a TAF for the arrival, each only when the shared cache has nothing fresh.
+    private func pollWeather() async {
+        for _ in 0..<20 where flight?.route == nil && departedFrom == nil && !Task.isCancelled { try? await Task.sleep(for: .seconds(1)) }
+        guard !Task.isCancelled else { return }
+        var origin = (flight?.route?.from ?? departedFrom).flatMap { AirportConditions(airport: $0) }
+        var destination = flight?.destination.flatMap { AirportConditions(airport: $0) }
+        let ids = [origin?.station, destination?.station].compactMap { $0 }
+        guard !ids.isEmpty else {
+            departureWeather = nil
+            arrivalWeather = nil
+            return
+        }
+        let metars = await WeatherService.shared.metars(ids)
+        var tafs: [String: Taf] = [:]
+        if let d = destination { tafs = await WeatherService.shared.tafs([d.station]) }
+        guard !Task.isCancelled else { return }
+        if let o = origin { origin?.metar = metars[o.station] }
+        if let d = destination {
+            destination?.metar = metars[d.station]
+            destination?.taf = tafs[d.station]
+        }
+        if origin != departureWeather { departureWeather = origin }
+        if destination != arrivalWeather { arrivalWeather = destination }
     }
 
     private func useAcarsEndpoints(_ route: RouteInfo?) {
@@ -450,7 +482,9 @@ final class FlightDetailModel: ObservableObject {
             return
         }
         let analyzer = ApproachAnalyzer(around: f.geoPoint, origin: f.route?.from ?? departedFrom, destination: f.destination)
-        let phase = isLive ? analyzer.phase(of: f, onGround: onGround, trail: samples, qnhHPa: qnhHPa)
+        // Without the aircraft's own setting, the nearby airport's reported altimeter is a fair stand-in.
+        let qnh = qnhHPa ?? AirportConditions.altimeterHPa(near: f.geoPoint, in: [departureWeather, arrivalWeather].compactMap { $0 })
+        let phase = isLive ? analyzer.phase(of: f, onGround: onGround, trail: samples, qnhHPa: qnh)
                            : analyzer.departure(trail: samples)
         let next = routePlan?.ahead.first.flatMap { w in
             w.point.map { NextFix(name: w.label, distanceNM: FlightService.gcDistance(f.lat, f.lon, $0.lat, $0.lon)) }
@@ -968,6 +1002,7 @@ private struct FlightDetailSidebar: View {
                         }
                     }
                     liveDataSection(f)
+                    weatherCard
                     if Shared.location != nil { fromYouCard(f) }
                     // Mostly airliners use ACARS; for other aircraft the section appears once something is heard.
                     if f.looksLikeAirline || model.acars.hasMessages { AcarsSection(state: model.acars, route: model.acarsRoute) }
@@ -1271,6 +1306,34 @@ private struct FlightDetailSidebar: View {
         }
     }
 
+    // MARK: Weather
+
+    /// Latest METAR for the departure and arrival airports (and the arrival TAF), from aviationweather.gov.
+    @ViewBuilder private var weatherCard: some View {
+        let stations = [("Departure", model.departureWeather), ("Arrival", model.arrivalWeather)]
+            .compactMap { role, c in c.flatMap { $0.metar == nil ? nil : (role, $0) } }
+        if !stations.isEmpty {
+            DetailCard("Weather") {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(stations.enumerated()), id: \.offset) { i, item in
+                        if i > 0 { Divider().padding(.vertical, 4) }
+                        WeatherBlock(role: item.0, conditions: item.1, runway: runway(at: item.1), units: o.units)
+                    }
+                    Link("via aviationweather.gov", destination: WeatherBlock.creditURL)
+                        .font(.caption)
+                        .padding(.top, 4)
+                        .help("METARs and TAFs from the NOAA Aviation Weather Center")
+                }
+            }
+        }
+    }
+
+    /// The runway the aircraft is using now at this airport, when the runway analysis names one.
+    private func runway(at c: AirportConditions) -> String? {
+        guard let p = model.runwayPhase, p.isCurrent, let ident = p.runway, c.matches(p.airport) else { return nil }
+        return ident
+    }
+
     // MARK: From you
 
     private func fromYouCard(_ f: Flight) -> some View {
@@ -1352,6 +1415,101 @@ private struct FlightDetailSidebar: View {
         let sub = DetailFormat.subtitle(for: f)
         let title = DetailFormat.title(for: f, hex: model.hex)
         return sub.isEmpty ? title : "\(title) · \(sub)"
+    }
+}
+
+// MARK: - Weather
+
+/// One airport's weather: category dot, the decoded basics, wind components for the runway in use,
+/// and the raw METAR (plus the TAF, when loaded) behind disclosures.
+private struct WeatherBlock: View {
+    static let creditURL = URL(string: "https://aviationweather.gov")!
+
+    let role: String
+    let conditions: AirportConditions
+    /// The runway in use at this airport, for wind components.
+    let runway: String?
+    let units: UnitSystem
+    @State private var showMetar = false
+    @State private var showTaf = false
+
+    var body: some View {
+        if let m = conditions.metar {
+            VStack(alignment: .leading, spacing: 0) {
+                header(m)
+                if let w = m.wind {
+                    InfoRow(label: "Wind", value: WeatherFormat.wind(w, units: units))
+                }
+                if let runway, let c = conditions.components(runway: runway) {
+                    InfoRow(label: "RWY \(runway)", value: WeatherFormat.components(c, units: units))
+                }
+                if let v = m.visibility {
+                    InfoRow(label: "Visibility", value: WeatherFormat.visibility(v, units: units))
+                }
+                InfoRow(label: "Ceiling", value: WeatherFormat.ceiling(m, units: units))
+                if let t = WeatherFormat.temperature(m) { InfoRow(label: "Temp / Dew point", value: t) }
+                if let a = WeatherFormat.altimeter(m, units: units) { InfoRow(label: "Altimeter", value: a) }
+                DisclosureGroup("METAR", isExpanded: $showMetar) {
+                    raw(m.raw, label: "METAR")
+                }
+                .font(.caption)
+                .padding(.vertical, 2)
+                if let taf = conditions.taf {
+                    DisclosureGroup("TAF", isExpanded: $showTaf) {
+                        raw(WeatherFormat.tafLines(taf.raw).joined(separator: "\n"), label: "TAF")
+                    }
+                    .font(.caption)
+                    .padding(.vertical, 2)
+                }
+            }
+        }
+    }
+
+    private func header(_ m: Metar) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Circle()
+                .fill(Self.color(m.category))
+                .frame(width: 8, height: 8)
+                .accessibilityHidden(true)
+            Text("\(role) · \(conditions.airport.code)").font(.callout.weight(.semibold))
+            if let cat = m.category {
+                Text(cat.rawValue).font(.caption.weight(.semibold)).foregroundStyle(Self.color(cat))
+            }
+            Spacer(minLength: 4)
+            TimelineView(.periodic(from: .now, by: 30)) { ctx in
+                Text(WeatherFormat.age(m.observed, now: ctx.date))
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+        .help("\(m.station) observed \(m.observed.formatted(date: .omitted, time: .shortened))")
+        .accessibilityElement(children: .combine)
+    }
+
+    private func raw(_ text: String, label: String) -> some View {
+        Text(text)
+            .font(.system(.caption2, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel("\(label): \(text)")
+    }
+
+    static func color(_ c: FlightCategory?) -> Color { c?.tint ?? .secondary }
+}
+
+extension FlightCategory {
+    /// VFR green, MVFR blue, IFR red, LIFR magenta.
+    var tint: Color {
+        switch self {
+        case .vfr: .green
+        case .mvfr: .blue
+        case .ifr: .red
+        case .lifr: Color(red: 0.85, green: 0.1, blue: 0.85)
+        }
     }
 }
 

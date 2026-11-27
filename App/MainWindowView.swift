@@ -891,7 +891,12 @@ private struct FlightInspector: View {
                         }
                     }
                     position(f)
-                    if let r = f.route { Section("Route") { route(r, f) } }
+                    if let r = f.route {
+                        Section("Route") {
+                            route(r, f)
+                            DestinationWeatherRow(airport: f.destination ?? r.to, units: o.units)
+                        }
+                    }
                     Section("Flight") {
                         fact("Altitude", o.altitude(f.altitude))
                         fact("Vertical Speed", FlightRowText.verticalSpeed(f.verticalRate, units: o.units))
@@ -1014,6 +1019,44 @@ private struct FlightInspector: View {
     private func fact(_ label: String, _ value: String) -> some View {
         LabeledContent(label) {
             Text(value).monospacedDigit().textSelection(.enabled)
+        }
+    }
+}
+
+/// One line for the destination's latest METAR: the flight-category dot and the wind. Loaded through
+/// the shared `WeatherService` cache (so it costs no request when the detail already has it).
+private struct DestinationWeatherRow: View {
+    let airport: Airport
+    let units: UnitSystem
+    @State private var metar: Metar?
+    @State private var loadedFor: String?
+
+    var body: some View {
+        Group {
+            if let m = metar, loadedFor == airport.code {
+                LabeledContent("Weather at \(airport.code)") {
+                    HStack(spacing: 5) {
+                        Circle().fill(m.category?.tint ?? .secondary).frame(width: 8, height: 8)
+                            .accessibilityHidden(true)
+                        Text([m.category?.rawValue, m.wind.map { WeatherFormat.wind($0, units: units) }]
+                            .compactMap { $0 }.joined(separator: " · "))
+                            .monospacedDigit()
+                            .textSelection(.enabled)
+                    }
+                }
+                .help(m.raw)
+            }
+        }
+        .task(id: airport.code) {
+            guard let station = WeatherStation.icao(for: airport) else { metar = nil; return }
+            // The cache decides when a request is due; this just picks up newer reports.
+            while !Task.isCancelled {
+                let found = await WeatherService.shared.metars([station])[station]
+                guard !Task.isCancelled else { return }
+                metar = found
+                loadedFor = airport.code
+                try? await Task.sleep(for: .seconds(120))
+            }
         }
     }
 }
