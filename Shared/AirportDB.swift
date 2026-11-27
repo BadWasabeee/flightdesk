@@ -12,7 +12,24 @@ enum AirportDB {
 
     /// `IATA,ICAO,lat,lon,city` rows from `airports.csv`, from the bundle this code is compiled
     /// into (app, widget extension or test bundle).
-    static let all: [Airport] = {
+    static let all: [Airport] = rows { _, airport in airport }
+
+    /// Airports by ICAO code, built on first use (only the app's ACARS route hints need it).
+    private static let byICAO: [String: Airport] = Dictionary(rows { icao, airport in icao.isEmpty ? nil : (icao, airport) },
+                                                              uniquingKeysWith: { first, _ in first })
+
+    /// The airport with this IATA (3-letter) or ICAO (4-letter) code, if it has scheduled service.
+    static func airport(code raw: String) -> Airport? {
+        let code = raw.trimmingCharacters(in: .whitespaces).uppercased()
+        switch code.count {
+        case 3: return all.first { $0.code == code }
+        case 4: return byICAO[code]
+        default: return nil
+        }
+    }
+
+    /// Each row of `airports.csv` passed through `transform` as (ICAO code, airport).
+    private static func rows<T>(_ transform: (String, Airport) -> T?) -> [T] {
         guard let url = Bundle(for: BundleToken.self).url(forResource: "airports", withExtension: "csv"),
               let text = try? String(contentsOf: url, encoding: .utf8) else {
             fdLog.error("airports.csv is missing from the bundle")
@@ -21,9 +38,9 @@ enum AirportDB {
         return text.split(separator: "\n").compactMap { line in
             let c = line.split(separator: ",", maxSplits: 4, omittingEmptySubsequences: false)
             guard c.count == 5, let lat = Double(c[2]), let lon = Double(c[3]) else { return nil }
-            return Airport(code: String(c[0]), city: String(c[4]), lat: lat, lon: lon)
+            return transform(String(c[1]), Airport(code: String(c[0]), city: String(c[4]), lat: lat, lon: lon))
         }
-    }()
+    }
 
     /// The closest airport to `p`, if one is within `nm`.
     static func nearest(to p: GeoPoint, within nm: Double) -> Airport? {

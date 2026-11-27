@@ -2,7 +2,7 @@ import Foundation
 
 /// The web services FlightDesk talks to, for counting requests and respecting rate limits.
 enum ApiService: String, CaseIterable, Codable, Sendable {
-    case adsbFi, adsbLol, openSky, adsbdb, planespotters, logos, other
+    case adsbFi, adsbLol, openSky, adsbdb, planespotters, airframes, logos, other
 
     init(host: String) {
         switch host {
@@ -11,6 +11,7 @@ enum ApiService: String, CaseIterable, Codable, Sendable {
         case let h where h.hasSuffix("opensky-network.org"): self = .openSky
         case let h where h.hasSuffix("adsbdb.com"): self = .adsbdb
         case let h where h.hasSuffix("planespotters.net") || h.hasSuffix("plnspttrs.net"): self = .planespotters
+        case let h where h.hasSuffix("airframes.io"): self = .airframes
         case let h where h.hasSuffix("jsdelivr.net") || h.hasSuffix("githubusercontent.com") || h.hasSuffix("kiwi.com"): self = .logos
         default: self = .other
         }
@@ -23,6 +24,7 @@ enum ApiService: String, CaseIterable, Codable, Sendable {
         case .openSky: "OpenSky Network"
         case .adsbdb: "adsbdb"
         case .planespotters: "Planespotters.net"
+        case .airframes: "Airframes.io"
         case .logos: "Airline logos"
         case .other: "Other"
         }
@@ -144,9 +146,10 @@ enum ApiBudget {
     }
 
     /// How long to pause a service after a response, from its status and rate-limit headers.
-    /// adsb.lol sends `x-ratelimit-remaining` / `x-ratelimit-reset` (seconds); OpenSky sends
-    /// `X-Rate-Limit-Remaining` and, when limited, `X-Rate-Limit-Retry-After-Seconds`.
-    static func pauseInterval(service: ApiService, status: Int, headers: [AnyHashable: Any]) -> TimeInterval? {
+    /// adsb.lol sends `x-ratelimit-remaining` / `x-ratelimit-reset` (seconds); Airframes.io sends
+    /// the same names with the reset as a Unix time; OpenSky sends `X-Rate-Limit-Remaining` and,
+    /// when limited, `X-Rate-Limit-Retry-After-Seconds`.
+    static func pauseInterval(service: ApiService, status: Int, headers: [AnyHashable: Any], now: Date = Date()) -> TimeInterval? {
         func header(_ name: String) -> String? {
             headers.first { ($0.key as? String)?.caseInsensitiveCompare(name) == .orderedSame }.map { "\($0.value)" }
         }
@@ -154,7 +157,9 @@ enum ApiBudget {
         func number(_ name: String) -> Double? {
             header(name).flatMap { Double($0.split(whereSeparator: { !"0123456789.".contains($0) }).first ?? "") }
         }
-        let retryAfter = number("x-rate-limit-retry-after-seconds") ?? number("retry-after") ?? number("x-ratelimit-reset")
+        // A reset this large is a Unix time, not a number of seconds.
+        let reset = number("x-ratelimit-reset").map { $0 > 1_000_000_000 ? max(0, $0 - now.timeIntervalSince1970) : $0 }
+        let retryAfter = number("x-rate-limit-retry-after-seconds") ?? number("retry-after") ?? reset
         if status == 429 { return retryAfter ?? 1_800 }
         if let remaining = number("x-ratelimit-remaining") ?? number("x-rate-limit-remaining"),
            Int(remaining) <= service.reserve, service.reserve > 0 {

@@ -23,6 +23,7 @@
 - **Unusual situations.** Emergency squawks (7700, 7600, 7500), diversions and returns to the departure airport get a red or orange label everywhere the flight appears, and a diverting flight's route reads "ORD → ~~DEN~~ MKE".
 - **Live progress.** The plane slides along the route line to show how far into the flight it is.
 - **Flight details.** Click a flight in the widget (or the desktop panel) to open a live map with its route, its recorded track since takeoff, every flight within your search radius (drawn as a circle) and full details, including a photo of the airframe and where to look for it in your sky. Click any other plane on the map to switch to it.
+- **ACARS messages.** The flight detail lists the datalink messages (ACARS, VDL2, HFDL, satcom) heard from and to the aircraft by [Airframes.io](https://airframes.io)'s volunteer receivers, newest first, in plain English ("Wind data request", "Out report", "ADS-C report") with the raw text alongside. Out · Off · On · In times, positions and route fixes named in the messages are decoded where the format is unambiguous, and link maintenance (keep-alives, link tests) is hidden unless you ask for it. Coverage depends on where volunteers run receivers.
 - **Airline logos.** Downloaded once and cached (can be turned off in Settings).
 - **Two looks.** Choose an LED board (amber, green, red, blue, cyan or white, with optional glow and dot-matrix texture) or **Standard**, which uses system colours and follows Light and Dark Mode. Both work with the macOS *Clear* and *Tinted* widget styles.
 - **Configurable.** Set the location, radius (5–100 nm), units (ft/kt/nm or metric) and which details appear. Each widget can also override the location, radius, style, colour and units.
@@ -113,8 +114,9 @@ The app and widget both run in the App Sandbox; remote images are size-checked b
 | Data | Source |
 | --- | --- |
 | Live positions, altitude, speed, heading | Your own ADS-B receiver if you set one up, otherwise [adsb.fi](https://adsb.fi) open data, with [adsb.lol](https://adsb.lol) (ODbL) as an automatic fallback. Both are community-run ADS-B/MLAT feeds |
-| Routes, airlines, aircraft models | [adsbdb](https://www.adsbdb.com) |
+| Routes, airlines, aircraft models | [adsbdb](https://www.adsbdb.com); in the detail, when adsbdb has no route that fits, the departure and destination the aircraft reports over ACARS (checked against its live position the same way) |
 | Recorded flight tracks (detail window) | [OpenSky Network](https://opensky-network.org), anonymous access |
+| ACARS messages (detail window) | [Airframes.io](https://airframes.io) public API, anonymous access. Data provided by Airframes.io and its community of feeders; the detail credits and links it. Used under its [terms](https://app.airframes.io/terms) and [licensing & attribution](https://docs.airframes.io/api/licensing) guidance: personal, non-commercial display, a couple of requests every two minutes while a detail is open, and a pause whenever the service signals its rate limit. Airframe lookups are cached for a day |
 | Aircraft photos (detail window) | [Planespotters.net](https://www.planespotters.net) public photo API, credited to each photographer and linked to the photo page. Lookups are cached for 7 days (1 day when there's no photo) |
 | Airport locations (bundled) | [OurAirports](https://ourairports.com/data/), public domain |
 | Interesting-aircraft alerts (downloaded at runtime and refreshed weekly, not included in this repo) | [plane-alert-db](https://github.com/sdr-enthusiasts/plane-alert-db) by sdr-enthusiasts and contributors, fetched from GitHub. The download sends nothing about you |
@@ -126,6 +128,7 @@ These are free community services. Please be kind to them, and consider supporti
 
 - The flight detail window looks up the selected aircraft's track on the [OpenSky Network](https://opensky-network.org) by its ICAO address only.
 - The flight detail window asks [Planespotters.net](https://www.planespotters.net) for a photo of the selected aircraft by its ICAO address (or registration) only.
+- The flight detail window asks [Airframes.io](https://airframes.io) for ACARS messages using only the aircraft's ICAO address, then Airframes' own airframe and flight ids. Nothing about you or your location is sent, and FlightDesk never reads or shows the receiving stations' owner details.
 - Airline logos are fetched by airline code only (ICAO and/or IATA, never your location) from jsDelivr, GitHub (raw.githubusercontent.com) and Kiwi.com's logo CDN, then cached on your Mac. Turn off **Show airline logos** to disable this.
 
 - Your location stays on your Mac. Requests to adsb.fi and adsb.lol include only a **rounded** position (about 1 km).

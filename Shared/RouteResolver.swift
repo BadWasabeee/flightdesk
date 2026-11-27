@@ -44,9 +44,18 @@ enum RouteResolver {
     }
 
     /// Picks the route to show: the scheduled route when it fits the live position and the known
-    /// departure airport (keeping it during a diversion or return), else what the departure
+    /// departure airport (keeping it during a diversion or return), else `hint` (a route the
+    /// aircraft itself reported, e.g. over ACARS) when it fits them, else what the departure
     /// airport and the descent imply.
-    static func resolve(scheduled: RouteInfo?, flight f: Flight, departedFrom origin: Airport?) -> RouteResolution {
+    static func resolve(scheduled: RouteInfo?, flight f: Flight, departedFrom origin: Airport?,
+                        hint: RouteInfo? = nil) -> RouteResolution {
+        let r = resolveScheduled(scheduled, flight: f, departedFrom: origin)
+        guard r.route == nil || r.destinationEstimated, let hint, hint.from.code != hint.to.code,
+              origin == nil || origin?.code == hint.from.code, FlightService.isPlausible(hint, for: f) else { return r }
+        return RouteResolution(route: hint, note: "Route reported by the aircraft over ACARS.")
+    }
+
+    private static func resolveScheduled(_ scheduled: RouteInfo?, flight f: Flight, departedFrom origin: Airport?) -> RouteResolution {
         if let r = scheduled, origin == nil || origin?.code == r.from.code {
             if let s = FlightSituation.path(for: f, route: r, departedFrom: origin) {
                 return RouteResolution(route: r, situation: s)

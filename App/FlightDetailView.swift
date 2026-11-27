@@ -39,6 +39,8 @@ final class FlightDetailModel: ObservableObject {
     @Published private(set) var photo: PhotoState = .loading(aspectRatio: 1.5)
     /// Year the airframe was built, when the live feed knows it.
     @Published private(set) var buildYear: Int?
+    /// ACARS messages for the current flight, from Airframes.io.
+    @Published private(set) var acars: AcarsState = .loading
 
     /// Planned great-circle route, origin to destination (cached; recomputed when data changes).
     private(set) var plannedPath: [GeoPoint] = []
@@ -70,6 +72,8 @@ final class FlightDetailModel: ObservableObject {
     private static let historyInterval: Duration = .seconds(180)
     /// A position older than this counts as no longer live.
     private static let staleAfter: TimeInterval = 60
+    /// Airframes.io is a community service, so ACARS is checked every couple of minutes.
+    private static let acarsInterval: Duration = .seconds(120)
 
     /// Route from the lookup cache, re-verified against every live position.
     private var candidateRoute: RouteInfo?
@@ -77,6 +81,10 @@ final class FlightDetailModel: ObservableObject {
     private var enrichedCallsign: String?
     private var tasks: [Task<Void, Never>] = []
     private var lastPlannedKey = ""
+    private var acarsCursor = AcarsCursor()
+    /// Departure and destination the aircraft reported over ACARS: a route used only when the
+    /// scheduled one is missing or doesn't fit (see `RouteResolver`).
+    private var acarsRoute: RouteInfo?
 
     /// `nearby` seeds the map's other aircraft (when switching planes) until the next refresh.
     init(hex: String, snapshot: Flight?, nearby: [Flight] = []) {
@@ -110,6 +118,7 @@ final class FlightDetailModel: ObservableObject {
         tasks.append(Self.loop(every: Self.pollInterval) { [weak self] in await self?.poll() != nil })
         tasks.append(Self.loop(every: Self.nearbyInterval) { [weak self] in await self?.pollNearby() != nil })
         tasks.append(Self.loop(every: Self.historyInterval, delay: .seconds(1)) { [weak self] in await self?.pollHistory() != nil })
+        tasks.append(Self.loop(every: Self.acarsInterval, delay: .seconds(3)) { [weak self] in await self?.pollAcars() != nil })
         if case .loading = photo {
             tasks.append(Task { [weak self] in await self?.loadPhoto() })
         }
@@ -185,9 +194,46 @@ final class FlightDetailModel: ObservableObject {
         }
     }
 
+    /// Refreshes the ACARS messages (the service decides which requests are due).
+    private func pollAcars() async {
+        // The first poll needs the callsign, which a detail opened without a snapshot doesn't have yet.
+        for _ in 0..<20 where flight == nil && !Task.isCancelled { try? await Task.sleep(for: .seconds(1)) }
+        guard let f = flight, !Task.isCancelled else { return }
+        do {
+            let (result, cursor) = try await AcarsService.shared.refresh(hex: hex, callsign: f.callsign,
+                                                                         flightNumber: candidateRoute?.flightNo,
+                                                                         position: f.geoPoint, cursor: acarsCursor)
+            guard !Task.isCancelled else { return }
+            acarsCursor = cursor
+            switch result {
+            case .flight(let a)?:
+                if acars != .loaded(a) { acars = .loaded(a) }
+                useAcarsRoute(a.route(scheduled: candidateRoute))
+            case .noFlight?, .unknownAircraft?:
+                acars = .none
+                useAcarsRoute(nil)
+            case nil:
+                break
+            }
+        } catch {
+            guard !Task.isCancelled else { return }
+            fdLog.info("ACARS for \(self.hex, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            if acars == .loading { acars = .unavailable }
+        }
+    }
+
+    private func useAcarsRoute(_ route: RouteInfo?) {
+        guard route != acarsRoute else { return }
+        acarsRoute = route
+        if var f = flight {
+            resolveRoute(&f)
+            flight = f
+        }
+    }
+
     /// Picks the route to show (see `RouteResolver`, which the list and widget share).
     private func resolveRoute(_ f: inout Flight) {
-        let r = RouteResolver.resolve(scheduled: candidateRoute, flight: f, departedFrom: departedFrom)
+        let r = RouteResolver.resolve(scheduled: candidateRoute, flight: f, departedFrom: departedFrom, hint: acarsRoute)
         f.route = r.route
         f.pathSituation = r.situation
         routeNote = r.note
@@ -334,6 +380,21 @@ private extension GeoPoint {
 }
 
 private func observerPoint() -> GeoPoint? { Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) } }
+
+/// Progress of a detail's ACARS lookup.
+enum AcarsState: Equatable {
+    case loading
+    case loaded(AcarsFlight)
+    /// Airframes.io has nothing for this flight (or doesn't know the aircraft).
+    case none
+    /// Airframes.io couldn't be reached, or asked FlightDesk to slow down, before anything loaded.
+    case unavailable
+
+    var hasMessages: Bool {
+        if case .loaded(let f) = self { return !f.messages.isEmpty }
+        return false
+    }
+}
 
 // MARK: - Content
 
@@ -736,6 +797,8 @@ private struct FlightDetailSidebar: View {
                     }
                     liveDataSection(f)
                     if Shared.location != nil { fromYouCard(f) }
+                    // Mostly airliners use ACARS; for other aircraft the section appears once something is heard.
+                    if f.looksLikeAirline || model.acars.hasMessages { AcarsSection(state: model.acars) }
                     aircraftCard(f)
                     linksCard(f)
                 }
@@ -1046,6 +1109,321 @@ private struct FlightDetailSidebar: View {
         let sub = DetailFormat.subtitle(for: f)
         let title = DetailFormat.title(for: f, hex: model.hex)
         return sub.isEmpty ? title : "\(title) · \(sub)"
+    }
+}
+
+// MARK: - ACARS
+
+/// ACARS messages heard for the flight, newest first, with any decoded OOOI times and route fixes.
+private struct AcarsSection: View {
+    let state: AcarsState
+    @State private var showAll = false
+    @State private var expanded: Set<String> = []
+    @State private var limit = AcarsSection.pageSize
+
+    private static let pageSize = 20
+    private static let creditURL = URL(string: "https://airframes.io")!
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            header
+            switch state {
+            case .loading:
+                skeleton
+            case .unavailable:
+                DetailCard(nil) {
+                    note("ACARS messages couldn’t be loaded", symbol: "exclamationmark.triangle",
+                         detail: "Airframes.io didn’t respond. FlightDesk will try again in a couple of minutes.")
+                }
+            case .none:
+                emptyState(hidden: 0)
+            case .loaded(let f):
+                loaded(f)
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text("ACARS")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+            if case .loaded(let f) = state, case let n = f.visibleMessages(showAll: showAll).count, n > 0 {
+                Text("\(n)")
+                    .font(.caption.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(Capsule().fill(Color.primary.opacity(0.07)))
+                    .accessibilityLabel(n == 1 ? "1 message" : "\(n) messages")
+            }
+            Spacer()
+            Link("via Airframes.io", destination: Self.creditURL)
+                .font(.caption)
+                .help("Data provided by Airframes.io and its community of feeders")
+        }
+        .padding(.horizontal, 2)
+    }
+
+    @ViewBuilder private func loaded(_ f: AcarsFlight) -> some View {
+        let visible = f.visibleMessages(showAll: showAll)
+        let hidden = f.messages.count - f.visibleMessages(showAll: false).count
+        if visible.isEmpty {
+            emptyState(hidden: hidden)
+        } else {
+            if !f.times.isEmpty { OOOIRow(times: f.times) }
+            if !f.waypoints.isEmpty { WaypointChips(names: f.waypoints) }
+            DetailCard(nil) {
+                TimelineView(.periodic(from: .now, by: 30)) { ctx in
+                    VStack(spacing: 0) {
+                        ForEach(Array(visible.prefix(limit).enumerated()), id: \.element.id) { i, m in
+                            if i > 0 { Divider() }
+                            AcarsRow(message: m, now: ctx.date, isExpanded: expanded.contains(m.id)) {
+                                if expanded.remove(m.id) == nil { expanded.insert(m.id) }
+                            }
+                        }
+                    }
+                }
+            }
+            HStack(spacing: 10) {
+                if hidden > 0 || showAll {
+                    Toggle("Show link messages\(hidden > 0 ? " (\(hidden))" : "")", isOn: $showAll)
+                        .toggleStyle(.checkbox)
+                        .help("Keep-alives, link tests and other link maintenance")
+                }
+                Spacer()
+                if visible.count > limit {
+                    Button("Show \(min(Self.pageSize, visible.count - limit)) More") { limit += Self.pageSize }
+                        .buttonStyle(.link)
+                }
+            }
+            .font(.caption)
+            .padding(.horizontal, 2)
+        }
+    }
+
+    @ViewBuilder private func emptyState(hidden: Int) -> some View {
+        DetailCard(nil) {
+            note("No ACARS heard for this flight yet", symbol: "antenna.radiowaves.left.and.right",
+                 detail: "ACARS is picked up by volunteer receivers, so coverage varies from place to place.")
+        }
+        if hidden > 0 {
+            Button("Show \(hidden) link \(hidden == 1 ? "message" : "messages")") { showAll = true }
+                .buttonStyle(.link)
+                .font(.caption)
+                .padding(.horizontal, 2)
+        }
+    }
+
+    private func note(_ title: String, symbol: String, detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Label(title, systemImage: symbol).font(.callout)
+            Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var skeleton: some View {
+        DetailCard(nil) {
+            VStack(alignment: .leading, spacing: 14) {
+                ForEach([150.0, 110, 170], id: \.self) { width in
+                    VStack(alignment: .leading, spacing: 6) {
+                        bar(width: width, height: 10)
+                        bar(width: nil, height: 8)
+                        bar(width: width + 40, height: 8)
+                    }
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Loading ACARS messages")
+    }
+
+    private func bar(width: CGFloat?, height: CGFloat) -> some View {
+        RoundedRectangle(cornerRadius: 3, style: .continuous)
+            .fill(Color.primary.opacity(0.07))
+            .frame(maxWidth: width ?? .infinity, alignment: .leading)
+            .frame(height: height)
+    }
+}
+
+/// One ACARS message: what it is, which way and over which link, when, and its text.
+private struct AcarsRow: View {
+    let message: AcarsMessage
+    let now: Date
+    let isExpanded: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                if let d = message.direction {
+                    Image(systemName: d == .downlink ? "arrow.up" : "arrow.down")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.secondary)
+                        .help(d == .downlink ? "Air-to-ground (downlink)" : "Ground-to-air (uplink)")
+                }
+                Text(message.plainLabel).font(.callout.weight(.semibold)).lineLimit(1)
+                if let label = message.label {
+                    Text(label).font(.caption.monospaced()).foregroundStyle(.tertiary)
+                }
+                Spacer(minLength: 4)
+                Text(message.link)
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4).padding(.vertical, 1)
+                    .overlay(RoundedRectangle(cornerRadius: 3, style: .continuous).strokeBorder(Color.secondary.opacity(0.5), lineWidth: 0.5))
+                Text(DetailFormat.ago(message.time, now: now))
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .help(timeHelp)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(spokenHeader)
+            if !message.fields.isEmpty {
+                Text(message.fields.map { "\($0.name) \($0.value)" }.joined(separator: " · "))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !message.text.isEmpty {
+                Text(message.text)
+                    .font(.system(.caption, design: .monospaced))
+                    .lineLimit(isExpanded ? nil : 3)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Text: \(message.text)")
+                if isLong {
+                    Button(isExpanded ? "Show Less" : "Show More", action: toggle)
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+            }
+        }
+        .padding(.vertical, 8)
+        .accessibilityElement(children: .contain)
+    }
+
+    /// More than fits in three lines of the sidebar.
+    private var isLong: Bool {
+        message.text.count > 120 || message.text.split(separator: "\n", omittingEmptySubsequences: false).count > 3
+    }
+
+    private var timeHelp: String {
+        var parts = ["\(message.time.formatted(date: .abbreviated, time: .standard)) (\(AcarsMessage.utc(message.time)))"]
+        if let station = message.station { parts.append("Heard by \(station)") }
+        return parts.joined(separator: " · ")
+    }
+
+    private var spokenHeader: String {
+        var parts = [message.plainLabel]
+        if let label = message.label { parts.append("label \(label)") }
+        switch message.direction {
+        case .downlink?: parts.append("air to ground")
+        case .uplink?: parts.append("ground to air")
+        case nil: break
+        }
+        parts.append(message.link)
+        parts.append(DetailFormat.ago(message.time, now: now))
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// Out · Off · On · In times reported over ACARS, in local time.
+private struct OOOIRow: View {
+    let times: [OOOIEvent: Date]
+
+    var body: some View {
+        DetailCard(nil) {
+            HStack(spacing: 0) {
+                ForEach(OOOIEvent.allCases, id: \.self) { e in
+                    VStack(spacing: 2) {
+                        Text(e.title).font(.caption).foregroundStyle(.secondary)
+                        Text(times[e].map { $0.formatted(date: .omitted, time: .shortened) } ?? "—")
+                            .font(.callout.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(times[e] == nil ? .tertiary : .primary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .help(times[e].map { AcarsMessage.utc($0) } ?? "Not reported")
+                }
+            }
+            .padding(.vertical, 2)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Gate and runway times: " + OOOIEvent.allCases.compactMap { e in
+            times[e].map { "\(e.title) \($0.formatted(date: .omitted, time: .shortened))" }
+        }.joined(separator: ", "))
+    }
+}
+
+/// Route fixes named in the messages, as chips.
+private struct WaypointChips: View {
+    let names: [String]
+    private static let maxShown = 30
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Route fixes").font(.caption).foregroundStyle(.secondary)
+            FlowLayout(spacing: 4) {
+                ForEach(names.prefix(Self.maxShown), id: \.self) { name in
+                    Text(name)
+                        .font(.caption.monospaced())
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Capsule().fill(Color.primary.opacity(0.06)))
+                        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+                        .textSelection(.enabled)
+                }
+                if names.count > Self.maxShown {
+                    Text("+\(names.count - Self.maxShown)").font(.caption).foregroundStyle(.secondary).padding(.vertical, 2)
+                }
+            }
+        }
+        .padding(.horizontal, 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Route fixes: " + names.joined(separator: ", "))
+    }
+}
+
+/// Lays subviews out left to right, wrapping onto new rows.
+private struct FlowLayout: Layout {
+    var spacing: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        let frames = layout(subviews, width: width)
+        let used = frames.map(\.maxX).max() ?? 0
+        return CGSize(width: proposal.width ?? used, height: frames.map(\.maxY).max() ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for (frame, view) in zip(layout(subviews, width: bounds.width), subviews) {
+            view.place(at: CGPoint(x: bounds.minX + frame.minX, y: bounds.minY + frame.minY), proposal: ProposedViewSize(frame.size))
+        }
+    }
+
+    private func layout(_ subviews: Subviews, width: CGFloat) -> [CGRect] {
+        var frames: [CGRect] = []
+        var x: CGFloat = 0, y: CGFloat = 0, rowHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > 0, x + size.width > width {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            frames.append(CGRect(origin: CGPoint(x: x, y: y), size: size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        return frames
     }
 }
 

@@ -13,6 +13,9 @@ enum ResponseLimit {
     static let logo = 1 << 20
     /// An aircraft photo.
     static let photo = 4 << 20
+    /// An Airframes.io airframe record, which lists every flight it has logged (about 1 MB for a
+    /// busy airliner today), or a flight with its latest 200 ACARS messages.
+    static let airframes = 8 << 20
 }
 
 enum Net {
