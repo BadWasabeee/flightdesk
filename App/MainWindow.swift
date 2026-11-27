@@ -58,6 +58,10 @@ final class RadarModel: ObservableObject {
     @Published private(set) var recenterRequests = 0
     /// The Settings pane shown in place of the map or detail, if any.
     @Published private(set) var settingsTab: SettingsTab?
+    /// True while the Logbook replaces the radar list and map (Settings can still open above it).
+    @Published private(set) var showsLogbook = false
+    /// The Logbook's selection, filters and sort.
+    let logbook = LogbookModel()
 
     /// The map's last camera region, kept so the map comes back where it was after a detail.
     var mapRegion: MKCoordinateRegion?
@@ -119,7 +123,7 @@ final class RadarModel: ObservableObject {
             detail?.stop()
             return
         }
-        if settingsTab == nil { detail?.start() }
+        if settingsTab == nil && !showsLogbook { detail?.start() }
         poll = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
@@ -167,6 +171,8 @@ final class RadarModel: ObservableObject {
             known = known.filter { ids.contains($0.key) }
             lookedUp.formIntersection(ids)
             tracks = tracks.filter { ids.contains($0.key) || $0.key == selection }
+            // Routes the window already knows go into the spotting log; it never looks any up.
+            if SpottingLogStore.shared.isEnabled { SpottingLogStore.shared.record(FlightListFilter.merging(fresh, known: known)) }
             updated = Date()
             feed = fresh.isEmpty ? .empty : .live
             let phases = RunwayPhase.listPhases(for: FlightListFilter.merging(fresh, known: known), previous: runwayPhases,
@@ -202,7 +208,8 @@ final class RadarModel: ObservableObject {
     /// Fetches the selected aircraft's recorded track for the map's flown path, unless it's cached,
     /// already loading, or the map isn't showing (the detail fetches its own).
     private func loadSelectedTrack() {
-        guard isActive, let f = selected, tracks[f.id] == nil, trackTask == nil, detail == nil, settingsTab == nil else { return }
+        guard isActive, let f = selected, tracks[f.id] == nil, trackTask == nil, detail == nil, settingsTab == nil,
+              !showsLogbook else { return }
         let id = f.id
         trackTask = Task { [weak self] in
             let track = await FlightDetailService.track(hex: id, current: f.geoPoint)
@@ -262,7 +269,7 @@ final class RadarModel: ObservableObject {
     /// Shows the detail for the aircraft with `hex` in place of the map (leaving Settings), and selects it.
     func showDetail(hex: String, snapshot: Flight?) {
         let id = flights.first { $0.id.caseInsensitiveCompare(hex) == .orderedSame }?.id ?? hex
-        guard detail?.hex != id else { closeSettings(); return }
+        guard detail?.hex != id else { closeLogbook(); closeSettings(); return }
         let snap = snapshot ?? flights.first { $0.id == id } ?? detail?.nearby.first { $0.id == id }
         detail?.stop()
         let model = FlightDetailModel(hex: id, snapshot: snap, nearby: flights)
@@ -282,6 +289,7 @@ final class RadarModel: ObservableObject {
             self?.remember(route, for: id)
         }
         if selection != id { selection = id }
+        closeLogbook()
         closeSettings()
         if isActive { model.start() }
     }
@@ -327,7 +335,26 @@ final class RadarModel: ObservableObject {
         settingsTab = nil
         if let previous = sidebarBeforeSettings { sidebar = previous }
         sidebarBeforeSettings = nil
-        if isActive { detail?.start() }
+        if isActive && !showsLogbook { detail?.start() }
+        loadSelectedTrack()
+    }
+
+    // MARK: Logbook
+
+    /// Shows the Logbook in place of the radar list and map (leaving Settings); the detail underneath pauses.
+    func showLogbook() {
+        closeSettings()
+        guard !showsLogbook else { return }
+        detail?.stop()
+        showsLogbook = true
+        sidebar = .all
+    }
+
+    /// Back from the Logbook to the map or detail it was opened over.
+    func closeLogbook() {
+        guard showsLogbook else { return }
+        showsLogbook = false
+        if isActive && settingsTab == nil { detail?.start() }
         loadSelectedTrack()
     }
 
@@ -335,7 +362,7 @@ final class RadarModel: ObservableObject {
     /// there was nowhere to go back to.
     @discardableResult
     func goBack() -> Bool {
-        if settingsTab != nil { closeSettings() } else if detail != nil { closeDetail() } else { return false }
+        if settingsTab != nil { closeSettings() } else if showsLogbook { closeLogbook() } else if detail != nil { closeDetail() } else { return false }
         return true
     }
 
@@ -469,6 +496,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidati
         guard let radar else { return }
         withAnimation(Self.motion) {
             radar.closeSettings()
+            radar.closeLogbook()
             radar.closeDetail()
         }
         radar.recenter()
@@ -485,7 +513,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidati
         case #selector(openSelectedInNewWindow(_:)):
             return key && (radar?.detail != nil || radar?.selection != nil)
         case #selector(goBack(_:)):
-            return key && (radar?.detail != nil || radar?.settingsTab != nil)
+            return key && (radar?.detail != nil || radar?.settingsTab != nil || radar?.showsLogbook == true)
         case #selector(focusSearch(_:)):
             return key
         case #selector(setSort(_:)):

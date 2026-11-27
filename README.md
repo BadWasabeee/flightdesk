@@ -30,6 +30,7 @@
 - **Two looks.** Choose an LED board (amber, green, red, blue, cyan or white, with optional glow and dot-matrix texture) or **Standard**, which uses system colours and follows Light and Dark Mode. Both work with the macOS *Clear* and *Tinted* widget styles.
 - **Configurable.** Set the location, radius (5–100 nm), units (ft/kt/nm or metric) and which details appear. Each widget can also override the location, radius, style, colour and units.
 - **Live radar window.** Open FlightDesk from the Dock, Launchpad or Spotlight to get a map of your area with every aircraft in your search radius, drawn to its heading and size and moving in real time. A sidebar lists them with logos, routes, altitude and distance. You can search it by callsign, registration, type, airline or airport, and sort it by distance or altitude. Select a flight to see it in the inspector and on the map with its flown path, the dashed route still to go and its origin and destination airports. Double-click it (or click **Open Details**) for the full detail.
+- **Spotting log.** FlightDesk keeps a personal logbook of every airframe it sees near you: first and last seen, how many separate sightings (a return after more than 30 minutes counts again), registration, type, operator, callsigns, routes, the closest pass and the highest altitude. Open **Logbook** at the bottom of the main window's sidebar for totals (aircraft, types, airlines, today, and the rarest types you've seen only once), a searchable, sortable list with Today / This Week / All, wide-body and military filters, and each aircraft's details, with **Show on Radar** while it's in range. A radar row gets a *First sighting* tag when a type you've never logged before appears. Export it as CSV from the toolbar. It uses only the flight data FlightDesk already fetches, and stays on your Mac (see [Privacy](#privacy)).
 - **Menu bar and desktop panel.** A ✈ menu bar item gives quick access to the window, Settings and an optional floating panel that updates every 15 s. Closing the window keeps the menu bar item, panel and widgets running.
 - **Your own receiver.** Running a Raspberry Pi feeder? FlightDesk can read positions straight from it over your local network: no rate limits, no internet needed, your own coverage. See [Use your own ADS-B receiver](#use-your-own-ads-b-receiver).
 - **Private by design.** No accounts, no API keys and no analytics. See [Privacy](#privacy).
@@ -77,7 +78,7 @@ To work in Xcode, run `xcodegen generate` and open `FlightDesk.xcodeproj`.
 
 | Tab | Options |
 | --- | --- |
-| General | Location (this Mac's location, a city/airport, or `lat, lon`), radius, units, private/GA traffic, menu bar readout, floating panel, launch at login |
+| General | Location (this Mac's location, a city/airport, or `lat, lon`), radius, units, private/GA traffic, menu bar readout, floating panel, spotting log (on by default) and Clear Log, launch at login |
 | Widget | How to add the widget, live preview, style (LED Board or Standard), colour, glow, dot-matrix texture, header, flight list, city names, logos, rotation, how often to update (15 s – 5 min), refresh now |
 | Alerts | Notifications for emergency squawks, diversions, your watchlist, interesting (military, government) aircraft, heavies and aircraft passing close by; quiet hours |
 | Sources | Your own ADS-B receiver, the data sources in use |
@@ -139,6 +140,7 @@ These are free community services. Please be kind to them, and consider supporti
 - With your own receiver, FlightDesk only downloads its aircraft list over your local network; your position is never sent to it. With **Only use my receiver**, no position requests go to the internet at all.
 - adsbdb receives only flight callsigns and aircraft hex codes.
 - There are no accounts, analytics or tracking. Settings live in the App Group container on your Mac.
+- The spotting log is local only and never uploaded. It is a file in FlightDesk's own sandbox (`~/Library/Containers/<FlightDesk>/Data/Library/Application Support/FlightDesk/spotting-log.json`), not shared with the widget, and it makes no network requests of its own. Turn it off or clear it in Settings › General; CSV export writes only to a file you choose.
 
 ## Contributing
 

@@ -193,6 +193,8 @@ struct GeneralSettings: View {
                     .padding(.leading, SettingsMetrics.indent)
             }
 
+            SpottingLogSettingsSection()
+
             Section {
                 Toggle("Open FlightDesk at login", isOn: $loginEnabled)
                     .onChange(of: loginEnabled) { _, on in setLogin(on) }
