@@ -2020,12 +2020,15 @@ private struct InfoRow: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
-            Text(label).foregroundStyle(.secondary)
+            Text(label).foregroundStyle(.secondary).fixedSize()
             Spacer(minLength: 8)
+            // Long values (e.g. "29.56 inHg · 1001 hPa") wrap rather than truncate.
             Text(value)
                 .multilineTextAlignment(.trailing)
                 .monospacedDigit()
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(1)
         }
         .font(.callout)
         .padding(.vertical, 6)
