@@ -31,6 +31,9 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     /// True when `onFlights` needs data even while nothing is visible.
     var wantsBackgroundFlights: () -> Bool = { false }
 
+    /// Set while the app is in the background on iOS: the widget pump stops fetching until it's back.
+    var isPaused = false
+
     private let locationManager = CLLocationManager()
     private var timers: [Timer] = []
     private var widgetTimer: Timer?
@@ -96,7 +99,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     /// as its new baseline instead of reloading again.
     func reloadWidgets() {
         widgetBaselines = [:]
-        WidgetCenter.shared.reloadTimelines(ofKind: Shared.widgetKind)
+        Shared.widgetKinds.forEach { WidgetCenter.shared.reloadTimelines(ofKind: $0) }
         lastWidgetReload = Date()
     }
 
@@ -136,7 +139,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             let count = await withCheckedContinuation { (done: CheckedContinuation<Int, Never>) in
                 WidgetCenter.shared.getCurrentConfigurations { result in
                     // On error assume widgets exist, so they keep updating.
-                    done.resume(returning: (try? result.get())?.filter { $0.kind == Shared.widgetKind }.count ?? 1)
+                    done.resume(returning: (try? result.get())?.filter { Shared.widgetKinds.contains($0.kind) }.count ?? 1)
                 }
             }
             installedWidgets = (count, now)
@@ -147,6 +150,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
 
     private func widgetPumpTick() async {
+        guard !isPaused else { return }
         var appAreaFlights: [Flight]?
         var fresh: [String: [Flight]] = [:]
         var changed = false
@@ -167,7 +171,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             }
         }
         if changed {
-            WidgetCenter.shared.reloadTimelines(ofKind: Shared.widgetKind)
+            Shared.widgetKinds.forEach { WidgetCenter.shared.reloadTimelines(ofKind: $0) }
             lastWidgetReload = Date()
             let now = Date()
             widgetBaselines = fresh.mapValues { (now, $0) }
@@ -211,16 +215,46 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             locationStatus = "Couldn’t find “\(text)”. Try a nearby city, an airport code or coordinates like 39.74, -104.99."
             return false
         }
+        #if os(iOS)
+        followsDevice = false
+        #endif
         setLocation(lat: r.lat, lon: r.lon, name: r.name)
         return true
     }
 
+    #if os(iOS)
+    /// The location follows the iPhone (refreshed whenever FlightDesk comes to the front) rather
+    /// than a place chosen in Settings.
+    @Published private(set) var followsDevice = UserDefaults.standard.bool(forKey: "location.followsDevice") {
+        didSet { UserDefaults.standard.set(followsDevice, forKey: "location.followsDevice") }
+    }
+
+    /// Updates a device-following location quietly (no status text) when access is already granted.
+    func refreshDeviceLocationIfFollowing() {
+        guard followsDevice else { return }
+        switch locationManager.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            wantsCurrentLocation = true
+            locationManager.requestLocation()
+        default: break
+        }
+    }
+    #endif
+
+    /// True between asking for the current location and getting it (iOS reports authorization on
+    /// every launch, which mustn't overwrite a manually chosen place).
+    private var wantsCurrentLocation = false
+
     func requestCurrentLocation() {
+        wantsCurrentLocation = true
+        #if os(iOS)
+        followsDevice = true
+        #endif
         locationStatus = "Finding your location…"
         switch locationManager.authorizationStatus {
         case .notDetermined: locationManager.requestWhenInUseAuthorization()
         case .denied, .restricted:
-            locationStatus = "Location access is off for FlightDesk. Turn it on in System Settings, or search for a place."
+            locationStatus = Self.deniedMessage
         default: locationManager.requestLocation()
         }
     }
@@ -228,8 +262,14 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     nonisolated func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         Task { @MainActor in
             switch manager.authorizationStatus {
+            #if os(macOS)
             case .authorizedAlways, .authorized: manager.requestLocation()
-            case .denied, .restricted: self.locationStatus = "Location access is off for FlightDesk. Turn it on in System Settings, or search for a place."
+            #else
+            // Only ask for a fix after the user chose "current location" (a manual place stays put).
+            case .authorizedAlways, .authorizedWhenInUse:
+                if self.wantsCurrentLocation { manager.requestLocation() }
+            #endif
+            case .denied, .restricted: self.locationStatus = Self.deniedMessage
             default: break
             }
         }
@@ -238,12 +278,28 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let c = locations.last?.coordinate else { return }
         Task { @MainActor in
+            self.wantsCurrentLocation = false
+            #if os(iOS)
+            // A fresh fix a few hundred metres from the last one isn't worth resetting the board for.
+            // (Unless the last name is only coordinates: reverse geocoding failed then, so try again.)
+            if let old = Shared.location, old.name.contains(where: \.isLetter),
+               FlightService.gcDistance(old.lat, old.lon, c.latitude, c.longitude) < 0.3 {
+                self.locationStatus = ""
+                return
+            }
+            #endif
             let name = await FlightService.placeName(lat: c.latitude, lon: c.longitude)
             self.setLocation(lat: c.latitude, lon: c.longitude, name: name)
         }
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        Task { @MainActor in self.locationStatus = "Couldn’t get this Mac’s location. Search for a place instead." }
+        Task { @MainActor in self.locationStatus = "Couldn’t get \(DeviceName.this)’s location. Search for a place instead." }
     }
+
+    #if os(macOS)
+    private static let deniedMessage = "Location access is off for FlightDesk. Turn it on in System Settings, or search for a place."
+    #else
+    private static let deniedMessage = "Location access is off for FlightDesk. Turn it on in Settings, or search for a place."
+    #endif
 }

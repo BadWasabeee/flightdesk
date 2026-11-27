@@ -10,4 +10,8 @@ BUNDLE_ID_PREFIX = io.github.badwasabeee
 // App Group shared by the app and widget. On macOS this must start with your Team ID.
 APP_GROUP_ID = $(DEVELOPMENT_TEAM).$(BUNDLE_ID_PREFIX).flightdesk
 
+// The iPhone app and its widget share this App Group. iOS requires the "group." form (a
+// Team-ID-prefixed group can't be provisioned for a device).
+IOS_APP_GROUP_ID = group.$(BUNDLE_ID_PREFIX).flightdesk
+
 #include? "Local.xcconfig"

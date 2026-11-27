@@ -1,4 +1,8 @@
+#if os(macOS)
 import Cocoa
+#else
+import UIKit
+#endif
 import UserNotifications
 
 /// Spotter alerts: runs `SpotterEngine` on every flight list the app fetches, posts local notifications,
@@ -152,10 +156,14 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
     }
 
     func openNotificationSettings() {
+        #if os(macOS)
         let id = Bundle.main.bundleIdentifier ?? ""
         let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(id)")
             ?? URL(fileURLWithPath: "/System/Applications/System Settings.app")
         NSWorkspace.shared.open(url)
+        #else
+        if let url = URL(string: UIApplication.openNotificationSettingsURLString) { UIApplication.shared.open(url) }
+        #endif
     }
 
     // MARK: UNUserNotificationCenterDelegate
@@ -253,6 +261,7 @@ extension UNAuthorizationStatus {
 
 // MARK: - App wiring (status-item readout + data hooks)
 
+#if os(macOS)
 extension AppDelegate {
     /// Connects spotter alerts and the menu-bar readout to the live data. Call once at launch, before `store.start()`.
     func installSpotterAlerts() {
@@ -289,3 +298,4 @@ extension AppDelegate {
         }
     }
 }
+#endif

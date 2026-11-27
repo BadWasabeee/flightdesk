@@ -1,6 +1,6 @@
 // Bounded decoding for images that come from the network, and the shared decoded-logo cache.
 
-import AppKit
+import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -74,13 +74,13 @@ enum ImageGuard {
 enum LogoStore {
     /// A decoded logo with what views need to decide how to draw it.
     final class Logo: @unchecked Sendable {
-        let image: NSImage
+        let image: PlatformImage
         let url: URL
         /// Alpha-weighted brightness (0…1), see `LogoTone`.
         let brightness: Double
         var size: CGSize { image.size }
 
-        init(image: NSImage, url: URL, brightness: Double) {
+        init(image: PlatformImage, url: URL, brightness: Double) {
             self.image = image
             self.url = url
             self.brightness = brightness
@@ -105,7 +105,7 @@ enum LogoStore {
         // through the guard in case the shared container holds something unexpected.
         guard let data = try? Data(contentsOf: url),
               let cg = ImageGuard.thumbnail(data, ImageGuard.logo, maxPixel: 256) else { return nil }
-        let logo = Logo(image: NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)),
+        let logo = Logo(image: PlatformImage.make(cg),
                         url: url, brightness: LogoTone.brightness(cg))
         cache.setObject(logo, forKey: key)
         return logo

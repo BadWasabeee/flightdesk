@@ -1,6 +1,10 @@
 import SwiftUI
 import CoreLocation
+#if os(macOS)
 import ServiceManagement
+#else
+import UIKit
+#endif
 
 // MARK: - Tabs
 
@@ -72,15 +76,27 @@ struct LocationSearch: View {
                     .onSubmit(search)
                     .accessibilityLabel("Search for a location")
                 Button("Set", action: search)
+                    #if os(iOS)
+                    .buttonStyle(.borderless)
+                    #endif
                     .disabled(query.trimmingCharacters(in: .whitespaces).isEmpty || searching)
             }
             HStack(spacing: 8) {
                 Button("Use Current Location", systemImage: "location") { store.requestCurrentLocation() }
+                    #if os(iOS)
+                    .buttonStyle(.borderless)
+                    #endif
                 Spacer(minLength: 0)
                 if locationDenied {
+                    #if os(macOS)
                     Button("Open Privacy Settings…") {
                         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices")!)
                     }
+                    #else
+                    Button("Open Settings") {
+                        if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                    }
+                    #endif
                 }
             }
             if !store.locationStatus.isEmpty { statusLine }
@@ -144,6 +160,8 @@ struct CurrentPlace: View {
 }
 
 // MARK: - General
+
+#if os(macOS)
 
 struct GeneralSettings: View {
     @ObservedObject var store: LiveStore
@@ -236,6 +254,7 @@ struct GeneralSettings: View {
         if (status == .enabled) != on, !loginNeedsApproval { loginEnabled = status == .enabled }
     }
 }
+#endif
 
 // MARK: - Display
 
@@ -246,12 +265,7 @@ struct WidgetAppearanceSections: View {
     var body: some View {
         Group {
             Section {
-                let m = store.model.flights.isEmpty ? PanelModel.sample : store.model
-                PanelContent(model: m, layout: .panel)
-                    .environment(\.displayOptions, store.settings.display)
-                    .frame(width: 460)
-                    .modifier(PanelChrome(options: store.settings.display))
-                    .frame(maxWidth: .infinity)
+                preview
                     .padding(.vertical, 4)
                     .animation(.easeInOut(duration: 0.25), value: store.settings.display)
                     .allowsHitTesting(false)
@@ -290,10 +304,36 @@ struct WidgetAppearanceSections: View {
             } header: {
                 Text("Content")
             } footer: {
+                #if os(macOS)
                 Text("Applies to the desktop panel and every widget. To style one widget differently, right-click it and choose **Edit “Flights Overhead”**.")
                     .font(.caption).foregroundStyle(.secondary)
+                #else
+                Text("Applies to every widget. To style one widget differently, touch and hold it and choose **Edit Widget**.")
+                    .font(.caption).foregroundStyle(.secondary)
+                #endif
             }
         }
+    }
+
+    @ViewBuilder private var preview: some View {
+        let m = store.model.flights.isEmpty ? PanelModel.sample : store.model
+        #if os(macOS)
+        PanelContent(model: m, layout: .panel)
+            .environment(\.displayOptions, store.settings.display)
+            .frame(width: 460)
+            .modifier(PanelChrome(options: store.settings.display))
+            .frame(maxWidth: .infinity)
+        #else
+        // A medium Home Screen widget, at its size on most iPhones.
+        PanelContent(model: m, layout: .medium)
+            .environment(\.displayOptions, store.settings.display)
+            .frame(width: 338, height: 158)
+            .background(store.settings.display.isStandard ? AnyView(Color(uiColor: .secondarySystemGroupedBackground))
+                        : AnyView(PanelBackground().environment(\.displayOptions, store.settings.display)))
+            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+            .frame(maxWidth: .infinity)
+        #endif
     }
 
     private func swatch(_ t: LEDTheme) -> some View {
@@ -312,6 +352,8 @@ struct WidgetAppearanceSections: View {
 }
 
 // MARK: - Widget
+
+#if os(macOS)
 
 struct WidgetSettings: View {
     @ObservedObject var store: LiveStore
@@ -368,6 +410,7 @@ struct WidgetSettings: View {
         .accessibilityLabel(Text("Step \(n): ") + Text(text))
     }
 }
+#endif
 
 // MARK: - Sources
 
@@ -519,7 +562,7 @@ struct DataCredits: Identifiable {
 }
 
 /// Today's requests per service, against each service's free daily allowance.
-private struct RequestUsageSection: View {
+struct RequestUsageSection: View {
     @State private var counts: [ApiService: Int] = [:]
     @State private var paused: [ApiService: Date] = [:]
 

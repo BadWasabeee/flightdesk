@@ -1,4 +1,8 @@
+#if os(macOS)
 import Cocoa
+#else
+import UIKit
+#endif
 import Combine
 
 /// The app's spotting log: records every flight list the main app fetches (the radar, the panel
@@ -47,7 +51,13 @@ final class SpottingLogStore: ObservableObject {
         self.url = url
         isEnabled = UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool ?? true
         load()
-        terminateObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+        #if os(macOS)
+        let flushOn = NSApplication.willTerminateNotification
+        #else
+        // iOS may end a suspended app without warning, so save whenever it leaves the screen.
+        let flushOn = UIApplication.didEnterBackgroundNotification
+        #endif
+        terminateObserver = NotificationCenter.default.addObserver(forName: flushOn,
                                                                    object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.flushNow() }
         }

@@ -2,7 +2,6 @@
 // Two looks: a glowing LED board, and a Standard system look that follows Light/Dark Mode.
 
 import SwiftUI
-import AppKit
 import WidgetKit
 
 extension LEDTheme {
@@ -86,9 +85,16 @@ private struct HoverTarget<Content: View>: View {
             .onHover { inside in
                 guard inside != hovering else { return }
                 withAnimation(.easeOut(duration: 0.12)) { hovering = inside }
+                #if os(macOS)
                 if inside { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+                #endif
             }
-            .onDisappear { if hovering { NSCursor.pop(); hovering = false } }
+            .onDisappear {
+                #if os(macOS)
+                if hovering { NSCursor.pop() }
+                #endif
+                hovering = false
+            }
             .onTapGesture { action() }
             .help("Show flight details")
             .accessibilityAddTraits(.isButton)
@@ -337,7 +343,7 @@ struct PanelChrome: ViewModifier {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         if options.isStandard {
             content
-                .background(Color(nsColor: .windowBackgroundColor), in: shape)
+                .background(Color.platformBackground, in: shape)
                 .clipShape(shape)
                 .overlay(shape.strokeBorder(Color.primary.opacity(0.1), lineWidth: 1))
         } else {
@@ -416,11 +422,11 @@ struct AirlineLogo: View {
 
 /// A cached logo bitmap, kept in color but toned down in the Clear/Tinted desktop widget styles.
 private struct LogoImage: View {
-    let image: NSImage
+    let image: PlatformImage
     var body: some View {
-        let i = Image(nsImage: image).resizable().interpolation(.high)
+        let i = Image(platformImage: image).resizable().interpolation(.high)
         Group {
-            if #available(macOS 15.0, *) {
+            if #available(macOS 15.0, iOS 18.0, *) {
                 i.widgetAccentedRenderingMode(.desaturated)
             } else {
                 i
@@ -513,7 +519,7 @@ struct FlightMark: View {
         }
     }
 
-    @ViewBuilder private func content(_ kind: FlightMarkKind, _ img: NSImage?) -> some View {
+    @ViewBuilder private func content(_ kind: FlightMarkKind, _ img: PlatformImage?) -> some View {
         switch kind {
         case .logo:
             if let img { LogoImage(image: img) }

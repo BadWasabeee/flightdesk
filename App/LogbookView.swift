@@ -38,12 +38,13 @@ final class LogbookModel: ObservableObject {
         return s
     }
 
+    #if os(macOS)
     /// Asks where to save `entries` as CSV, then writes them off the main thread.
     func export(_ entries: [LogEntry]) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.commaSeparatedText]
         panel.canCreateDirectories = true
-        panel.nameFieldStringValue = "FlightDesk Logbook \(Date().formatted(.iso8601.year().month().day())).csv"
+        panel.nameFieldStringValue = Self.exportFileName
         panel.message = "The logbook is exported from this Mac only."
         let write: (NSApplication.ModalResponse) -> Void = { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
@@ -55,9 +56,15 @@ final class LogbookModel: ObservableObject {
         }
         if let window = NSApp.keyWindow { panel.beginSheetModal(for: window, completionHandler: write) } else { panel.begin(completionHandler: write) }
     }
+    #endif
+
+    /// The suggested CSV file name for an export made today.
+    nonisolated static var exportFileName: String { "FlightDesk Logbook \(Date().formatted(.iso8601.year().month().day())).csv" }
 }
 
 // MARK: - Sidebar
+
+#if os(macOS)
 
 /// The Logbook's sidebar: every logged airframe, searchable, filterable and sortable.
 struct LogbookList: View {
@@ -160,8 +167,9 @@ struct LogbookList: View {
         NSPasteboard.general.setString(s, forType: .string)
     }
 }
+#endif
 
-private struct LogbookRow: View {
+struct LogbookRow: View {
     let entry: LogEntry
     let sort: LogSort
     @Environment(\.displayOptions) private var o
@@ -197,7 +205,7 @@ private struct LogbookRow: View {
 }
 
 /// The airline logo when it's already cached (never downloaded for the log), else the class symbol.
-private struct LogBadge: View {
+struct LogBadge: View {
     let entry: LogEntry
     let size: CGFloat
     @Environment(\.displayOptions) private var o
@@ -206,7 +214,7 @@ private struct LogBadge: View {
         Group {
             if o.showLogos, let key = AirlineLogos.Key(icao: entry.airlineICAO, iata: entry.airlineIATA),
                let logo = LogoStore.logo(for: key.id) {
-                Image(nsImage: logo.image)
+                Image(platformImage: logo.image)
                     .resizable()
                     .interpolation(.high)
                     .aspectRatio(contentMode: .fit)
@@ -229,6 +237,7 @@ private struct LogBadge: View {
 
 // MARK: - Content
 
+#if os(macOS)
 /// The Logbook's content: totals across the top, then the selected aircraft or an overview.
 struct LogbookContent: View {
     @ObservedObject var radar: RadarModel
@@ -262,9 +271,12 @@ struct LogbookContent: View {
         }
     }
 }
+#endif
 
-private struct LogStatsHeader: View {
+struct LogStatsHeader: View {
     let stats: LogStats
+    /// How many rare-type chips fit on one line (8 in the Mac window, fewer on a phone).
+    var rareLimit = 8
     let showType: (String) -> Void
 
     var body: some View {
@@ -278,7 +290,7 @@ private struct LogStatsHeader: View {
             if !stats.rarestTypes.isEmpty {
                 HStack(spacing: 6) {
                     Text("Rarest").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    ForEach(stats.rarestTypes.prefix(8), id: \.self) { type in
+                    ForEach(stats.rarestTypes.prefix(rareLimit), id: \.self) { type in
                         Button(type) { showType(type) }
                             .buttonStyle(.plain)
                             .font(.caption.weight(.semibold).monospaced())
@@ -287,8 +299,8 @@ private struct LogStatsHeader: View {
                             .background(Capsule().fill(.quaternary))
                             .help("Seen on only one aircraft · show it")
                     }
-                    if stats.rarestTypes.count > 8 {
-                        Text("+\(stats.rarestTypes.count - 8)").font(.caption).foregroundStyle(.secondary)
+                    if stats.rarestTypes.count > rareLimit {
+                        Text("+\(stats.rarestTypes.count - rareLimit)").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer(minLength: 0)
                 }
@@ -310,7 +322,7 @@ private struct LogStatsHeader: View {
 }
 
 /// Shown when nothing is selected: what the log is and where it lives.
-private struct LogOverview: View {
+struct LogOverview: View {
     @ObservedObject var store: SpottingLogStore
 
     var body: some View {
@@ -333,7 +345,7 @@ private struct LogOverview: View {
     }
 }
 
-private struct LogEntryDetail: View {
+struct LogEntryDetail: View {
     let entry: LogEntry
     /// The aircraft as it is now, when it's in range.
     let live: Flight?
@@ -402,9 +414,13 @@ private struct LogEntryDetail: View {
 
     /// Through the main window's in-window presenter (never a new window).
     private func showOnRadar(_ f: Flight) {
+        #if os(macOS)
         withAnimation(MainWindowController.motion) {
             if let presenter = FlightDetail.presenter { presenter(f.id, f) }
         }
+        #else
+        FlightDetail.show(hex: f.id, snapshot: f)
+        #endif
     }
 
     private var header: some View {
@@ -468,7 +484,7 @@ struct SpottingLogSettingsSection: View {
 // MARK: - Formatting
 
 enum LogFormat {
-    static let privacyNote = "The logbook is stored only on this Mac and is never uploaded. It uses only the flight data FlightDesk already fetches."
+    static let privacyNote = "The logbook is stored only on \(DeviceName.this) and is never uploaded. It uses only the flight data FlightDesk already fetches."
 
     /// "14:05" today, "Nov 3" this year, else "Nov 3, 2024".
     static func when(_ d: Date, now: Date = Date(), calendar: Calendar = .current) -> String {

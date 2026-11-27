@@ -73,7 +73,7 @@ final class FlightDetailModel: ObservableObject {
     enum PhotoState {
         /// Still looking; space is reserved at this width ÷ height.
         case loading(aspectRatio: Double)
-        case loaded(AircraftPhoto, NSImage)
+        case loaded(AircraftPhoto, PlatformImage)
         /// No photo exists or it couldn't be loaded; nothing is shown.
         case unavailable
     }
@@ -187,10 +187,10 @@ final class FlightDetailModel: ObservableObject {
 
     /// Decodes a downloaded photo off the main thread, checked against `ImageGuard.photo` and
     /// downscaled to at most 1200 px.
-    private nonisolated static func decodePhoto(_ data: Data) async -> NSImage? {
-        await Task.detached(priority: .userInitiated) { () -> NSImage? in
+    private nonisolated static func decodePhoto(_ data: Data) async -> PlatformImage? {
+        await Task.detached(priority: .userInitiated) { () -> PlatformImage? in
             guard let cg = ImageGuard.thumbnail(data, ImageGuard.photo, maxPixel: 1200) else { return nil }
-            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+            return PlatformImage.make(cg)
         }.value
     }
 
@@ -516,7 +516,7 @@ final class FlightDetailModel: ObservableObject {
     }
 }
 
-private extension GeoPoint {
+extension GeoPoint {
     var coordinate: CLLocationCoordinate2D { CLLocationCoordinate2D(latitude: lat, longitude: lon) }
 }
 
@@ -569,25 +569,48 @@ struct FlightDetailView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        HStack(spacing: 0) {
-            FlightDetailMap(model: model, camera: $camera, latitudeSpan: $latitudeSpan, visibleCamera: $visibleCamera)
-                .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(alignment: .topTrailing) { mapControls.padding(10) }
-            Divider()
-            ZStack {
-                FlightDetailSidebar(model: model)
-                    .id(model.hex)
-                    .transition(.opacity)
-            }
-            .animation(.easeInOut(duration: 0.2), value: model.hex)
-            .frame(minWidth: 280, idealWidth: 310, maxWidth: 340)
-            .background(.background)
-        }
-        .environment(\.displayOptions, model.display)
-        .frame(minWidth: 620, minHeight: 420)
+        layout
+            .environment(\.displayOptions, model.display)
         // The camera follows the aircraft, never the route: a route or track loading doesn't move it.
         .onChange(of: model.hex, initial: true) { centreOnAircraft() }
         .onChange(of: model.flight != nil) { if centredHex != model.hex { centreOnAircraft() } }
+    }
+
+    #if os(macOS)
+    /// Map beside the sidebar, in a window or the main window's content area.
+    private var layout: some View {
+        HStack(spacing: 0) {
+            map.frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            sidebar
+                .frame(minWidth: 280, idealWidth: 310, maxWidth: 340)
+                .background(.background)
+        }
+        .frame(minWidth: 620, minHeight: 420)
+    }
+    #else
+    /// Map above the cards on a phone.
+    private var layout: some View {
+        VStack(spacing: 0) {
+            map.frame(height: 280)
+            Divider()
+            sidebar.background(.background)
+        }
+    }
+    #endif
+
+    private var map: some View {
+        FlightDetailMap(model: model, camera: $camera, latitudeSpan: $latitudeSpan, visibleCamera: $visibleCamera)
+            .overlay(alignment: .topTrailing) { mapControls.padding(10) }
+    }
+
+    private var sidebar: some View {
+        ZStack {
+            FlightDetailSidebar(model: model)
+                .id(model.hex)
+                .transition(.opacity)
+        }
+        .animation(.easeInOut(duration: 0.2), value: model.hex)
     }
 
     /// Map framing controls, styled like MapKit's own zoom control.
@@ -819,7 +842,9 @@ private struct FlightDetailMap: View {
         }
         .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
         .mapControls {
+            #if os(macOS)
             MapZoomStepper()
+            #endif
             MapScaleView()
         }
         .onMapCameraChange(frequency: .onEnd) { context in
@@ -867,15 +892,15 @@ private struct FlightDetailMap: View {
         Annotation("", coordinate: a.geoPoint.coordinate, anchor: .center) {
             VStack(spacing: 2) {
                 Circle()
-                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .fill(Color.platformBackground)
                     .frame(width: 10, height: 10)
                     .overlay(Circle().stroke(Color.primary, lineWidth: 2.5))
                 Text(a.code)
                     .font(.system(size: 11, weight: .bold))
                     .strikethrough(struck)
                     .foregroundStyle(.primary)
-                    .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
-                    .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
+                    .shadow(color: Color.platformBackground, radius: 1.5)
+                    .shadow(color: Color.platformBackground, radius: 1.5)
             }
             .opacity(struck ? 0.55 : 1)
             // Keep the dot (not the label) on the coordinate.
@@ -889,7 +914,7 @@ private struct FlightDetailMap: View {
 
 /// Another aircraft near the user: a small class symbol with a halo, plus its label when
 /// `MapLabelLayout` found room. The label is an overlay so the icon stays on the coordinate.
-private struct NearbyMarker: View {
+struct NearbyMarker: View {
     let f: Flight
     let showLabel: Bool
 
@@ -899,14 +924,14 @@ private struct NearbyMarker: View {
             .font(.system(size: 12 * kind.iconScale, weight: .semibold))
             .foregroundStyle(f.looksLikeAirline ? Color.primary.opacity(0.75) : Color.secondary)
             .rotationEffect(.degrees(kind == .rotorcraft ? 0 : (f.track ?? 90) - 90))
-            .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.2)
+            .shadow(color: Color.platformBackground, radius: 1.2)
             .frame(width: MapLabelLayout.iconSize.width, height: MapLabelLayout.iconSize.height)
             .overlay(alignment: .top) {
                 if showLabel {
                     Text(f.displayNumber)
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(.secondary)
-                        .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1)
+                        .shadow(color: Color.platformBackground, radius: 1)
                         .fixedSize()
                         .offset(y: MapLabelLayout.iconSize.height / 2 + MapLabelLayout.labelOffset)
                         .transition(.opacity)
@@ -918,13 +943,13 @@ private struct NearbyMarker: View {
 }
 
 /// A waypoint of the ACARS route: a small ringed dot, plus its name when `MapLabelLayout` found room.
-private struct WaypointMarker: View {
+struct WaypointMarker: View {
     let label: String
     let showLabel: Bool
 
     var body: some View {
         Circle()
-            .fill(Color(nsColor: .windowBackgroundColor))
+            .fill(Color.platformBackground)
             .frame(width: 6, height: 6)
             .overlay(Circle().stroke(Color.accentColor, lineWidth: 1.5))
             .frame(width: MapLabelLayout.iconSize.width, height: MapLabelLayout.iconSize.height)
@@ -933,7 +958,7 @@ private struct WaypointMarker: View {
                     Text(label)
                         .font(.system(size: 9, weight: .semibold, design: .monospaced))
                         .foregroundStyle(.secondary)
-                        .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1)
+                        .shadow(color: Color.platformBackground, radius: 1)
                         .fixedSize()
                         .offset(y: MapLabelLayout.iconSize.height / 2 + MapLabelLayout.labelOffset - 6)
                         .transition(.opacity)
@@ -946,7 +971,7 @@ private struct WaypointMarker: View {
 }
 
 /// The aircraft being shown: larger, accent-coloured, with a label capsule (grey once the signal is lost).
-private struct SelectedMarker: View {
+struct SelectedMarker: View {
     let f: Flight
     let isLive: Bool
 
@@ -977,7 +1002,7 @@ private struct SelectedMarker: View {
 
 // MARK: - Sidebar
 
-private struct FlightDetailSidebar: View {
+struct FlightDetailSidebar: View {
     @ObservedObject var model: FlightDetailModel
     private var o: DisplayOptions { model.display }
 
@@ -1108,7 +1133,7 @@ private struct FlightDetailSidebar: View {
             case .loaded(let photo, let image):
                 VStack(alignment: .leading, spacing: 5) {
                     Link(destination: photo.pageURL) {
-                        Image(nsImage: image)
+                        Image(platformImage: image)
                             .resizable()
                             .aspectRatio(photo.aspectRatio, contentMode: .fit)
                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -1592,13 +1617,13 @@ private struct AcarsSection: View {
             HStack(spacing: 10) {
                 if hidden > 0 || showAll {
                     Toggle("Show link messages\(hidden > 0 ? " (\(hidden))" : "")", isOn: $showAll)
-                        .toggleStyle(.checkbox)
+                        .checkboxToggleStyle()
                         .help("Keep-alives, link tests and other link maintenance")
                 }
                 Spacer()
                 if visible.count > limit {
                     Button("Show \(min(Self.pageSize, visible.count - limit)) More") { limit += Self.pageSize }
-                        .buttonStyle(.link)
+                        .linkButtonStyle()
                 }
             }
             .font(.caption)
@@ -1613,7 +1638,7 @@ private struct AcarsSection: View {
         }
         if hidden > 0 {
             Button("Show \(hidden) link \(hidden == 1 ? "message" : "messages")") { showAll = true }
-                .buttonStyle(.link)
+                .linkButtonStyle()
                 .font(.caption)
                 .padding(.horizontal, 2)
         }
@@ -1746,7 +1771,7 @@ private struct AcarsRow: View {
             .accessibilityLabel("\(label): \(text)")
         if text.count > 120 || text.split(separator: "\n", omittingEmptySubsequences: false).count > 3 {
             Button(isExpanded ? "Show Less" : "Show More", action: toggle)
-                .buttonStyle(.link)
+                .linkButtonStyle()
                 .font(.caption)
         }
     }

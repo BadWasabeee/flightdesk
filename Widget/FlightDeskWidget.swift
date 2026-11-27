@@ -1,4 +1,5 @@
-// Native macOS desktop widget (WidgetKit) with per-widget configuration via "Edit Widget".
+// Native WidgetKit widget with per-widget configuration via "Edit Widget": the macOS desktop widget
+// and (in the iPhone extension, with the Lock Screen widgets in iOS/Widget) the Home Screen widget.
 
 import WidgetKit
 import SwiftUI
@@ -261,7 +262,7 @@ struct FlightWidgetView: View {
             .containerBackground(for: .widget) {
                 // Standard: the system widget background, light or dark to match the Mac's appearance.
                 if o.isStandard {
-                    Color(nsColor: .windowBackgroundColor)
+                    Color.platformBackground
                 } else {
                     PanelBackground().environment(\.displayOptions, o)
                 }
@@ -283,7 +284,11 @@ struct FlightDeskWidget: Widget {
         }
         .configurationDisplayName("Flights Overhead")
         .description("The aircraft flying near you right now, on a glowing LED board or in a clean system style.")
+        #if os(macOS)
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge, .systemExtraLarge])
+        #else
+        .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
+        #endif
         // The board draws its own 14–16 pt margins so the LED texture and the layout grid line up.
         .contentMarginsDisabled()
     }
@@ -291,5 +296,10 @@ struct FlightDeskWidget: Widget {
 
 @main
 struct FlightDeskWidgets: WidgetBundle {
-    var body: some Widget { FlightDeskWidget() }
+    var body: some Widget {
+        FlightDeskWidget()
+        #if os(iOS)
+        NearestFlightWidget()
+        #endif
+    }
 }

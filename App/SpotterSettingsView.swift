@@ -1,5 +1,14 @@
 import SwiftUI
 import UserNotifications
+#if os(iOS)
+import UIKit
+#endif
+
+#if os(macOS)
+private let didBecomeActive = NSApplication.didBecomeActiveNotification
+#else
+private let didBecomeActive = UIApplication.didBecomeActiveNotification
+#endif
 
 /// Settings › Alerts: notification permission, spotter rules, watchlist and quiet hours.
 struct SpotterSettingsView: View {
@@ -18,13 +27,16 @@ struct SpotterSettingsView: View {
     var body: some View {
         Form {
             notificationsSection
+            #if os(iOS)
+            whileOpenSection
+            #endif
             rulesSection
             watchlistSection
             quietHoursSection
         }
         .formStyle(.grouped)
         .task { await alerts.refreshAuthorization() }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: didBecomeActive)) { _ in
             Task { await alerts.refreshAuthorization() }
         }
     }
@@ -50,7 +62,11 @@ struct SpotterSettingsView: View {
                     Button("Send Test") { alerts.sendTest() }
                         .help("Posts a sample alert for the nearest aircraft")
                 case .denied:
+                    #if os(macOS)
                     Button("Open System Settings…") { alerts.openNotificationSettings() }
+                    #else
+                    Button("Settings") { alerts.openNotificationSettings() }
+                    #endif
                 default:
                     Button("Allow…") { Task { await alerts.requestAuthorizationIfNeeded() } }
                 }
@@ -61,7 +77,7 @@ struct SpotterSettingsView: View {
                     .font(.callout).foregroundStyle(.secondary)
             }
             if alerts.authorization == .denied, !alerts.settings.activeRules.isEmpty {
-                Label("Your rules are on, but macOS won’t show their alerts until notifications are allowed.",
+                Label("Your rules are on, but \(Self.system) won’t show their alerts until notifications are allowed.",
                       systemImage: "exclamationmark.triangle.fill")
                     .font(.callout).foregroundStyle(.orange)
             }
@@ -78,17 +94,50 @@ struct SpotterSettingsView: View {
         }
     }
 
+    #if os(macOS)
+    private static let system = "macOS"
+    #else
+    private static let system = "iOS"
+    #endif
+
     private var permissionDetail: String {
         switch alerts.authorization {
         case .authorized, .provisional:
             let place = store.placeName.isEmpty ? "your location" : store.placeName
+            #if os(macOS)
             return "FlightDesk checks the sky around \(place) every \(SettingsMetrics.interval(store.settings.widgetRefreshSeconds)), even with no windows open."
+            #else
+            return "FlightDesk checks the sky around \(place) while it’s open."
+            #endif
         case .denied:
+            #if os(macOS)
             return "Turn on notifications for FlightDesk in System Settings to get alerts."
+            #else
+            return "Turn on notifications for FlightDesk in Settings to get alerts."
+            #endif
         default:
-            return "macOS asks once, the first time an alert rule is on."
+            return "\(Self.system) asks once, the first time an alert rule is on."
         }
     }
+
+    #if os(iOS)
+    /// iOS doesn't let FlightDesk watch the sky in the background, so say exactly when alerts can fire.
+    private var whileOpenSection: some View {
+        Section {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Alerts work while FlightDesk is open")
+                    Text("iOS pauses FlightDesk when you leave it, so it can’t check the sky in the background. Keep FlightDesk on screen (for example on a stand at the airport fence) to be alerted, and use widgets for a glance at what’s overhead.")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } icon: {
+                Image(systemName: "iphone.radiowaves.left.and.right").foregroundStyle(Color.accentColor)
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+    #endif
 
     // MARK: Rules
 
@@ -149,7 +198,9 @@ struct SpotterSettingsView: View {
                     }
                 }
             }
+            #if os(macOS)
             .toggleStyle(.checkbox)
+            #endif
             .padding(.leading, SettingsMetrics.indent)
         }
         if let db = alerts.database {
@@ -162,7 +213,9 @@ struct SpotterSettingsView: View {
                             Text(c.count.formatted()).foregroundStyle(.secondary).monospacedDigit()
                         }
                     }
+                    #if os(macOS)
                     .toggleStyle(.checkbox)
+                    #endif
                 }
             } label: {
                 let n = alerts.settings.interestingCategories.count
@@ -303,7 +356,11 @@ struct SpotterSettingsView: View {
 
     private func addWatchItem() {
         guard let v = normalizedNew else {
-            if !newValue.trimmingCharacters(in: .whitespaces).isEmpty { triedInvalid = true; NSSound.beep() }
+            if !newValue.trimmingCharacters(in: .whitespaces).isEmpty { triedInvalid = true
+                #if os(macOS)
+                NSSound.beep()
+                #endif
+            }
             return
         }
         guard !isDuplicate else { return }

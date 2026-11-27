@@ -3,7 +3,9 @@
 // `flightdesk://` links use, never a new one.
 
 import AppIntents
+#if os(macOS)
 import AppKit
+#endif
 import SwiftUI
 
 // MARK: - Answers
@@ -141,6 +143,8 @@ struct OpenSettingsIntent: AppIntent {
 
 // MARK: - Routing into the app
 
+// The iPhone's IntentRouting lives in iOS/App/AppRouter.swift.
+#if os(macOS)
 /// Connects intents to the running app, as the `flightdesk://` handlers in `AppDelegate` do.
 @MainActor
 enum IntentRouting {
@@ -159,3 +163,4 @@ enum IntentRouting {
 
     static func showSettings(_ tab: SettingsTab) { app?.performIntent { $0.openSettings(tab: tab) } }
 }
+#endif

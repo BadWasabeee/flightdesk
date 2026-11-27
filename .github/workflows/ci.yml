@@ -18,3 +18,7 @@ jobs:
         run: |
           xcodebuild -project FlightDesk.xcodeproj -scheme FlightDesk -destination 'platform=macOS' \
             CODE_SIGNING_ALLOWED=NO DEVELOPMENT_TEAM=CI0000000 build test
+      - name: Build the iPhone app (unsigned)
+        run: |
+          xcodebuild -project FlightDesk.xcodeproj -scheme FlightDeskiOS -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO DEVELOPMENT_TEAM=CI0000000 build

@@ -46,7 +46,7 @@
 
 ## Requirements
 
-- macOS 14 Sonoma or later
+- macOS 14 Sonoma or later (the iPhone app needs iOS 17 or later)
 - Xcode 26 or later, plus [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`)
 - An Apple ID signed in to Xcode. A free account works, because widgets must be code-signed.
 
@@ -69,9 +69,39 @@ Then add the widget: **right-click the desktop › Edit Widgets… › search "F
 | --- | --- |
 | `./build.sh` | Build, install and launch |
 | `./build.sh --no-open` | Build and install |
-| `./build.sh --test` | Run the unit tests |
+| `./build.sh --test` | Run the unit tests, and check the iPhone app builds |
+| `./build.sh --ios` | Build the iPhone app and run it in the iOS Simulator (see [iPhone](#iphone)) |
 
 To work in Xcode, run `xcodegen generate` and open `FlightDesk.xcodeproj`.
+
+## iPhone
+
+FlightDesk also runs on iPhone (iOS 17 or later). It shares the Mac app's data layer and most of its views:
+
+- **Radar.** A full-screen map with every aircraft in your radius, sized by type, with your location and the radius outline. A sheet you can drag up and down holds the searchable, sortable flight list with emergency, diversion and runway tags. Tap a plane or a row to open its detail in the sheet; the map behind it draws the flown track and the route ahead, and only pans (never zooms out) to keep the plane in view. Pull down to refresh.
+- **Logbook** and **Settings** are the other tabs in the sheet. Settings covers location (follow the iPhone or a fixed place), radius, units, private/GA traffic, the logbook, widget style, alerts, data sources and today's request counts.
+- **Widgets.** *Flights Overhead* for the Home Screen (Small, Medium, Large, in LED or Standard), and *Nearest Flight* for the Lock Screen (circular, rectangular and inline). Tapping a widget opens that flight.
+- **Shortcuts and Siri.** The same App Intents as on the Mac.
+
+Polling pauses while FlightDesk is in the background. The radar refetches every 12 s on adsb.fi, slows down when it has to fall back to adsb.lol's daily allowance, and slows further in Low Power Mode. iOS doesn't let FlightDesk check the sky in the background, so **alerts only fire while the app is open**, and widgets refresh as often as iOS allows (Settings › Alerts says so too).
+
+### Run it in the Simulator
+
+```sh
+./build.sh --ios
+xcrun simctl location booted set 43.08,-88.26   # optional: pretend to be near Milwaukee
+```
+
+This builds the `FlightDeskiOS` scheme, boots an iPhone simulator if none is running (iPhone 17 Pro on the newest iOS), installs the app and launches it. No signing setup is needed for the Simulator.
+
+### Run it on your iPhone
+
+1. Run `xcodegen generate` and open `FlightDesk.xcodeproj` in Xcode.
+2. Connect your iPhone (or pair it over Wi-Fi), turn on **Developer Mode** on the phone (Settings › Privacy & Security), and pick it as the run destination for the **FlightDeskiOS** scheme.
+3. In the project's **Signing & Capabilities**, choose your team for both **FlightDeskiOS** and **FlightDeskiOSWidget**. The iOS targets use automatic signing, so Xcode registers the device and creates the profiles and the App Group (`group.<BUNDLE_ID_PREFIX>.flightdesk`; iOS requires the `group.` form).
+4. Press Run. The first time, trust the developer certificate on the phone under Settings › General › VPN & Device Management.
+
+The device must be registered to your team, which Xcode does when you select it. With a free **Personal Team**, apps expire after **7 days**: run it from Xcode again to renew. If the bundle ID is taken, set your own `BUNDLE_ID_PREFIX` in `Config/Local.xcconfig`.
 
 ## Configuration
 
@@ -167,6 +197,7 @@ These are free community services. Please be kind to them, and consider supporti
 Issues and pull requests are welcome. Please run `./build.sh --test` before opening a PR.
 
 To refresh the bundled navigation table (the FAA publishes a new NASR edition every 28 days), run `scripts/update-navdata.sh` (or `scripts/update-navdata.sh 2026-11-26` for a specific edition). It downloads the NASR fix and navaid CSVs and OurAirports' navaids into a temporary folder and rewrites `Shared/Resources/navdata.csv`.
+On iPhone, a Debug build has the same `FLIGHTDESK_SNAPSHOT_*` options (relative paths go in the app's `tmp` folder) and also renders the Lock Screen faces, plus `FLIGHTDESK_UI_TAB`, `FLIGHTDESK_UI_DETENT`, `FLIGHTDESK_UI_SETTINGS`, `FLIGHTDESK_UI_OPEN=nearest` and `FLIGHTDESK_UI_URL` to open a screen without tapping. Pass them with `SIMCTL_CHILD_` in front, e.g. `SIMCTL_CHILD_FLIGHTDESK_UI_TAB=logbook xcrun simctl launch booted <bundle id>.flightdesk.ios` (see `iOS/App/DebugLaunch.swift`).
 To render every widget size to PNG (handy for UI changes), run a **Debug** build (snapshots are compiled out of Release).
 The app is sandboxed, so the output folder must be inside its container:
 

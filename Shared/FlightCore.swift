@@ -15,6 +15,15 @@ enum Shared {
     /// Injected from the build settings (Config/Base.xcconfig → Info.plist "FDAppGroupID").
     static let groupID = Bundle.main.object(forInfoDictionaryKey: "FDAppGroupID") as? String ?? ""
     static let widgetKind = "FlightDeskWidget"
+    #if os(iOS)
+    /// The Lock Screen widget (nearest flight), iPhone only.
+    static let accessoryWidgetKind = "FlightDeskNearest"
+    /// Every widget kind the app reloads.
+    static let widgetKinds = [widgetKind, accessoryWidgetKind]
+    #else
+    /// Every widget kind the app reloads.
+    static let widgetKinds = [widgetKind]
+    #endif
     static let defaults: UserDefaults = groupID.isEmpty ? .standard : (UserDefaults(suiteName: groupID) ?? .standard)
 
     static var location: (lat: Double, lon: Double, name: String)? {
@@ -717,9 +726,12 @@ extension PanelModel {
 
 // MARK: - Airline logos
 
-// AppKit/ImageIO are only needed here: SVG logos are rasterized to PNG once, and every logo is
-// checked for a transparent background before it is cached.
+// AppKit/ImageIO are only needed here: SVG logos are rasterized to PNG once (macOS only; iOS has no
+// public SVG decoder, so it uses the PNG sources), and every logo is checked for a transparent
+// background before it is cached.
+#if os(macOS)
 import AppKit
+#endif
 import ImageIO
 
 extension Flight {
@@ -831,7 +843,7 @@ enum AirlineLogos {
 
     private static func candidates(for key: Key) async -> [Candidate] {
         var list: [Candidate] = []
-        if let slug = await SoaringSymbols.shared.slug(icao: key.icao, iata: key.iata),
+        if rasterizesSVG, let slug = await SoaringSymbols.shared.slug(icao: key.icao, iata: key.iata),
            let u = RemoteURL.make("\(SoaringSymbols.base)/dist/airlines", [slug, "icon.svg"]) {
             list.append(Candidate(urls: [u], isSVG: true))
         }
@@ -927,6 +939,10 @@ enum AirlineLogos {
     /// An SVG rendered to PNG (longest side `side` px), so the widget only ever reads PNGs.
     /// Only plain SVG documents under 1 MB are accepted, so a raster image (or an entity bomb)
     /// served from an SVG URL never reaches the decoder.
+    #if os(macOS)
+    /// Whether this platform can turn the curated SVG icons into PNGs.
+    static let rasterizesSVG = true
+
     static func rasterizedSVG(_ data: Data) -> Data? {
         guard ImageGuard.isPlainSVG(data), let img = NSImage(data: data),
               img.size.width > 0, img.size.height > 0 else { return nil }
@@ -941,6 +957,12 @@ enum AirlineLogos {
         NSGraphicsContext.restoreGraphicsState()
         return ctx.makeImage().flatMap(trimmed).flatMap(pngData)
     }
+    #else
+    /// iOS has no public SVG decoder, so the curated SVG icons are skipped (the PNG sources remain).
+    static let rasterizesSVG = false
+
+    static func rasterizedSVG(_ data: Data) -> Data? { nil }
+    #endif
 
     /// PNG data downscaled to at most `side` px and with transparent margins cropped, so logos from
     /// different sources fill the same space.
