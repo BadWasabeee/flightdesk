@@ -138,9 +138,9 @@ enum ReceiverError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .invalidURL: "Enter your receiver’s address, like http://raspberrypi.local/tar1090."
-        case .noAircraftData(let host): "\(host) answered, but no aircraft.json was found. Enter the address of the receiver’s map page (tar1090, SkyAware or dump1090)."
-        case .httpStatus(let code): "The receiver answered with HTTP \(code)."
-        case .notAircraftJSON: "The receiver didn’t return aircraft data."
+        case .noAircraftData(let host): "\(host) answered, but no aircraft data was found there. Enter the address of the receiver’s map page (tar1090, SkyAware or dump1090) — FlightDesk finds aircraft.json from it."
+        case .httpStatus(let code): "The receiver answered with an error (HTTP \(code))."
+        case .notAircraftJSON: "The receiver answered, but not with aircraft data."
         }
     }
 }
@@ -361,7 +361,8 @@ enum ReceiverFeed {
     }
 
     /// Discovers the receiver at `base`, remembers the working path, and describes the result.
-    static func test(_ base: String, observer: GeoPoint?, radiusNM: Int?) async -> TestResult {
+    /// `radiusLabel` is the search radius as the user sees it (e.g. "100 nm" or "185 km").
+    static func test(_ base: String, observer: GeoPoint?, radiusNM: Int?, radiusLabel: String? = nil) async -> TestResult {
         let start = Date()
         do {
             let found = try await discover(base)
@@ -369,17 +370,25 @@ enum ReceiverFeed {
             remember(found.url, for: base)
             await FeedHealth.shared.receiverSucceeded()
             let software = await softwareName(near: found.url)
-            var text = "Connected — \(found.file.aircraft.count) aircraft"
-            if let observer, let radiusNM {
-                let near = flights(in: found.file, observer: observer, radiusNM: radiusNM).count
-                text += ", \(near) within \(radiusNM) nm"
-            }
-            let time = elapsed < 1 ? "\(max(1, Int(elapsed * 1000))) ms" : String(format: "%.1f s", elapsed)
-            text += " (" + [software, time].compactMap { $0 }.joined(separator: ", ") + ")"
-            return TestResult(ok: true, message: text, detail: "Reading \(found.url.absoluteString)")
+            var near: Int?
+            if let observer, let radiusNM { near = flights(in: found.file, observer: observer, radiusNM: radiusNM).count }
+            return connected(total: found.file.aircraft.count, near: near,
+                             radius: radiusLabel ?? radiusNM.map { "\($0) nm" }, software: software,
+                             elapsed: elapsed, url: found.url)
         } catch {
             return TestResult(ok: false, message: describe(error, base: base))
         }
+    }
+
+    /// The success message, e.g. "Connected to readsb · 214 aircraft, 37 within 100 nm"
+    /// with detail "http://pi.local/tar1090/data/aircraft.json · 45 ms".
+    static func connected(total: Int, near: Int?, radius: String?, software: String?,
+                          elapsed: TimeInterval, url: URL) -> TestResult {
+        var text = software.map { "Connected to \($0)" } ?? "Connected"
+        text += " · \(total.formatted()) aircraft"
+        if let near, let radius { text += ", \(near.formatted()) within \(radius)" }
+        let time = elapsed < 1 ? "\(max(1, Int(elapsed * 1000))) ms" : String(format: "%.1f s", elapsed)
+        return TestResult(ok: true, message: text, detail: "\(url.absoluteString) · \(time)")
     }
 
     /// Best-effort decoder name from the `receiver.json` next to `aircraft.json` and the URL path.
@@ -408,13 +417,13 @@ enum ReceiverFeed {
         guard let e = error as? URLError else { return error.localizedDescription }
         switch e.code {
         case .cannotFindHost, .dnsLookupFailed:
-            return "Couldn’t find \(host). Check the name, or use the receiver’s IP address (e.g. http://192.168.1.50)."
+            return "Couldn’t find \(host). Check the name, or use the receiver’s IP address, like http://192.168.1.50."
         case .timedOut:
-            return "No answer from \(host). Is the receiver on and on the same network as this Mac?"
+            return "No answer from \(host). Check that the receiver is on and on the same network as this Mac."
         case .cannotConnectToHost:
-            return "\(host) refused the connection. Check the port (tar1090 and SkyAware use 80; ultrafeeder often 8080)."
+            return "\(host) refused the connection. Check the port: tar1090 and SkyAware use 80, ultrafeeder often 8080."
         case .notConnectedToInternet, .networkConnectionLost:
-            return "Couldn’t reach \(host). If macOS asked about local network access, allow FlightDesk in System Settings › Privacy & Security › Local Network."
+            return "Couldn’t reach \(host). Allow FlightDesk in System Settings › Privacy & Security › Local Network."
         case .appTransportSecurityRequiresSecureConnection:
             return "macOS blocks plain http to \(host). Use the receiver’s IP address or its .local name instead."
         case .secureConnectionFailed, .serverCertificateUntrusted, .serverCertificateHasBadDate,

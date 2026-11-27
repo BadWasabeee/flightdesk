@@ -139,4 +139,106 @@ final class DetailExtrasTests: XCTestCase {
         XCTAssertNil(try report(#","year":"unknown""#)?.year)
         XCTAssertNil(try report(#","year":null"#)?.year)
     }
+
+    // MARK: Detail formatting
+
+    private let us = Locale(identifier: "en_US")
+
+    func testDistanceUsesGroupingAndSensiblePrecision() {
+        XCTAssertEqual(DetailFormat.distance(6424.4, units: .imperial, locale: us), "6,424 nm")
+        XCTAssertEqual(DetailFormat.distance(3.74, units: .imperial, locale: us), "3.7 nm")
+        XCTAssertEqual(DetailFormat.distance(9.96, units: .imperial, locale: us), "10 nm")
+        XCTAssertEqual(DetailFormat.distance(1320.2, units: .imperial, locale: us), "1,320 nm")
+        XCTAssertEqual(DetailFormat.distance(100, units: .metric, locale: us), "185 km")
+        XCTAssertEqual(DetailFormat.distance(-1, units: .imperial, locale: us), "0.0 nm")
+    }
+
+    func testVerticalRate() {
+        XCTAssertEqual(DetailFormat.verticalRate(64, units: .imperial, locale: us), "Level")
+        XCTAssertEqual(DetailFormat.verticalRate(1_216, units: .imperial, locale: us), "+1,200 fpm")
+        XCTAssertEqual(DetailFormat.verticalRate(-832, units: .imperial, locale: us), "-850 fpm")
+        XCTAssertEqual(DetailFormat.verticalRate(1_000, units: .metric, locale: us), "+5.1 m/s")
+    }
+
+    func testHeadingIsThreeDigitsWithCompassPoint() {
+        XCTAssertEqual(DetailFormat.heading(95.4), "095° E")
+        XCTAssertEqual(DetailFormat.heading(359.7), "000° N")
+        XCTAssertEqual(DetailFormat.heading(-90), "270° W")
+    }
+
+    func testBuiltAndAgo() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)   // 2027
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        XCTAssertEqual(DetailFormat.built(2009, now: now, calendar: cal), "2009 · 18 years old")
+        XCTAssertEqual(DetailFormat.built(2026, now: now, calendar: cal), "2026 · 1 year old")
+        XCTAssertEqual(DetailFormat.built(2027, now: now, calendar: cal), "2027")
+        XCTAssertEqual(DetailFormat.ago(now.addingTimeInterval(-20), now: now), "just now")
+        XCTAssertEqual(DetailFormat.ago(now.addingTimeInterval(-245), now: now), "4 min ago")
+        XCTAssertEqual(DetailFormat.ago(now.addingTimeInterval(-7_500), now: now), "2 h 5 m ago")
+    }
+
+    func testSquawkAlerts() {
+        XCTAssertEqual(DetailFormat.squawkAlert("7700"), "Emergency")
+        XCTAssertEqual(DetailFormat.squawkAlert("7600"), "Radio Failure")
+        XCTAssertEqual(DetailFormat.squawkAlert("7500"), "Hijack")
+        XCTAssertNil(DetailFormat.squawkAlert("1200"))
+        XCTAssertNil(DetailFormat.squawkAlert(nil))
+    }
+
+    func testArrivalStates() {
+        XCTAssertEqual(DetailFormat.arrival(remainingNM: 2, speedKT: 0, altitudeFt: 0, verticalRate: 0, onGround: true), .landed)
+        XCTAssertNil(DetailFormat.arrival(remainingNM: 900, speedKT: 10, altitudeFt: 0, verticalRate: 0, onGround: true))
+        XCTAssertEqual(DetailFormat.arrival(remainingNM: 4, speedKT: 150, altitudeFt: 1_200, verticalRate: -700, onGround: false), .landing)
+        XCTAssertEqual(DetailFormat.arrival(remainingNM: 450, speedKT: 450, altitudeFt: 36_000, verticalRate: 0, onGround: false),
+                       .estimate(3_600))
+        XCTAssertNil(DetailFormat.arrival(remainingNM: 450, speedKT: 20, altitudeFt: 36_000, verticalRate: 0, onGround: false))
+    }
+
+    func testMapDetailLevels() {
+        XCTAssertEqual(DetailFormat.MapDetail(latitudeSpan: 1), .labelled)
+        XCTAssertEqual(DetailFormat.MapDetail(latitudeSpan: 8), .icons)
+        XCTAssertEqual(DetailFormat.MapDetail(latitudeSpan: 30), .hidden)
+        XCTAssertLessThan(DetailFormat.MapDetail.hidden, .icons)
+    }
+
+    func testTitleAndSubtitle() throws {
+        XCTAssertEqual(DetailFormat.title(for: nil, hex: "a1b2c3"), "A1B2C3")
+        XCTAssertEqual(DetailFormat.subtitle(for: nil), "")
+    }
+
+    func testFramingSimpleRoute() throws {
+        let fr = try XCTUnwrap(DetailFormat.framing([GeoPoint(lat: 36.08, lon: -115.15), GeoPoint(lat: 42.95, lon: -87.9)], margin: 0))
+        XCTAssertEqual(fr.center.lon, -101.525, accuracy: 0.01)
+        XCTAssertGreaterThan(fr.center.lat, 36.08)
+        XCTAssertLessThan(fr.center.lat, 42.95)
+        XCTAssertEqual(fr.longitudeDelta, 27.25, accuracy: 0.01)
+        XCTAssertGreaterThanOrEqual(fr.latitudeDelta, 42.95 - 36.08)
+    }
+
+    func testFramingAcrossTheAntimeridian() throws {
+        // Taipei to Chicago via Alaska: the frame must span the Pacific, not Europe.
+        let pts = [GeoPoint(lat: 25.08, lon: 121.23), GeoPoint(lat: 60, lon: 180), GeoPoint(lat: 62, lon: -170), GeoPoint(lat: 41.98, lon: -87.9)]
+        let fr = try XCTUnwrap(DetailFormat.framing(pts, margin: 0))
+        XCTAssertEqual(fr.longitudeDelta, 150.87, accuracy: 0.01)
+        XCTAssertEqual(fr.center.lon, -163.335, accuracy: 0.01)
+    }
+
+    func testFramingSinglePointHasMinimumSize() throws {
+        let fr = try XCTUnwrap(DetailFormat.framing([GeoPoint(lat: 0, lon: 10)]))
+        XCTAssertEqual(fr.latitudeDelta, 0.3, accuracy: 1e-9)
+        XCTAssertEqual(fr.center.lon, 10, accuracy: 1e-9)
+        XCTAssertNil(DetailFormat.framing([GeoPoint(lat: .nan, lon: 0)]))
+    }
+
+    func testLookUpCopy() {
+        let overhead = SkyPosition(observer: observer, aircraft: GeoPoint(lat: observer.lat + 10 * nmLat, lon: observer.lon),
+                                   altitudeFt: 30_000)
+        let text = DetailFormat.lookUp(overhead)
+        XCTAssertTrue(text.headline.hasPrefix("Look "))
+        XCTAssertTrue(text.headline.hasSuffix("toward N"))
+        XCTAssertEqual(text.detail, "Bearing 000°")
+        let hidden = SkyPosition(observer: observer, aircraft: GeoPoint(lat: observer.lat + 150 * nmLat, lon: observer.lon), altitudeFt: 2_000)
+        XCTAssertEqual(DetailFormat.lookUp(hidden).headline, "Below your horizon")
+    }
 }

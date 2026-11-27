@@ -141,6 +141,7 @@ final class SpotterAlertTests: XCTestCase {
         let a = SpotterEngine.evaluate([jumbo, flight(hex: "bbbbbb", type: "B738", dist: 10)],
                                        settings: s, db: nil, squawk: { _ in nil })
         XCTAssertEqual(a.map(\.rule), [.watchlist, .heavy, .proximity])
+        XCTAssertEqual(a.map(\.label), ["Watchlist · B748", "Wide-body", "Close approach"], "the watchlist label names the entry")
         XCTAssertTrue(a.allSatisfy { $0.flight.id == "aaaaaa" })
     }
 
@@ -181,6 +182,37 @@ final class SpotterAlertTests: XCTestCase {
         let first = ledger.admit(many, now: t0, limit: 3)
         XCTAssertEqual(first.map(\.flight.id), ["c00004", "c00003", "c00002"], "nearest first")
         XCTAssertEqual(ledger.admit(many, now: t0, limit: 3).map(\.flight.id), ["c00001", "c00000"])
+    }
+
+    func testMuteSilencesEveryRuleUntilItExpires() {
+        var ledger = AlertLedger()
+        let t0 = Date(timeIntervalSince1970: 0)
+        let f = flight(hex: "ABC123")
+        let alerts = [SpotterAlert(flight: f, rule: .emergency, label: "", entry: nil),
+                      SpotterAlert(flight: f, rule: .heavy, label: "", entry: nil)]
+        ledger.mute(hex: "ABC123", now: t0)
+        XCTAssertTrue(ledger.isMuted(hex: "abc123", now: t0.addingTimeInterval(3600)))
+        XCTAssertEqual(ledger.mutedCount(now: t0), 1)
+        XCTAssertTrue(ledger.admit(alerts, now: t0.addingTimeInterval(3600)).isEmpty, "muted aircraft never alert")
+        let later = t0.addingTimeInterval(AlertLedger.muteDuration + 1)
+        XCTAssertFalse(ledger.isMuted(hex: "abc123", now: later))
+        ledger.prune(now: later)
+        XCTAssertTrue(ledger.muted.isEmpty, "expired mutes are pruned")
+        XCTAssertEqual(ledger.admit(alerts, now: later).map(\.rule), [.emergency])
+
+        ledger.mute(hex: "abc123", now: later)
+        ledger.unmuteAll()
+        XCTAssertEqual(ledger.mutedCount(now: later), 0)
+    }
+
+    func testLedgerDecodesDataWrittenBeforeMutes() throws {
+        let old = try JSONEncoder().encode(["sent": ["heavy|abc123": Date(timeIntervalSince1970: 0)]])
+        let ledger = try JSONDecoder().decode(AlertLedger.self, from: old)
+        XCTAssertTrue(ledger.isRecent(.heavy, hex: "abc123", now: Date(timeIntervalSince1970: 60)))
+        XCTAssertTrue(ledger.muted.isEmpty)
+        var muted = ledger
+        muted.mute(hex: "abc123", now: Date(timeIntervalSince1970: 0))
+        XCTAssertEqual(try JSONDecoder().decode(AlertLedger.self, from: JSONEncoder().encode(muted)), muted)
     }
 
     func testLedgerPruneAndCodable() throws {
@@ -244,13 +276,28 @@ final class SpotterAlertTests: XCTestCase {
         let f = flight(hex: "ae07e1", callsign: "RCH123", reg: "05-5140", type: "C17", alt: 24_000, dist: 2.5)
         let entry = db["ae07e1"]
         let a = SpotterAlert(flight: f, rule: .interesting, label: "Military", entry: entry)
-        XCTAssertEqual(a.title, "Military · Boeing C-17A Globemaster III overhead")
+        XCTAssertEqual(a.title, "Boeing C-17A Globemaster III overhead")
+        XCTAssertEqual(a.subtitle, "Military")
         var o = DisplayOptions()                            // LED style by default; alerts always use standard text
         XCTAssertEqual(a.body(display: o), "RCH123 · 05-5140 · United States Air Force\n\(24_000.formatted()) ft · 2.5 nm NE")
         o.units = .metric
         XCTAssertTrue(a.body(display: o).hasSuffix("4.6 km NE"))
         let far = SpotterAlert(flight: flight(type: "", dist: 9), rule: .proximity, label: "Close approach", entry: nil)
-        XCTAssertEqual(far.title, "Close approach · Aircraft nearby")
+        XCTAssertEqual(far.title, "Aircraft nearby")
+        XCTAssertEqual(far.subtitle, "Close approach")
+        let mayday = SpotterAlert(flight: flight(type: "B738", dist: 2), rule: .emergency, label: "Emergency · squawk 7700", entry: nil)
+        XCTAssertEqual(mayday.title, "Emergency · squawk 7700", "emergencies lead with the squawk")
+        XCTAssertEqual(mayday.subtitle, "B738 overhead")
+    }
+
+    func testWatchKindCopyIsComplete() {
+        for k in WatchItem.Kind.allCases {
+            XCTAssertFalse(k.title.isEmpty)
+            XCTAssertFalse(k.symbol.isEmpty)
+            XCTAssertTrue(k.explanation.hasSuffix("."), "\(k) explanation is a sentence")
+            XCTAssertTrue(k.validationHint.hasSuffix("."), "\(k) hint is a sentence")
+            XCTAssertNil(WatchItem.normalize("!!", as: k), "\(k) rejects punctuation")
+        }
     }
 
     func testMenuBarReadoutPicksNearestAirline() {

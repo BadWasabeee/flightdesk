@@ -1,8 +1,8 @@
 import SwiftUI
 import MapKit
 
-/// Main window content: searchable flight list, live map of the search radius and an inspector
-/// for the selected aircraft.
+/// Main window content: a searchable aircraft list beside either the live radar map (with an
+/// inspector for the selection) or the full detail of one flight.
 struct MainWindowView: View {
     @ObservedObject var store: LiveStore
     @ObservedObject var radar: RadarModel
@@ -14,37 +14,98 @@ struct MainWindowView: View {
         return o
     }
 
-    private var inspectorShown: Binding<Bool> {
-        Binding(get: { radar.selection != nil }, set: { if !$0 { radar.selection = nil } })
-    }
-
     var body: some View {
         NavigationSplitView(columnVisibility: $radar.sidebar) {
-            FlightList(radar: radar, flights: FlightListFilter.apply(radar.flights, query: radar.query, sort: radar.sort))
+            FlightList(radar: radar,
+                       flights: FlightListFilter.apply(radar.flights, query: radar.query, sort: radar.sort),
+                       total: radar.flights.count,
+                       feed: radar.feed,
+                       radius: store.settings.radius,
+                       includeGA: store.settings.includeGA,
+                       hasLocation: !store.placeName.isEmpty || Shared.location != nil,
+                       locationStatus: store.locationStatus)
                 .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 420)
         } detail: {
-            RadarMap(radar: radar, radiusNM: store.settings.radius.nm)
-                .inspector(isPresented: inspectorShown) {
-                    FlightInspector(radar: radar)
-                        .inspectorColumnWidth(min: 250, ideal: 280, max: 360)
-                }
+            content
         }
-        .searchable(text: $radar.query, placement: .sidebar, prompt: "Callsign, reg, type, airline")
-        .navigationTitle("FlightDesk")
-        .navigationSubtitle(store.placeName.isEmpty ? "No location set" : store.placeName)
+        .searchable(text: $radar.query, placement: .sidebar, prompt: "Callsign, reg, type, airport")
+        .navigationTitle(title)
+        .navigationSubtitle(subtitle)
         .toolbar { toolbar }
+        .onExitCommand { withAnimation(MainWindowController.motion) { _ = radar.cancel() } }
         .environment(\.displayOptions, display)
         .frame(minWidth: 900, minHeight: 600)
     }
 
+    // MARK: Content
+
+    @ViewBuilder
+    private var content: some View {
+        ZStack {
+            if let detail = radar.detail {
+                FlightDetailView(model: detail)
+                    .id(detail.hex)
+                    .environment(\.openFlightDetail) { [radar] f in
+                        withAnimation(MainWindowController.motion) { radar.showDetail(hex: f.id, snapshot: f) }
+                    }
+                    .transition(.opacity)
+            } else {
+                RadarMap(radar: radar, radiusNM: store.settings.radius.nm, placeName: store.placeName,
+                         locationStatus: store.locationStatus)
+                    .inspector(isPresented: inspectorShown) {
+                        FlightInspector(radar: radar)
+                            .inspectorColumnWidth(min: 260, ideal: 290, max: 360)
+                    }
+                    .transition(.opacity)
+            }
+        }
+    }
+
+    private var inspectorShown: Binding<Bool> {
+        Binding(get: { radar.selected != nil }, set: { if !$0 { radar.selection = nil } })
+    }
+
+    // MARK: Title
+
+    private var title: String {
+        guard let detail = radar.detail else { return "FlightDesk" }
+        let number = radar.detailFlight?.displayNumber ?? ""
+        return number.isEmpty ? detail.hex.uppercased() : number
+    }
+
+    private var subtitle: String {
+        if radar.detail != nil {
+            guard let f = radar.detailFlight else { return "Loading…" }
+            if let r = f.route { return "\(r.from.city.isEmpty ? r.from.code : r.from.city) → \(r.to.city.isEmpty ? r.to.code : r.to.city)" }
+            return [FlightRowText.operatorName(f), f.typeCode].filter { !$0.isEmpty }.joined(separator: " · ")
+        }
+        guard !store.placeName.isEmpty else { return "No location set" }
+        return "\(store.placeName) · \(feedSummary)"
+    }
+
+    private var feedSummary: String {
+        let radius = display.radius(store.settings.radius.nm)
+        switch radar.feed {
+        case .loading: return "Looking for aircraft…"
+        case .noLocation: return "No location set"
+        case .offline: return radar.flights.isEmpty ? "Offline" : "Offline · \(count(radar.flights.count)) last seen"
+        case .empty, .live: return "\(count(radar.flights.count)) within \(radius)"
+        }
+    }
+
+    private func count(_ n: Int) -> String { n == 0 ? "No aircraft" : "\(n) aircraft" }
+
+    // MARK: Toolbar
+
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
-        ToolbarItem(placement: .status) {
-            Text(statusText)
-                .font(.callout)
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-                .fixedSize()
+        if radar.detail != nil {
+            ToolbarItem(placement: .navigation) {
+                Button { withAnimation(MainWindowController.motion) { radar.closeDetail() } } label: {
+                    Label("Back", systemImage: "chevron.backward")
+                }
+                .help("Back to the map (⌘[)")
+            }
         }
         ToolbarItemGroup(placement: .primaryAction) {
             Picker("Radius", selection: $store.settings.radius) {
@@ -52,24 +113,27 @@ struct MainWindowView: View {
             }
             .pickerStyle(.menu)
             .help("Search radius")
-            Toggle(isOn: $store.settings.includeGA) {
-                Label("Private & GA", systemImage: "airplane.circle")
+            Toggle(isOn: Binding(get: { !store.settings.includeGA }, set: { store.settings.includeGA = !$0 })) {
+                Label("Airlines Only", systemImage: "line.3.horizontal.decrease.circle")
             }
-            .help(store.settings.includeGA ? "Hide private and general-aviation traffic" : "Show private and general-aviation traffic")
+            .help(store.settings.includeGA ? "Show only airline flights" : "Show all aircraft, including private and general aviation")
             Button { Task { await radar.refresh() } } label: {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
-            .help("Refresh now")
-            .disabled(radar.isRefreshing)
+            .help(refreshHelp)
         }
     }
 
-    private var statusText: String {
-        if !radar.status.isEmpty, radar.flights.isEmpty { return radar.status }
-        let n = radar.flights.count
-        var text = "\(n) aircraft within \(display.radius(store.settings.radius.nm))"
-        if let t = radar.updated { text += " · \(t.formatted(date: .omitted, time: .standard))" }
-        return text
+    private var refreshHelp: String {
+        guard let t = radar.updated else { return "Refresh now (⌘R)" }
+        return "Refresh now (⌘R) · updated \(t.formatted(date: .omitted, time: .standard))"
+    }
+}
+
+extension RadarModel {
+    /// Opens `f`'s detail in the window, with the window's transition.
+    func open(_ f: Flight) {
+        withAnimation(MainWindowController.motion) { showDetail(hex: f.id, snapshot: f) }
     }
 }
 
@@ -78,55 +142,133 @@ struct MainWindowView: View {
 private struct FlightList: View {
     @ObservedObject var radar: RadarModel
     let flights: [Flight]
+    let total: Int
+    let feed: RadarFeedState
+    let radius: SearchRadius
+    let includeGA: Bool
+    let hasLocation: Bool
+    let locationStatus: String
+    @Environment(\.displayOptions) private var o
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ScrollViewReader { proxy in
             List(selection: $radar.selection) {
-                Section {
-                    ForEach(flights) { FlightRow(f: $0).tag($0.id) }
-                } header: {
-                    HStack {
-                        Text("\(flights.count) aircraft")
-                        Spacer()
-                        Picker("Sort by", selection: $radar.sort) {
-                            ForEach(FlightSort.allCases) { Text($0.title).tag($0) }
-                        }
-                        .pickerStyle(.menu)
-                        .fixedSize()
+                if !flights.isEmpty {
+                    Section {
+                        ForEach(flights) { FlightRow(f: $0).tag($0.id) }
+                    } header: {
+                        header
                     }
                 }
             }
             .contextMenu(forSelectionType: Flight.ID.self) { ids in
-                Button("Open Details") { openDetails(ids) }.disabled(ids.isEmpty)
-            } primaryAction: { openDetails($0) }
+                if let f = flight(ids) { FlightMenu(f: f, radar: radar) }
+            } primaryAction: { ids in
+                if let f = flight(ids) { radar.open(f) }
+            }
+            .onKeyPress(.space) {
+                guard let id = radar.selection, let f = radar.flights.first(where: { $0.id == id }) else { return .ignored }
+                radar.open(f)
+                return .handled
+            }
             .onChange(of: radar.selection) { _, id in
-                if let id { withAnimation { proxy.scrollTo(id) } }
+                guard let id else { return }
+                withAnimation(reduceMotion ? nil : .default) { proxy.scrollTo(id) }
             }
             .overlay { emptyState }
         }
     }
 
-    private func openDetails(_ ids: Set<Flight.ID>) {
-        for f in radar.flights where ids.contains(f.id) { FlightDetail.show(hex: f.id, snapshot: f) }
+    private func flight(_ ids: Set<Flight.ID>) -> Flight? {
+        guard let id = ids.first else { return nil }
+        return radar.flights.first { $0.id == id } ?? (radar.selected?.id == id ? radar.selected : nil)
+    }
+
+    private var header: some View {
+        HStack {
+            Text(flights.count == total ? "\(total) aircraft" : "\(flights.count) of \(total) aircraft")
+                .monospacedDigit()
+            Spacer()
+            Menu {
+                Picker("Sort By", selection: $radar.sort) {
+                    ForEach(FlightSort.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Text("Sort: \(radar.sort.title)")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .accessibilityLabel("Sort by \(radar.sort.title)")
+            .help("Sort the list")
+        }
     }
 
     @ViewBuilder
     private var emptyState: some View {
-        if Shared.location == nil {
+        if !hasLocation {
             ContentUnavailableView {
                 Label("No Location", systemImage: "location.slash")
             } description: {
-                Text("Set your location to see the aircraft flying near you.")
+                Text(locationStatus.isEmpty ? "Choose where you are to see the aircraft flying nearby." : locationStatus)
             } actions: {
-                Button("Open Settings…") { NSApp.sendAction(#selector(AppDelegate.showSettings), to: nil, from: nil) }
+                Button("Use Current Location") { radar.store.requestCurrentLocation() }
+                Button("Choose a Place…") { (NSApp.delegate as? AppDelegate)?.openSettings(tab: .general) }
             }
-        } else if flights.isEmpty && !radar.query.isEmpty {
+        } else if flights.isEmpty && total > 0 {
             ContentUnavailableView.search(text: radar.query)
-        } else if flights.isEmpty && !radar.status.isEmpty {
-            ContentUnavailableView(radar.status, systemImage: "airplane")
         } else if flights.isEmpty {
-            ProgressView()
+            switch feed {
+            case .offline:
+                ContentUnavailableView {
+                    Label("Can’t Reach the Flight Feed", systemImage: "wifi.exclamationmark")
+                } description: {
+                    Text("FlightDesk will keep trying.")
+                } actions: {
+                    Button("Try Again") { Task { await radar.refresh() } }
+                }
+            case .empty:
+                ContentUnavailableView {
+                    Label("Quiet Skies", systemImage: "airplane")
+                } description: {
+                    Text("No aircraft within \(o.radius(radius.nm)) right now.")
+                } actions: {
+                    if let wider = SearchRadius.allCases.last, wider != radius {
+                        Button("Search Within \(o.radius(wider.nm))") { radar.store.settings.radius = wider }
+                    }
+                    if !includeGA {
+                        Button("Include Private & GA") { radar.store.settings.includeGA = true }
+                    }
+                }
+            case .loading, .live, .noLocation:
+                VStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Looking for aircraft…").font(.callout).foregroundStyle(.secondary)
+                }
+            }
         }
+    }
+}
+
+/// Actions for one aircraft (list and map context menus).
+private struct FlightMenu: View {
+    let f: Flight
+    let radar: RadarModel
+
+    var body: some View {
+        Button("Open Details") { radar.open(f) }
+        Button("Open in New Window") { FlightDetail.showInNewWindow(hex: f.id, snapshot: f) }
+        Divider()
+        Button("Copy Flight Number") { copy(f.displayNumber) }
+        if !f.callsign.isEmpty && f.callsign != f.displayNumber { Button("Copy Callsign") { copy(f.callsign) } }
+        if !f.reg.isEmpty { Button("Copy Registration") { copy(f.reg) } }
+        Button("Copy ICAO Hex") { copy(f.id.uppercased()) }
+    }
+
+    private func copy(_ s: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(s, forType: .string)
     }
 }
 
@@ -137,51 +279,133 @@ private struct FlightRow: View {
     var body: some View {
         HStack(spacing: 10) {
             FlightBadge(f: f, size: 28)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(f.displayNumber).font(.headline)
-                    if let r = f.route {
-                        Text("\(r.from.code) → \(r.to.code)").foregroundStyle(.secondary)
-                    }
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 5) {
+                    Text(f.displayNumber).font(.headline).lineLimit(1)
+                    if FlightRowText.emergency(f) != nil, let squawk = f.squawk { SquawkBadge(code: squawk) }
                 }
-                Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(FlightRowText.subtitle(f))
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            Spacer(minLength: 4)
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(o.altitude(f.altitude) + (f.climbSymbol.isEmpty ? "" : " \(f.climbSymbol)"))
-                Text("\(o.distance(f.distance)) \(f.direction)").font(.caption).foregroundStyle(.secondary)
+            .layoutPriority(1)
+            Spacer(minLength: 6)
+            VStack(alignment: .trailing, spacing: 1) {
+                HStack(spacing: 3) {
+                    Text(o.altitude(f.altitude))
+                    ClimbGlyph(state: ClimbState(verticalRate: f.verticalRate))
+                }
+                Text("\(o.distance(f.distance)) \(f.direction)")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .padding(.trailing, ClimbGlyph.width + 3)
             }
             .monospacedDigit()
+            .lineLimit(1)
+            .fixedSize()
         }
-        .padding(.vertical, 2)
-        .accessibilityElement(children: .combine)
-    }
-
-    private var subtitle: String {
-        [f.airlineName, f.typeCode].filter { !$0.isEmpty }.joined(separator: " · ")
+        .padding(.vertical, 3)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(FlightRowText.accessibilityLabel(f))
+        .accessibilityValue(FlightRowText.accessibilityValue(f, units: o.units))
+        .accessibilityAction(named: "Open Details") { FlightDetail.show(hex: f.id, snapshot: f) }
     }
 }
 
-/// The airline logo, or the aircraft's class symbol when there's no logo to show.
+/// Climb/descent arrow in a fixed-width slot, so altitudes line up whether or not one is shown.
+private struct ClimbGlyph: View {
+    static let width: CGFloat = 9
+    let state: ClimbState
+
+    var body: some View {
+        Group {
+            switch state {
+            case .climbing: Image(systemName: "arrow.up")
+            case .descending: Image(systemName: "arrow.down")
+            case .level: Color.clear
+            }
+        }
+        .font(.system(size: 9, weight: .bold))
+        .foregroundStyle(.secondary)
+        .frame(width: Self.width)
+        .accessibilityHidden(true)
+    }
+}
+
+/// A red "7700" pill for emergency squawks.
+private struct SquawkBadge: View {
+    let code: String
+    var body: some View {
+        Text(code)
+            .font(.caption2.weight(.bold))
+            .monospacedDigit()
+            .foregroundStyle(.white)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(Color.red))
+            .accessibilityHidden(true)
+    }
+}
+
+/// The airline logo, or a neutral disc with the aircraft's class symbol, always the same size so
+/// rows line up.
 private struct FlightBadge: View {
     let f: Flight
     let size: CGFloat
     @Environment(\.displayOptions) private var o
+    @Environment(\.colorScheme) private var scheme
+
+    /// True when the cached logo reads well at badge size (not a wide wordmark, not too dark).
+    private func isLegible(_ image: NSImage) -> Bool {
+        guard let url = AirlineLogos.file(for: f.logoKey?.id) else { return false }
+        if case .logo = FlightMarkKind.resolve(f, logo: url, logoSize: image.size,
+                                               brightness: LogoTone.brightness(of: image, at: url),
+                                               darkBackground: scheme == .dark) { return true }
+        return false
+    }
 
     var body: some View {
         Group {
-            if o.showLogos, AirlineLogos.file(for: f.logoKey?.id) != nil {
-                AirlineLogo(code: f.logoKey?.id, size: size)
+            if o.showLogos, let image = LogoCache.image(for: f.logoKey?.id) {
+                if isLegible(image) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                } else {
+                    // Wordmarks and dark logos become the shared airline-code tile.
+                    FlightMark(flight: f, size: size)
+                }
             } else {
                 let kind = AircraftClass(typeCode: f.typeCode)
-                Image(systemName: kind.symbol)
-                    .font(.system(size: size * 0.5 * kind.iconScale, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .rotationEffect(.degrees(kind == .rotorcraft ? 0 : -45))
+                Circle()
+                    .fill(.quaternary)
+                    .overlay {
+                        Image(systemName: kind.symbol)
+                            .font(.system(size: size * 0.42 * min(1.15, kind.iconScale + 0.15), weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(kind == .rotorcraft ? 0 : -45))
+                    }
             }
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
+    }
+}
+
+/// Decoded airline logos, so list rows don't read and decode PNGs on every refresh.
+/// Misses aren't remembered: a logo can arrive on disk at any time.
+@MainActor
+private enum LogoCache {
+    private static var images: [String: NSImage] = [:]
+
+    static func image(for code: String?) -> NSImage? {
+        guard let code, !code.isEmpty else { return nil }
+        if let image = images[code] { return image }
+        guard let url = AirlineLogos.file(for: code), let image = NSImage(contentsOf: url) else { return nil }
+        images[code] = image
+        return image
     }
 }
 
@@ -190,65 +414,163 @@ private struct FlightBadge: View {
 private struct RadarMap: View {
     @ObservedObject var radar: RadarModel
     let radiusNM: Int
-    @State private var camera: MapCameraPosition = .automatic
+    /// Passed so the map redraws when the location changes.
+    let placeName: String
+    let locationStatus: String
+    @State private var camera: MapCameraPosition
+    @State private var region: MKCoordinateRegion?
+    @State private var mapSize: CGSize = .zero
+    @State private var labelled: Set<String> = []
+    @State private var hovered: String?
     @Environment(\.displayOptions) private var o
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(radar: RadarModel, radiusNM: Int, placeName: String, locationStatus: String) {
+        self.radar = radar
+        self.radiusNM = radiusNM
+        self.placeName = placeName
+        self.locationStatus = locationStatus
+        _camera = State(initialValue: radar.mapRegion.map { .region($0) } ?? .automatic)
+        _region = State(initialValue: radar.mapRegion)
+    }
+
     private var observer: GeoPoint? { Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) } }
 
     private var framingKey: String {
         "\(observer.map { "\($0.lat),\($0.lon)" } ?? "")|\(radiusNM)"
     }
 
+    private var motion: Animation? { reduceMotion ? nil : .default }
+
     var body: some View {
+        let selected = radar.flights.first { $0.id == radar.selection }
         Map(position: $camera, interactionModes: [.pan, .zoom]) {
             if let observer {
                 // A polygon, not MapCircle: MapCircle stopped the map rendering tiles while on screen.
                 MapPolygon(coordinates: FlightMath.removingRepeats(FlightMath.circle(around: observer, radiusNM: Double(radiusNM)))
                     .map(coordinate))
-                    .foregroundStyle(Color.blue.opacity(0.05))
-                    .stroke(Color.blue.opacity(0.6), lineWidth: 1.5)
+                    .foregroundStyle(Color.blue.opacity(0.04))
+                    .stroke(Color.blue.opacity(0.55), lineWidth: 1.5)
                 Annotation("", coordinate: CLLocationCoordinate2D(latitude: observer.lat + Double(radiusNM) / 60,
                                                                   longitude: observer.lon), anchor: .center) {
                     Text(o.radius(radiusNM))
                         .font(.caption2.weight(.semibold))
+                        .monospacedDigit()
                         .foregroundStyle(.white)
                         .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.blue.opacity(0.8)))
+                        .background(Capsule().fill(Color.blue.opacity(0.85)))
+                        .accessibilityLabel("Search radius \(o.radius(radiusNM))")
                 }
+                .annotationTitles(.hidden)
                 Annotation("You", coordinate: coordinate(observer), anchor: .center) {
                     Circle()
                         .fill(Color.blue)
                         .frame(width: 12, height: 12)
                         .overlay(Circle().stroke(.white, lineWidth: 2))
                         .shadow(radius: 1)
+                        .accessibilityLabel("Your location")
+                }
+            }
+            if let selected {
+                let path = FlightMath.removingRepeats(radar.trail + [selected.geoPoint])
+                if path.count > 1 {
+                    MapPolyline(coordinates: path.map(coordinate))
+                        .stroke(Color.accentColor.opacity(0.8), style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round))
                 }
             }
             // The selected aircraft is drawn last so it sits on top.
             ForEach(radar.flights.filter { $0.id != radar.selection }) { aircraft($0, selected: false) }
-            if let f = radar.flights.first(where: { $0.id == radar.selection }) { aircraft(f, selected: true) }
+            if let selected { aircraft(selected, selected: true) }
         }
-        .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+        .mapStyle(.standard(elevation: .flat, emphasis: .muted, pointsOfInterest: .excludingAll))
         .mapControls {
             MapZoomStepper()
-            MapCompass()
             MapScaleView()
         }
-        .overlay(alignment: .topLeading) {
-            if observer != nil {
-                Button(action: frameRadius) { Image(systemName: "location.circle") }
-                    .help("Center on your location")
-                    .padding(10)
+        .onMapCameraChange(frequency: .onEnd) { context in
+            region = context.region
+            radar.mapRegion = context.region
+            relabel()
+        }
+        .background {
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { mapSize = geo.size; relabel() }
+                    .onChange(of: geo.size) { _, size in mapSize = size; relabel() }
             }
         }
-        .onChange(of: framingKey, initial: true) { frameRadius() }
+        .overlay(alignment: .topLeading) {
+            if observer != nil { recenterButton.padding(10) }
+        }
+        .overlay(alignment: .top) { MapStatusBanner(feed: radar.feed, hasFlights: !radar.flights.isEmpty, radius: o.radius(radiusNM)).padding(.top, 10) }
+        .overlay {
+            if observer == nil { NoLocationCard(store: radar.store, status: locationStatus) }
+        }
+        .onChange(of: framingKey, initial: true) {
+            guard radar.framedKey != framingKey else { return }
+            radar.framedKey = framingKey
+            frameRadius()
+        }
+        .onChange(of: radar.recenterRequests) { frameRadius() }
+        .onChange(of: radar.flights) { relabel() }
+        .onChange(of: radar.selection) { _, id in
+            relabel()
+            reveal(id)
+        }
+    }
+
+    private var recenterButton: some View {
+        Button(action: frameRadius) {
+            Image(systemName: "location")
+                .font(.system(size: 13, weight: .medium))
+                .frame(width: 30, height: 30)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(.separator, lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.15), radius: 2, y: 1)
+        .help("Center on your location (⌘L)")
+        .accessibilityLabel("Center on your location")
     }
 
     private func aircraft(_ f: Flight, selected: Bool) -> some MapContent {
-        Annotation("", coordinate: coordinate(f.geoPoint), anchor: .center) {
-            AircraftMarker(f: f, selected: selected)
-                .onTapGesture(count: 2) { FlightDetail.show(hex: f.id, snapshot: f) }
+        Annotation(f.displayNumber, coordinate: coordinate(f.geoPoint), anchor: .center) {
+            AircraftMarker(f: f, selected: selected, showsLabel: selected || labelled.contains(f.id) || hovered == f.id)
                 .onTapGesture { radar.selection = f.id }
+                .simultaneousGesture(TapGesture(count: 2).onEnded { radar.open(f) })
+                .onHover { inside in
+                    if inside { hovered = f.id } else if hovered == f.id { hovered = nil }
+                }
+                .contextMenu { FlightMenu(f: f, radar: radar) }
+                .accessibilityAction { radar.selection = f.id }
+                .accessibilityAction(named: "Open Details") { radar.open(f) }
         }
         .annotationTitles(.hidden)
+    }
+
+    /// Picks which aircraft get labels for the current camera, keeping the previous ones where possible.
+    private func relabel() {
+        guard let r = region, mapSize.width > 0, mapSize.height > 0 else {
+            labelled = radar.selection.map { [$0] } ?? []
+            return
+        }
+        let viewport = MapLabelLayout.Viewport(center: GeoPoint(lat: r.center.latitude, lon: r.center.longitude),
+                                               latitudeDelta: r.span.latitudeDelta, longitudeDelta: r.span.longitudeDelta,
+                                               size: mapSize)
+        let items = radar.flights.sorted { $0.distance < $1.distance }
+            .map { MapLabelLayout.Item(id: $0.id, point: $0.geoPoint, text: $0.displayNumber) }
+        let next = MapLabelLayout.labelled(items, in: viewport, pinned: radar.selection, prefer: labelled)
+        if next != labelled { labelled = next }
+    }
+
+    /// Pans (keeping the zoom) to an aircraft selected in the list when it's off screen.
+    private func reveal(_ id: Flight.ID?) {
+        guard let id, let f = radar.flights.first(where: { $0.id == id }), let r = region else { return }
+        let inside = abs(f.lat - r.center.latitude) < r.span.latitudeDelta * 0.42
+            && abs(f.lon - r.center.longitude) < r.span.longitudeDelta * 0.42
+        guard !inside else { return }
+        withAnimation(motion) { camera = .region(MKCoordinateRegion(center: coordinate(f.geoPoint), span: r.span)) }
     }
 
     /// Fits the search-radius circle around the user.
@@ -256,7 +578,7 @@ private struct RadarMap: View {
         guard let observer else { return }
         let d = Double(radiusNM) / 60 * 1.15
         let span = MKCoordinateSpan(latitudeDelta: d * 2, longitudeDelta: d * 2 / max(0.2, cos(observer.lat * .pi / 180)))
-        withAnimation { camera = .region(MKCoordinateRegion(center: coordinate(observer), span: span)) }
+        withAnimation(motion) { camera = .region(MKCoordinateRegion(center: coordinate(observer), span: span)) }
     }
 
     private func coordinate(_ p: GeoPoint) -> CLLocationCoordinate2D {
@@ -264,34 +586,142 @@ private struct RadarMap: View {
     }
 }
 
-/// An aircraft on the radar map: its class symbol rotated to its track, labelled with its flight number.
+/// An aircraft on the radar map: its class symbol rotated to its track, optionally labelled with
+/// its flight number. The icon is always centred on the aircraft's position.
 private struct AircraftMarker: View {
     let f: Flight
     let selected: Bool
+    let showsLabel: Bool
+    @Environment(\.displayOptions) private var o
+
+    private static let labelHeight: CGFloat = 14
+    private var halo: Color { Color(nsColor: .windowBackgroundColor) }
 
     var body: some View {
-        let kind = AircraftClass(typeCode: f.typeCode)
-        VStack(spacing: 1) {
-            Image(systemName: kind.symbol)
-                .font(.system(size: (selected ? 24 : 16) * kind.iconScale, weight: .semibold))
-                .foregroundStyle(selected ? Color.accentColor : f.looksLikeAirline ? Color.primary : Color.secondary)
-                // The symbol points east; the map is always north-up.
-                .rotationEffect(.degrees(kind == .rotorcraft ? 0 : (f.track ?? 90) - 90))
-                .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
-            Text(f.displayNumber)
-                .font(.system(size: selected ? 11 : 9, weight: selected ? .bold : .medium))
-                .foregroundStyle(selected ? Color.white : Color.primary)
-                .padding(.horizontal, selected ? 5 : 0)
-                .background {
-                    if selected { Capsule().fill(Color.accentColor) }
-                }
-                .shadow(color: selected ? .clear : Color(nsColor: .windowBackgroundColor), radius: 1)
+        VStack(spacing: 0) {
+            // Mirrors the label so the icon stays at the annotation's centre.
+            if showsLabel { Color.clear.frame(height: Self.labelHeight) }
+            icon
+            if showsLabel { label.frame(height: Self.labelHeight) }
         }
-        .contentShape(Rectangle())
-        .help("\(f.displayNumber) — double-click for details")
+        .fixedSize()
+        .help(helpText)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(f.displayNumber)
+        .accessibilityLabel(FlightRowText.accessibilityLabel(f))
+        .accessibilityValue(FlightRowText.accessibilityValue(f, units: o.units))
         .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private var kind: AircraftClass { AircraftClass(typeCode: f.typeCode) }
+    private var isEmergency: Bool { FlightRowText.emergency(f) != nil }
+
+    /// The symbol points east; the map is always north-up.
+    private var rotation: Angle { .degrees(kind == .rotorcraft ? 0 : (f.track ?? 90) - 90) }
+
+    @ViewBuilder
+    private var icon: some View {
+        if selected {
+            Image(systemName: kind.symbol)
+                .font(.system(size: min(20, 16 * kind.iconScale), weight: .bold))
+                .foregroundStyle(.white)
+                .rotationEffect(rotation)
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(isEmergency ? Color.red : Color.accentColor))
+                .overlay(Circle().strokeBorder(.white, lineWidth: 2))
+                .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
+                .contentShape(Circle())
+        } else {
+            Image(systemName: kind.symbol)
+                .font(.system(size: 15 * kind.iconScale, weight: .semibold))
+                .foregroundStyle(isEmergency ? Color.red : f.looksLikeAirline ? Color.primary : Color.primary.opacity(0.7))
+                .rotationEffect(rotation)
+                .shadow(color: halo, radius: 1)
+                .shadow(color: halo, radius: 1)
+                .frame(width: 26, height: 26)
+                .contentShape(Circle())
+        }
+    }
+
+    @ViewBuilder
+    private var label: some View {
+        if selected {
+            Text(f.displayNumber)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 5)
+                .background(Capsule().fill(isEmergency ? Color.red : Color.accentColor))
+                .contentShape(Rectangle())
+        } else {
+            Text(f.displayNumber)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(isEmergency ? Color.red : Color.primary)
+                .shadow(color: halo, radius: 1)
+                .shadow(color: halo, radius: 1)
+                .contentShape(Rectangle())
+        }
+    }
+
+    private var helpText: String {
+        let detail = [FlightRowText.subtitle(f), o.altitude(f.altitude)].filter { !$0.isEmpty }.joined(separator: " · ")
+        return "\(f.displayNumber) — \(detail)\nDouble-click for details"
+    }
+}
+
+/// A capsule at the top of the map for loading, offline and empty states.
+private struct MapStatusBanner: View {
+    let feed: RadarFeedState
+    let hasFlights: Bool
+    let radius: String
+
+    var body: some View {
+        Group {
+            switch feed {
+            case .loading where !hasFlights:
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Looking for aircraft…")
+                }
+            case .offline:
+                Label(hasFlights ? "Can’t reach flight data · positions are estimated" : "Can’t reach flight data · retrying",
+                      systemImage: "wifi.exclamationmark")
+            case .empty:
+                Label("No aircraft within \(radius) right now", systemImage: "airplane")
+            default:
+                EmptyView()
+            }
+        }
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background {
+            if feed != .live && !(feed == .loading && hasFlights) && feed != .noLocation {
+                Capsule().fill(.regularMaterial).shadow(color: .black.opacity(0.15), radius: 3, y: 1)
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Shown over the map until a location is set.
+private struct NoLocationCard: View {
+    let store: LiveStore
+    let status: String
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("Set Your Location", systemImage: "location.slash")
+        } description: {
+            Text(status.isEmpty ? "FlightDesk shows the aircraft flying around the place you choose." : status)
+        } actions: {
+            Button("Use Current Location") { store.requestCurrentLocation() }
+                .buttonStyle(.borderedProminent)
+            Button("Choose a Place…") { (NSApp.delegate as? AppDelegate)?.openSettings(tab: .general) }
+        }
+        .frame(maxWidth: 380)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .shadow(color: .black.opacity(0.2), radius: 12, y: 4)
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 
@@ -303,53 +733,96 @@ private struct FlightInspector: View {
 
     var body: some View {
         if let f = radar.selected {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    header(f)
-                    if let r = f.route { route(r, f) }
-                    facts(f)
+            VStack(spacing: 0) {
+                header(f)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
+                Form {
                     if !radar.flights.contains(where: { $0.id == f.id }) {
-                        Label("Out of range — last known position", systemImage: "exclamationmark.triangle")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
+                        Section {
+                            Label("Out of range — last known position", systemImage: "exclamationmark.triangle")
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                    Button { FlightDetail.show(hex: f.id, snapshot: f) } label: {
-                        Text("Open Details").frame(maxWidth: .infinity)
+                    if let r = f.route { Section("Route") { route(r, f) } }
+                    Section("Flight") {
+                        fact("Altitude", o.altitude(f.altitude))
+                        fact("Vertical Speed", FlightRowText.verticalSpeed(f.verticalRate, units: o.units))
+                        fact("Ground Speed", o.speed(f.speed))
+                        fact("Track", f.track.map { "\(Int($0.rounded()))° \(FlightMath.compassPoint($0))" } ?? "—")
+                        if let squawk = f.squawk {
+                            LabeledContent("Squawk") {
+                                Text(FlightRowText.emergency(f).map { "\(squawk) · \($0)" } ?? squawk)
+                                    .monospacedDigit()
+                                    .foregroundStyle(FlightRowText.emergency(f) == nil ? Color.primary : Color.red)
+                                    .textSelection(.enabled)
+                            }
+                        }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
+                    Section("From You") {
+                        fact("Distance", o.distance(f.distance))
+                        fact("Direction", "\(FlightMath.compassPoint(f.bearing)) · \(Int(f.bearing.rounded()))°")
+                    }
+                    Section("Aircraft") {
+                        if let model = f.aircraft?.model, !model.isEmpty { fact("Model", model) }
+                        fact("Type", f.typeCode.isEmpty ? "—" : f.typeCode)
+                        fact("Registration", f.reg)
+                        if !f.callsign.isEmpty && f.callsign != f.displayNumber { fact("Callsign", f.callsign) }
+                        fact("ICAO Hex", f.id.uppercased())
+                    }
                 }
-                .padding()
+                .formStyle(.grouped)
+                .scrollContentBackground(.hidden)
+                Divider()
+                Button { radar.open(f) } label: {
+                    Text("Open Details").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .help("Show the full flight detail (Return)")
+                .padding(12)
             }
         } else {
-            ContentUnavailableView("No Selection", systemImage: "airplane", description: Text("Select a flight in the list or on the map."))
+            ContentUnavailableView("No Selection", systemImage: "airplane",
+                                   description: Text("Select an aircraft in the list or on the map."))
         }
     }
 
     private func header(_ f: Flight) -> some View {
         HStack(spacing: 12) {
-            FlightBadge(f: f, size: 44)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(f.displayNumber).font(.title2.bold())
-                Text(f.airlineName.isEmpty ? (f.looksLikeAirline ? f.callsign : "Private / general aviation") : f.airlineName)
+            FlightBadge(f: f, size: 40)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(FlightRowText.operatorName(f))
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(1)
+                Text(f.displayNumber)
+                    .font(.title2.weight(.bold))
+                    .lineLimit(1)
+                    .textSelection(.enabled)
             }
+            Spacer(minLength: 0)
         }
+        .accessibilityElement(children: .combine)
     }
 
     private func route(_ r: RouteInfo, _ f: Flight) -> some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 airport(r.from, alignment: .leading)
                 Spacer()
                 airport(r.to, alignment: .trailing)
             }
-            RouteLine(iconSize: 14, progress: f.progress)
-            if let p = f.progress {
-                Text("\(Int((p * 100).rounded()))% of the way").font(.caption).foregroundStyle(.secondary)
-            }
+            RouteLine(iconSize: 12, progress: f.progress)
+            let flown = FlightService.gcDistance(r.from.lat, r.from.lon, f.lat, f.lon)
+            let left = FlightService.gcDistance(f.lat, f.lon, r.to.lat, r.to.lon)
+            Text("\(o.distance(flown)) flown · \(o.distance(left)) to go")
+                .font(.caption)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .padding(.vertical, 2)
     }
 
     private func airport(_ a: Airport, alignment: HorizontalAlignment) -> some View {
@@ -357,33 +830,12 @@ private struct FlightInspector: View {
             Text(a.code).font(.title3.weight(.semibold))
             Text(a.city).font(.caption).foregroundStyle(.secondary).lineLimit(1)
         }
-    }
-
-    private func facts(_ f: Flight) -> some View {
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 6) {
-            fact("Altitude", o.altitude(f.altitude) + climb(f))
-            fact("Speed", o.speed(f.speed))
-            fact("Track", f.track.map { "\(Int($0.rounded()))° \(FlightMath.compassPoint($0))" } ?? "—")
-            Divider().gridCellUnsizedAxes(.horizontal)
-            fact("Aircraft", f.aircraft?.model ?? (f.typeCode.isEmpty ? "—" : f.typeCode))
-            fact("Type", f.typeCode.isEmpty ? "—" : f.typeCode)
-            fact("Registration", f.reg)
-            if !f.callsign.isEmpty { fact("Callsign", f.callsign) }
-            Divider().gridCellUnsizedAxes(.horizontal)
-            fact("Distance", o.distance(f.distance))
-            fact("Direction", "\(FlightMath.compassPoint(f.bearing)) of you (\(Int(f.bearing.rounded()))°)")
-        }
-        .font(.callout)
+        .accessibilityElement(children: .combine)
     }
 
     private func fact(_ label: String, _ value: String) -> some View {
-        GridRow {
-            Text(label).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
-            Text(value).textSelection(.enabled).monospacedDigit()
+        LabeledContent(label) {
+            Text(value).monospacedDigit().textSelection(.enabled)
         }
-    }
-
-    private func climb(_ f: Flight) -> String {
-        f.verticalRate > 300 ? " · climbing" : f.verticalRate < -300 ? " · descending" : ""
     }
 }

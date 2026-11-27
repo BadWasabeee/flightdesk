@@ -2,16 +2,30 @@ import Cocoa
 import Combine
 import SwiftUI
 
-/// Flight detail window (map + flight info), opened from the widget via `FlightLink`.
-/// Contract: `FlightDetail.show(hex:snapshot:)` opens (or focuses) a window for the aircraft with that ICAO hex.
+/// Entry point for showing an aircraft's details.
+/// Contract: `FlightDetail.show(hex:snapshot:)` presents details for the aircraft with that ICAO hex:
+/// in the main window when a `presenter` is installed, otherwise in a separate window.
 @MainActor
 enum FlightDetail {
+    /// When set (by the main window), `show` presents details there instead of opening a window.
+    static var presenter: (@MainActor (String, Flight?) -> Void)?
+
     /// Open windows by lowercase hex; an entry is removed when its window closes.
     private static var controllers: [String: FlightDetailWindowController] = [:]
 
-    /// Shows the detail window for `hex`, creating it if needed. `snapshot` fills a new window
-    /// immediately while live data loads; it is ignored when the window already exists.
+    /// Shows details for `hex` via the `presenter` when one is installed, else in a window.
+    /// `snapshot` fills the view immediately while live data loads.
     static func show(hex: String, snapshot: Flight? = nil) {
+        if let presenter {
+            presenter(hex.lowercased(), snapshot)
+        } else {
+            showInNewWindow(hex: hex, snapshot: snapshot)
+        }
+    }
+
+    /// Shows the separate detail window for `hex`, creating it if needed. `snapshot` is ignored
+    /// when the window already exists.
+    static func showInNewWindow(hex: String, snapshot: Flight? = nil) {
         let key = hex.lowercased()
         let controller: FlightDetailWindowController
         if let existing = controllers[key] {
@@ -38,18 +52,43 @@ enum FlightDetail {
     }
 }
 
-/// The aircraft a detail window is showing. Clicking another plane on the map switches it.
+/// The aircraft a detail window is showing, with Back/Forward history. Clicking another plane
+/// on the map switches it in place.
 @MainActor
 final class FlightDetailNavigator: ObservableObject {
     @Published private(set) var model: FlightDetailModel
+    @Published private(set) var backStack: [Flight] = []
+    @Published private(set) var forwardStack: [Flight] = []
     var onSwitch: ((FlightDetailModel) -> Void)?
+    private static let historyLimit = 30
 
     init(hex: String, snapshot: Flight?) {
         model = FlightDetailModel(hex: hex, snapshot: snapshot)
     }
 
     func select(_ flight: Flight) {
-        guard flight.id != model.hex else { return }
+        guard flight.id.lowercased() != model.hex else { return }
+        if let current = model.flight {
+            backStack.append(current)
+            if backStack.count > Self.historyLimit { backStack.removeFirst() }
+        }
+        forwardStack.removeAll()
+        show(flight)
+    }
+
+    func goBack() {
+        guard let previous = backStack.popLast() else { return }
+        if let current = model.flight { forwardStack.append(current) }
+        show(previous)
+    }
+
+    func goForward() {
+        guard let next = forwardStack.popLast() else { return }
+        if let current = model.flight { backStack.append(current) }
+        show(next)
+    }
+
+    private func show(_ flight: Flight) {
         model.stop()
         // Keep the other aircraft (and the one being left) on the map while the new one loads.
         let others = model.nearby + [model.flight].compactMap { $0 }
@@ -61,10 +100,23 @@ final class FlightDetailNavigator: ObservableObject {
 
 private struct FlightDetailRoot: View {
     @ObservedObject var navigator: FlightDetailNavigator
+
     var body: some View {
+        // No `.id`: the map persists and glides to the new aircraft; the sidebar crossfades.
         FlightDetailView(model: navigator.model)
-            .id(navigator.model.hex)
             .environment(\.openFlightDetail) { navigator.select($0) }
+            .toolbar {
+                ToolbarItemGroup(placement: .navigation) {
+                    Button(action: navigator.goBack) { Label("Back", systemImage: "chevron.backward") }
+                        .help(navigator.backStack.last.map { "Back to \($0.displayNumber)" } ?? "Back")
+                        .keyboardShortcut("[", modifiers: .command)
+                        .disabled(navigator.backStack.isEmpty)
+                    Button(action: navigator.goForward) { Label("Forward", systemImage: "chevron.forward") }
+                        .help(navigator.forwardStack.last.map { "Forward to \($0.displayNumber)" } ?? "Forward")
+                        .keyboardShortcut("]", modifiers: .command)
+                        .disabled(navigator.forwardStack.isEmpty)
+                }
+            }
     }
 }
 
@@ -78,13 +130,17 @@ private final class FlightDetailWindowController: NSWindowController, NSWindowDe
 
     init(hex: String, snapshot: Flight?) {
         navigator = FlightDetailNavigator(hex: hex, snapshot: snapshot)
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 600),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 640),
                               styleMask: [.titled, .closable, .resizable, .miniaturizable],
                               backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
+        window.toolbarStyle = .unified
         window.contentMinSize = NSSize(width: 620, height: 420)
-        window.contentViewController = NSHostingController(rootView: FlightDetailRoot(navigator: navigator))
-        window.setContentSize(NSSize(width: 860, height: 600))
+        let host = NSHostingController(rootView: FlightDetailRoot(navigator: navigator))
+        // Bridge the Back/Forward toolbar items into the window; the title is set below.
+        host.sceneBridgingOptions = [.toolbars]
+        window.contentViewController = host
+        window.setContentSize(NSSize(width: 920, height: 640))
         window.center()
         super.init(window: window)
         window.delegate = self
@@ -102,9 +158,12 @@ private final class FlightDetailWindowController: NSWindowController, NSWindowDe
     private func observeTitle(of model: FlightDetailModel) {
         let hex = model.hex
         titleSubscription = model.$flight
-            .map { FlightDetailModel.title(for: $0, hex: hex) }
-            .removeDuplicates()
-            .sink { [weak window] in window?.title = $0 }
+            .map { (FlightDetailModel.title(for: $0, hex: hex), FlightDetailModel.subtitle(for: $0)) }
+            .removeDuplicates { $0 == $1 }
+            .sink { [weak window] title, subtitle in
+                window?.title = title
+                window?.subtitle = subtitle
+            }
     }
 
     func windowWillClose(_ notification: Notification) {

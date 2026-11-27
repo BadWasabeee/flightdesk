@@ -52,7 +52,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     func refresh() async {
         guard let loc = Shared.location else {
-            model.status = "No location — open Settings"
+            model.status = "No location set — open Settings"
             return
         }
         do {
@@ -65,7 +65,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             model = m
             onFlights?(flights)
         } catch {
-            model.status = "Can't reach flight data — retrying"
+            model.status = "Can’t reach flight data — retrying"
         }
     }
 
@@ -120,7 +120,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     func setManualLocation(_ text: String) async -> Bool {
         locationStatus = "Searching…"
         guard let r = await FlightService.resolve(text) else {
-            locationStatus = "Couldn't find “\(text)”. Try coordinates, e.g. 39.74, -104.99"
+            locationStatus = "Couldn’t find “\(text)”. Try a nearby city, an airport code or coordinates like 39.74, -104.99."
             return false
         }
         setLocation(lat: r.lat, lon: r.lon, name: r.name)
@@ -132,7 +132,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
         switch locationManager.authorizationStatus {
         case .notDetermined: locationManager.requestWhenInUseAuthorization()
         case .denied, .restricted:
-            locationStatus = "Location access is off for FlightDesk (System Settings › Privacy & Security › Location Services)."
+            locationStatus = "Location access is off for FlightDesk. Turn it on in System Settings, or search for a place."
         default: locationManager.requestLocation()
         }
     }
@@ -141,7 +141,7 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
         Task { @MainActor in
             switch manager.authorizationStatus {
             case .authorizedAlways, .authorized: manager.requestLocation()
-            case .denied, .restricted: self.locationStatus = "Location access denied — enter a place instead."
+            case .denied, .restricted: self.locationStatus = "Location access is off for FlightDesk. Turn it on in System Settings, or search for a place."
             default: break
             }
         }
@@ -156,6 +156,6 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        Task { @MainActor in self.locationStatus = "Couldn't get your location — enter a place instead." }
+        Task { @MainActor in self.locationStatus = "Couldn’t get this Mac’s location. Search for a place instead." }
     }
 }

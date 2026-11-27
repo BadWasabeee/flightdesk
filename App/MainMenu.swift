@@ -25,7 +25,9 @@ enum MainMenu {
         appMenu.addItem(item("Quit \(name)", #selector(NSApplication.terminate(_:)), "q"))
 
         let file = submenu(of: main, "File")
-        file.addItem(item("New Window", #selector(MainWindowController.showWindow(_:)), "n", target: window))
+        file.addItem(item("Open Details", #selector(MainWindowController.openSelectedDetails(_:)), "o", target: window))
+        file.addItem(item("Open in New Window", #selector(MainWindowController.openSelectedInNewWindow(_:)), "o",
+                          [.command, .option], target: window))
         file.addItem(.separator())
         file.addItem(item("Close", #selector(NSWindow.performClose(_:)), "w"))
 
@@ -38,18 +40,38 @@ enum MainMenu {
         edit.addItem(item("Paste", #selector(NSText.paste(_:)), "v"))
         edit.addItem(item("Delete", #selector(NSText.delete(_:))))
         edit.addItem(item("Select All", #selector(NSText.selectAll(_:)), "a"))
+        edit.addItem(.separator())
+        edit.addItem(item("Find…", #selector(MainWindowController.focusSearch(_:)), "f", target: window))
 
         let view = submenu(of: main, "View")
+        view.addItem(item("Back", #selector(MainWindowController.goBack(_:)), "[", target: window))
+        view.addItem(.separator())
+        let sortBy = NSMenu(title: "Sort By")
+        for (i, sort) in FlightSort.allCases.enumerated() {
+            let entry = item(sort.title, #selector(MainWindowController.setSort(_:)), target: window)
+            entry.tag = i
+            sortBy.addItem(entry)
+        }
+        view.addItem(withTitle: "Sort By", action: nil, keyEquivalent: "").submenu = sortBy
+        view.addItem(item("Airlines Only", #selector(MainWindowController.toggleAirlinesOnly(_:)), target: window))
+        view.addItem(.separator())
+        view.addItem(item("Center on My Location", #selector(MainWindowController.recenter(_:)), "l", target: window))
         view.addItem(item("Refresh", #selector(MainWindowController.refresh(_:)), "r", target: window))
+        view.addItem(.separator())
         view.addItem(item("Hide Sidebar", #selector(MainWindowController.toggleFlightList(_:)), "s", [.command, .control], target: window))
+        // AppKit retitles this "Exit Full Screen" as needed.
+        view.addItem(item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control]))
 
         let windows = submenu(of: main, "Window")
         windows.addItem(item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"))
         windows.addItem(item("Zoom", #selector(NSWindow.performZoom(_:))))
         windows.addItem(.separator())
+        windows.addItem(item(name, #selector(MainWindowController.showWindow(_:)), "0", target: window))
+        windows.addItem(.separator())
         windows.addItem(item("Bring All to Front", #selector(NSApplication.arrangeInFront(_:))))
 
         let help = submenu(of: main, "Help")
+        help.addItem(item("Welcome to \(name)", #selector(AppDelegate.showWelcome), target: app))
         help.addItem(item("\(name) on GitHub", #selector(AppDelegate.openGitHub), target: app))
 
         NSApp.mainMenu = main

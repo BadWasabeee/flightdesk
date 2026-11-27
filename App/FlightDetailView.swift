@@ -3,7 +3,7 @@ import MapKit
 
 // MARK: - Model
 
-/// Live state for one aircraft's detail window. Polls adsb.lol while running and keeps the
+/// Live state for one aircraft's detail view. Polls adsb.lol while running and keeps the
 /// last known data when the aircraft stops being reported.
 @MainActor
 final class FlightDetailModel: ObservableObject {
@@ -11,27 +11,36 @@ final class FlightDetailModel: ObservableObject {
     /// Unit formatters from the user's settings, in the system (non-LED) style.
     let display: DisplayOptions
 
-    @Published private(set) var flight: Flight?
+    @Published private(set) var flight: Flight? { didSet { updatePaths() } }
     @Published private(set) var squawk: String?
     @Published private(set) var onGround = false
     /// True while the latest poll returned a fresh position.
     @Published private(set) var isLive = false
     /// When the most recent position was received, once a poll has returned one.
     @Published private(set) var lastSeen: Date?
-    /// Positions observed while the window has been open, oldest first.
-    @Published private(set) var trail: [TimedPoint] = []
+    /// Positions observed while the view has been showing this aircraft, oldest first.
+    @Published private(set) var trail: [TimedPoint] = [] { didSet { updatePaths() } }
     /// The flight's recorded track from OpenSky, when available.
-    @Published private(set) var history: [TimedPoint] = []
+    @Published private(set) var history: [TimedPoint] = [] { didSet { updatePaths() } }
     /// Departure airport read from the start of the recorded track.
     @Published private(set) var departedFrom: Airport?
+    /// When the recorded track left `departedFrom`.
+    @Published private(set) var departureTime: Date?
     /// How the shown route was worked out, when it isn't the verified scheduled route.
     @Published private(set) var routeNote: String?
+    /// True when the destination is a guess from the aircraft's descent.
+    @Published private(set) var destinationEstimated = false
     /// Other aircraft within the user's search radius.
     @Published private(set) var nearby: [Flight] = []
     /// The airframe photo, while loading and once found.
     @Published private(set) var photo: PhotoState = .loading(aspectRatio: 1.5)
     /// Year the airframe was built, when the live feed knows it.
     @Published private(set) var buildYear: Int?
+
+    /// Planned great-circle route, origin to destination (cached; recomputed when data changes).
+    private(set) var plannedPath: [GeoPoint] = []
+    /// Flown track (cached): the recorded track plus live positions since.
+    private(set) var flownPath: [GeoPoint] = []
 
     /// Progress of the airframe photo lookup.
     enum PhotoState {
@@ -56,15 +65,13 @@ final class FlightDetailModel: ObservableObject {
     private var candidateRoute: RouteInfo?
     private var aircraftInfo: AircraftInfo?
     private var enrichedCallsign: String?
-    private var poller: Task<Void, Never>?
-    private var nearbyPoller: Task<Void, Never>?
-    private var historyPoller: Task<Void, Never>?
-    private var photoTask: Task<Void, Never>?
+    private var tasks: [Task<Void, Never>] = []
+    private var lastPlannedKey = ""
 
     /// `nearby` seeds the map's other aircraft (when switching planes) until the next refresh.
     init(hex: String, snapshot: Flight?, nearby: [Flight] = []) {
-        self.hex = hex
-        self.nearby = nearby.filter { $0.id != hex }
+        self.hex = hex.lowercased()
+        self.nearby = nearby.filter { $0.id != hex.lowercased() }
         let settings = AppSettings.load()
         var display = settings.display
         display.style = .standard
@@ -74,47 +81,46 @@ final class FlightDetailModel: ObservableObject {
         flight = snapshot
         candidateRoute = snapshot?.route
         aircraftInfo = snapshot?.aircraft
+        squawk = snapshot?.squawk
         isLive = snapshot != nil
         // The snapshot can be minutes old, so it only stands in until the first live position.
         if let snapshot { trail = [TimedPoint(point: snapshot.geoPoint, time: .distantPast)] }
+        updatePaths()
     }
 
     deinit {
-        poller?.cancel()
-        nearbyPoller?.cancel()
-        historyPoller?.cancel()
-        photoTask?.cancel()
+        tasks.forEach { $0.cancel() }
     }
 
+    var isRunning: Bool { !tasks.isEmpty }
+
+    /// Starts polling. Safe to call repeatedly.
     func start() {
-        guard poller == nil else { return }
-        poller = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.poll()
-                try? await Task.sleep(for: Self.pollInterval)
-            }
-        }
-        nearbyPoller = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.pollNearby()
-                try? await Task.sleep(for: Self.nearbyInterval)
-            }
-        }
-        historyPoller = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(1))   // let the first live position arrive
-            while !Task.isCancelled {
-                await self?.pollHistory()
-                try? await Task.sleep(for: Self.historyInterval)
-            }
-        }
+        guard tasks.isEmpty else { return }
+        tasks.append(Self.loop(every: Self.pollInterval) { [weak self] in await self?.poll() != nil })
+        tasks.append(Self.loop(every: Self.nearbyInterval) { [weak self] in await self?.pollNearby() != nil })
+        tasks.append(Self.loop(every: Self.historyInterval, delay: .seconds(1)) { [weak self] in await self?.pollHistory() != nil })
         if case .loading = photo {
-            photoTask = Task { [weak self] in await self?.loadPhoto() }
+            tasks.append(Task { [weak self] in await self?.loadPhoto() })
         }
     }
 
+    /// Stops all polling. Any request already in flight is discarded when it returns.
     func stop() {
-        [poller, nearbyPoller, historyPoller, photoTask].forEach { $0?.cancel() }
-        poller = nil; nearbyPoller = nil; historyPoller = nil; photoTask = nil
+        tasks.forEach { $0.cancel() }
+        tasks.removeAll()
+    }
+
+    /// Runs `body` repeatedly until cancelled or until it returns false (the model is gone).
+    private static func loop(every interval: Duration, delay: Duration? = nil,
+                             _ body: @escaping @MainActor () async -> Bool) -> Task<Void, Never> {
+        Task { @MainActor in
+            if let delay { try? await Task.sleep(for: delay) }
+            while !Task.isCancelled {
+                guard await body() else { return }
+                try? await Task.sleep(for: interval)
+            }
+        }
     }
 
     /// Looks up the airframe photo (by hex, then registration) and downloads the image.
@@ -133,7 +139,6 @@ final class FlightDetailModel: ObservableObject {
         } else if !Task.isCancelled {
             photo = .unavailable
         }
-        photoTask = nil
     }
 
     private func pollNearby() async {
@@ -151,6 +156,7 @@ final class FlightDetailModel: ObservableObject {
         // A track that starts low began at the departure airport.
         if let start = track.points.first, (track.startAltitudeFt ?? .infinity) < 3_000 {
             departedFrom = AirportDB.nearest(to: start.point, within: 8)
+            departureTime = departedFrom == nil ? nil : start.time
         }
         if var f = flight {
             resolveRoute(&f)
@@ -162,6 +168,7 @@ final class FlightDetailModel: ObservableObject {
     /// recorded departure airport), else what the recorded track and descent imply.
     private func resolveRoute(_ f: inout Flight) {
         routeNote = nil
+        destinationEstimated = false
         let scheduled = candidateRoute
         if let r = scheduled, FlightService.isPlausible(r, for: f), departedFrom == nil || departedFrom?.code == r.from.code {
             f.route = r
@@ -173,14 +180,15 @@ final class FlightDetailModel: ObservableObject {
         }
         if let r = scheduled, r.from.code == origin.code {
             f.route = r
-            routeNote = "Departure confirmed by the flight’s track"
+            routeNote = "Origin confirmed by the recorded track."
         } else if let dest = AirportDB.likelyDestination(for: f), dest.code != origin.code {
             f.route = RouteInfo(airline: scheduled?.airline, flightNo: scheduled?.flightNo,
                                 airlineCode: scheduled?.airlineCode, from: origin, to: dest)
-            routeNote = "Departure from the flight’s track · destination estimated from its descent"
+            destinationEstimated = true
+            routeNote = "No scheduled route. Origin from the recorded track; destination estimated from the descent."
         } else {
             f.route = nil
-            routeNote = "Departure from the flight’s track"
+            routeNote = "No scheduled route. Origin from the recorded track."
         }
     }
 
@@ -190,6 +198,8 @@ final class FlightDetailModel: ObservableObject {
             report = try await FlightDetailService.report(hex: hex)
         } catch {
             fdLog.info("Detail poll for \(self.hex, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            // Don't claim "Live" forever while the network is down.
+            if let seen = lastSeen, -seen.timeIntervalSinceNow > Self.staleAfter { isLive = false }
             return
         }
         guard !Task.isCancelled else { return }
@@ -203,18 +213,19 @@ final class FlightDetailModel: ObservableObject {
             let previous = enrichedCallsign ?? flight?.callsign
             enrichedCallsign = f.callsign
             let lookup = await FlightDetailService.enrichment(for: f)
+            guard !Task.isCancelled else { return }
             // Keep the snapshot's route if a lookup fails for the same callsign.
             if lookup.route != nil || previous != f.callsign { candidateRoute = lookup.route }
             aircraftInfo = lookup.aircraft ?? aircraftInfo
-            guard !Task.isCancelled else { return }
         }
         f.aircraft = AircraftInfo(model: aircraftInfo?.model ?? f.aircraft?.model,
                                   owner: aircraftInfo?.owner ?? f.aircraft?.owner)
         resolveRoute(&f)
 
-        trail.removeAll { $0.time == .distantPast }
-        let moved = trail.last.map { FlightService.gcDistance($0.point.lat, $0.point.lon, f.lat, f.lon) >= 0.05 } ?? true
-        if moved { trail.append(TimedPoint(point: f.geoPoint, time: report.positionTime)) }
+        var newTrail = trail.filter { $0.time != .distantPast }
+        let moved = newTrail.last.map { FlightService.gcDistance($0.point.lat, $0.point.lon, f.lat, f.lon) >= 0.05 } ?? true
+        if moved { newTrail.append(TimedPoint(point: f.geoPoint, time: report.positionTime)) }
+        if newTrail != trail { trail = newTrail }
         flight = f
         squawk = report.squawk
         onGround = report.onGround
@@ -225,13 +236,14 @@ final class FlightDetailModel: ObservableObject {
 
     // MARK: Derived values
 
-    /// Window title, e.g. "DL1342 · SEA → JFK".
-    static func title(for f: Flight?, hex: String) -> String {
-        guard let f else { return hex.uppercased() }
-        let number = f.displayNumber.isEmpty ? hex.uppercased() : f.displayNumber
-        guard let r = f.route else { return number }
-        return "\(number) · \(r.from.code) → \(r.to.code)"
-    }
+    /// Title for a host window or navigation bar: the flight number (or callsign/registration).
+    static func title(for f: Flight?, hex: String) -> String { DetailFormat.title(for: f, hex: hex) }
+
+    /// Subtitle for a host: "LAS → MKE · Southwest Airlines" (may be empty).
+    static func subtitle(for f: Flight?) -> String { DetailFormat.subtitle(for: f) }
+
+    var title: String { Self.title(for: flight, hex: hex) }
+    var subtitle: String { Self.subtitle(for: flight) }
 
     var flownNM: Double? {
         guard let f = flight, let r = f.route else { return nil }
@@ -243,32 +255,40 @@ final class FlightDetailModel: ObservableObject {
         return FlightService.gcDistance(f.lat, f.lon, r.to.lat, r.to.lon)
     }
 
-    /// Time to destination at the current ground speed, while airborne and live.
-    var timeToGo: TimeInterval? {
-        guard isLive, !onGround, let f = flight, let left = remainingNM else { return nil }
-        return FlightMath.timeToGo(remainingNM: left, speedKT: f.speed)
+    /// Arrival state while live: landed, landing, or an estimate at the current ground speed.
+    var arrival: DetailFormat.Arrival? {
+        guard isLive, let f = flight, let left = remainingNM else { return nil }
+        return DetailFormat.arrival(remainingNM: left, speedKT: f.speed, altitudeFt: f.altitude,
+                                    verticalRate: f.verticalRate, onGround: onGround)
     }
 
-    /// Planned great-circle route, origin to destination.
-    var plannedPath: [GeoPoint] {
-        guard let r = flight?.route else { return [] }
-        return FlightMath.removingRepeats(FlightMath.greatCircle(from: r.from.geoPoint, to: r.to.geoPoint))
-    }
-
-    /// Flown track: the recorded track plus live positions since, or (without a recorded track)
-    /// a great circle from the origin to the first observed position, then the observed trail.
-    var flownPath: [GeoPoint] {
+    private func updatePaths() {
+        let r = flight?.route
+        let key = r.map { "\($0.from.code)>\($0.to.code)" } ?? ""
+        if key != lastPlannedKey {
+            lastPlannedKey = key
+            plannedPath = r.map { FlightMath.removingRepeats(FlightMath.greatCircle(from: $0.from.geoPoint, to: $0.to.geoPoint)) } ?? []
+        }
         // Merge by time so the line always runs through the aircraft's current position.
         let end = history.last?.time ?? .distantPast
         var points = history.map(\.point) + trail.filter { $0.time > end }.map(\.point)
         if let f = flight, points.last != f.geoPoint { points.append(f.geoPoint) }
-        if history.isEmpty, let r = flight?.route, let first = points.first {
+        // Without a recorded track, join the origin to the first observed position.
+        if history.isEmpty, let r, let first = points.first {
             points = FlightMath.greatCircle(from: r.from.geoPoint, to: first).dropLast() + points
         }
-        return FlightMath.removingRepeats(points)
+        flownPath = FlightMath.removingRepeats(points)
     }
 
     var adsbLolURL: URL? { URL(string: "https://adsb.lol/?icao=\(hex)") }
+
+    /// The photo's page, or a Planespotters search for the registration.
+    var planespottersURL: URL? {
+        if case .loaded(let p, _) = photo { return p.pageURL }
+        guard let reg = flight?.reg, reg.uppercased() != hex.uppercased(),
+              let q = reg.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(["-"])) else { return nil }
+        return URL(string: "https://www.planespotters.net/search?q=\(q)")
+    }
 
     /// Where to look for the aircraft from the user's location, while it's airborne.
     var skyPosition: SkyPosition? {
@@ -281,20 +301,119 @@ private extension GeoPoint {
     var coordinate: CLLocationCoordinate2D { CLLocationCoordinate2D(latitude: lat, longitude: lon) }
 }
 
-// MARK: - Window content
+private func observerPoint() -> GeoPoint? { Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) } }
 
+// MARK: - Content
+
+/// Map plus info sidebar for one aircraft. Embeddable in any host (a window or the main
+/// window's content area): it has no toolbar or window-title dependencies.
+///
+/// Hosts can swap `model` in place (no `.id`) for the smoothest switch: the map stays and
+/// glides to the new flight, and the sidebar crossfades. The host owns `start()`/`stop()`.
 struct FlightDetailView: View {
     @ObservedObject var model: FlightDetailModel
+    @State private var camera: MapCameraPosition = .automatic
+    @State private var latitudeSpan: Double = 180
 
     var body: some View {
         HStack(spacing: 0) {
-            FlightDetailMap(model: model)
+            FlightDetailMap(model: model, camera: $camera, latitudeSpan: $latitudeSpan)
                 .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity)
+                .overlay(alignment: .topTrailing) { mapControls.padding(10) }
             Divider()
-            FlightDetailSidebar(model: model)
-                .frame(width: 280)
+            ZStack {
+                FlightDetailSidebar(model: model)
+                    .id(model.hex)
+                    .transition(.opacity)
+            }
+            .animation(.easeInOut(duration: 0.2), value: model.hex)
+            .frame(minWidth: 280, idealWidth: 310, maxWidth: 340)
+            .background(.background)
         }
+        .environment(\.displayOptions, model.display)
         .frame(minWidth: 620, minHeight: 420)
+        .onChange(of: framingKey) { if !camera.positionedByUser { frameFlight() } }
+        // A different aircraft always reframes, even if the user had moved the map.
+        .onChange(of: model.hex, initial: true) { frameFlight() }
+    }
+
+    /// Changes when the set of things worth framing changes (first data, route found, track loaded).
+    private var framingKey: String {
+        let r = model.flight?.route
+        return "\(model.flight != nil)|\(r?.from.code ?? "")|\(r?.to.code ?? "")|\(model.history.isEmpty)"
+    }
+
+    /// Map framing controls, styled like MapKit's own zoom control.
+    private var mapControls: some View {
+        VStack(spacing: 0) {
+            mapButton("Show Whole Flight", "point.topleft.down.to.point.bottomright.curvepath", action: frameFlight)
+            Divider().frame(width: 20)
+            mapButton("Center on Aircraft", "scope", action: frameAircraft)
+                .disabled(model.flight == nil)
+            if observerPoint() != nil {
+                Divider().frame(width: 20)
+                mapButton("Show Flights Near You (\(model.display.radius(model.radiusNM)))", "location.circle", action: frameNearby)
+            }
+        }
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.15), radius: 3, y: 1)
+    }
+
+    private func mapButton(_ title: String, _ symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .medium))
+                .frame(width: 30, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help(title)
+        .accessibilityLabel(title)
+    }
+
+    // MARK: Framing
+
+    /// Fits origin, destination (including the arc between them), the recorded track and the
+    /// aircraft, or the aircraft and the observer when the route is unknown.
+    private func frameFlight() {
+        var points: [GeoPoint] = []
+        if let f = model.flight {
+            points.append(f.geoPoint)
+            points += model.plannedPath
+            if let origin = model.departedFrom { points.append(origin.geoPoint) }
+            if f.route == nil, let observer = observerPoint(),
+               FlightService.gcDistance(observer.lat, observer.lon, f.lat, f.lon) < 300 {
+                points.append(observer)
+            }
+            points += model.history.map(\.point)
+        } else if let observer = observerPoint() {
+            points.append(observer)
+        }
+        guard let fr = DetailFormat.framing(points) else { return }
+        move(to: MKCoordinateRegion(center: fr.center.coordinate,
+                                    span: MKCoordinateSpan(latitudeDelta: fr.latitudeDelta, longitudeDelta: fr.longitudeDelta)))
+    }
+
+    /// Centres on the aircraft, about 60 nm across.
+    private func frameAircraft() {
+        guard let f = model.flight else { return }
+        let d = 1.0
+        move(to: MKCoordinateRegion(center: f.geoPoint.coordinate,
+                                    span: MKCoordinateSpan(latitudeDelta: d, longitudeDelta: d / max(0.2, cos(f.lat * .pi / 180)))))
+    }
+
+    /// Fits the search-radius circle around the user.
+    private func frameNearby() {
+        guard let observer = observerPoint() else { return }
+        let d = Double(model.radiusNM) / 60 * 1.15
+        move(to: MKCoordinateRegion(center: observer.coordinate,
+                                    span: MKCoordinateSpan(latitudeDelta: d * 2, longitudeDelta: d * 2 / max(0.2, cos(observer.lat * .pi / 180)))))
+    }
+
+    private func move(to region: MKCoordinateRegion) {
+        withAnimation(.easeInOut(duration: 0.6)) { camera = .region(region) }
     }
 }
 
@@ -302,84 +421,87 @@ struct FlightDetailView: View {
 
 private struct FlightDetailMap: View {
     @ObservedObject var model: FlightDetailModel
-    @State private var camera: MapCameraPosition = .automatic
+    @Binding var camera: MapCameraPosition
+    @Binding var latitudeSpan: Double
     @Environment(\.openFlightDetail) private var openFlight
-    private let observer = Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) }
+    private let observer = observerPoint()
+    /// The visible region and map size, for label placement.
+    @State private var region: MKCoordinateRegion?
+    @State private var mapSize: CGSize = .zero
+    /// Nearby aircraft whose labels fit without overlapping (see `MapLabelLayout`).
+    @State private var labelled: Set<String> = []
 
-    /// Changes when the set of things worth framing changes (first data, route found).
-    private var framingKey: String {
-        let r = model.flight?.route
-        return "\(model.flight != nil)|\(r?.from.code ?? "")|\(r?.to.code ?? "")|\(model.history.isEmpty)"
-    }
+    private var detail: DetailFormat.MapDetail { DetailFormat.MapDetail(latitudeSpan: latitudeSpan) }
 
     var body: some View {
         Map(position: $camera, interactionModes: [.pan, .zoom]) {
-            if let r = model.flight?.route {
-                MapPolyline(coordinates: model.plannedPath.map(\.coordinate))
-                    .stroke(Color.secondary.opacity(0.7), style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [6, 6]))
-                airport(r.from)
-                airport(r.to)
+            if let observer {
+                // A polygon, not MapCircle: MapCircle stopped the map rendering tiles while on screen.
+                MapPolygon(coordinates: FlightMath.removingRepeats(FlightMath.circle(around: observer, radiusNM: Double(model.radiusNM)))
+                    .map(\.coordinate))
+                    .foregroundStyle(Color.blue.opacity(0.05))
+                    .stroke(Color.blue.opacity(0.55), lineWidth: 1.5)
+                if detail >= .icons {
+                    Annotation("", coordinate: CLLocationCoordinate2D(latitude: observer.lat + Double(model.radiusNM) / 60,
+                                                                      longitude: observer.lon), anchor: .center) {
+                        Text(model.display.radius(model.radiusNM))
+                            .font(.caption2.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Capsule().fill(Color.blue.opacity(0.8)))
+                            .accessibilityLabel("Search radius \(model.display.radius(model.radiusNM))")
+                    }
+                    .annotationTitles(.hidden)
+                }
             }
-            if model.flight?.route == nil, let origin = model.departedFrom {
-                airport(origin)
+            if model.plannedPath.count > 1 {
+                MapPolyline(coordinates: model.plannedPath.map(\.coordinate))
+                    .stroke(Color.primary.opacity(0.45), style: StrokeStyle(lineWidth: 1.5, lineCap: .round, dash: [5, 5]))
             }
             if model.flownPath.count > 1 {
+                // A dark casing under the line keeps it legible over any terrain.
+                MapPolyline(coordinates: model.flownPath.map(\.coordinate))
+                    .stroke(Color.black.opacity(0.25), style: StrokeStyle(lineWidth: 5.5, lineCap: .round, lineJoin: .round))
                 MapPolyline(coordinates: model.flownPath.map(\.coordinate))
                     .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
             }
-            if let observer {
-                // Drawn as a polygon: MapCircle stopped the map rendering tiles while on screen.
-                MapPolygon(coordinates: FlightMath.circle(around: observer, radiusNM: Double(model.radiusNM)).map(\.coordinate))
-                    .foregroundStyle(Color.blue.opacity(0.06))
-                    .stroke(Color.blue.opacity(0.6), lineWidth: 1.5)
-                // Radius label on the circle's northern edge.
-                Annotation("", coordinate: CLLocationCoordinate2D(latitude: observer.lat + Double(model.radiusNM) / 60,
-                                                                  longitude: observer.lon), anchor: .center) {
-                    Text(model.display.radius(model.radiusNM))
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(Capsule().fill(Color.blue.opacity(0.8)))
-                }
+            if let r = model.flight?.route {
+                airport(r.from, role: "Departure")
+                airport(r.to, role: model.destinationEstimated ? "Estimated destination" : "Destination")
+            } else if let origin = model.departedFrom {
+                airport(origin, role: "Departure")
             }
-            ForEach(model.nearby) { other in
-                Annotation("", coordinate: other.geoPoint.coordinate, anchor: .center) {
-                    Button { openFlight(other) } label: {
-                        VStack(spacing: 1) {
-                            let kind = AircraftClass(typeCode: other.typeCode)
-                            Image(systemName: kind.symbol)
-                                .font(.system(size: 14 * kind.iconScale, weight: .semibold))
-                                .rotationEffect(.degrees((other.track ?? 90) - 90))
-                            Text(other.displayNumber)
-                                .font(.system(size: 9, weight: .medium))
+            if detail >= .icons {
+                ForEach(model.nearby) { other in
+                    Annotation("", coordinate: other.geoPoint.coordinate, anchor: .center) {
+                        Button { openFlight(other) } label: {
+                            NearbyMarker(f: other, showLabel: labelled.contains(other.id))
                         }
-                        .foregroundStyle(.secondary)
-                        .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1)
+                        .buttonStyle(.plain)
+                        .help("Show \(other.displayNumber)")
+                        .accessibilityLabel("\(other.displayNumber), \(model.display.altitude(other.altitude))")
+                        .accessibilityHint("Shows this aircraft’s details")
                     }
-                    .buttonStyle(.plain)
-                    .help("Show \(other.displayNumber)")
+                    .annotationTitles(.hidden)
                 }
             }
             if let observer {
                 Annotation("You", coordinate: observer.coordinate, anchor: .center) {
                     Circle()
                         .fill(Color.blue)
-                        .frame(width: 10, height: 10)
+                        .frame(width: 11, height: 11)
                         .overlay(Circle().stroke(.white, lineWidth: 2))
                         .shadow(radius: 1)
+                        .accessibilityLabel("Your location")
                 }
+                .annotationTitles(detail == .labelled ? .automatic : .hidden)
             }
             if let f = model.flight {
-                Annotation(f.displayNumber, coordinate: f.geoPoint.coordinate, anchor: .center) {
-                    let kind = AircraftClass(typeCode: f.typeCode)
-                    Image(systemName: kind.symbol)
-                        .font(.system(size: 22 * kind.iconScale, weight: .semibold))
-                        .foregroundStyle(model.isLive ? Color.accentColor : Color.secondary)
-                        .shadow(color: .black.opacity(0.35), radius: 1.5)
-                        // The symbol points east; the map is always north-up.
-                        .rotationEffect(.degrees((f.track ?? 90) - 90))
-                        .accessibilityLabel("Aircraft position")
+                Annotation("", coordinate: f.geoPoint.coordinate, anchor: .center) {
+                    SelectedMarker(f: f, isLive: model.isLive)
                 }
+                .annotationTitles(.hidden)
             }
         }
         .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
@@ -387,65 +509,122 @@ private struct FlightDetailMap: View {
             MapZoomStepper()
             MapScaleView()
         }
-        .overlay(alignment: .topLeading) {
-            HStack(spacing: 6) {
-                Button(action: frameFlight) { Image(systemName: "scope") }
-                    .help("Show the whole flight")
-                if observer != nil {
-                    Button(action: frameNearby) { Image(systemName: "circle.dashed") }
-                        .help("Show flights near you (\(model.display.radius(model.radiusNM)))")
+        .onMapCameraChange(frequency: .onEnd) { context in
+            region = context.region
+            latitudeSpan = context.region.span.latitudeDelta
+            relabel()
+        }
+        .background {
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { mapSize = geo.size; relabel() }
+                    .onChange(of: geo.size) { _, size in mapSize = size; relabel() }
+            }
+        }
+        .onChange(of: labelKey) { relabel() }
+    }
+
+    /// Changes when the aircraft to label move or change.
+    private var labelKey: [String] {
+        model.nearby.map { "\($0.id)\(Int($0.lat * 100)),\(Int($0.lon * 100))" } + [model.hex]
+    }
+
+    /// Picks which nearby aircraft get labels: nearest first, never overlapping each other, the
+    /// icons, or the shown aircraft's label; previous labels are kept where possible.
+    private func relabel() {
+        guard let r = region, mapSize.width > 0, mapSize.height > 0 else { return }
+        let viewport = MapLabelLayout.Viewport(center: GeoPoint(lat: r.center.latitude, lon: r.center.longitude),
+                                               latitudeDelta: r.span.latitudeDelta, longitudeDelta: r.span.longitudeDelta,
+                                               size: mapSize)
+        var items = model.nearby.sorted { $0.distance < $1.distance }
+            .map { MapLabelLayout.Item(id: $0.id, point: $0.geoPoint, text: $0.displayNumber) }
+        if let f = model.flight {
+            items.insert(MapLabelLayout.Item(id: f.id, point: f.geoPoint, text: f.displayNumber), at: 0)
+        }
+        var next = MapLabelLayout.labelled(items, in: viewport, pinned: model.flight?.id, prefer: labelled)
+        if let id = model.flight?.id { next.remove(id) }
+        if next != labelled { labelled = next }
+    }
+
+    private func airport(_ a: Airport, role: String) -> some MapContent {
+        Annotation("", coordinate: a.geoPoint.coordinate, anchor: .center) {
+            VStack(spacing: 2) {
+                Circle()
+                    .fill(Color(nsColor: .windowBackgroundColor))
+                    .frame(width: 10, height: 10)
+                    .overlay(Circle().stroke(Color.primary, lineWidth: 2.5))
+                Text(a.code)
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.primary)
+                    .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
+                    .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.5)
+            }
+            // Keep the dot (not the label) on the coordinate.
+            .offset(y: 8)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(role) airport, \(a.code), \(a.city)")
+        }
+        .annotationTitles(.hidden)
+    }
+}
+
+/// Another aircraft near the user: a small class symbol with a halo, plus its label when
+/// `MapLabelLayout` found room. The label is an overlay so the icon stays on the coordinate.
+private struct NearbyMarker: View {
+    let f: Flight
+    let showLabel: Bool
+
+    var body: some View {
+        let kind = AircraftClass(typeCode: f.typeCode)
+        Image(systemName: kind.symbol)
+            .font(.system(size: 12 * kind.iconScale, weight: .semibold))
+            .foregroundStyle(f.looksLikeAirline ? Color.primary.opacity(0.75) : Color.secondary)
+            .rotationEffect(.degrees(kind == .rotorcraft ? 0 : (f.track ?? 90) - 90))
+            .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1.2)
+            .frame(width: MapLabelLayout.iconSize.width, height: MapLabelLayout.iconSize.height)
+            .overlay(alignment: .top) {
+                if showLabel {
+                    Text(f.displayNumber)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .shadow(color: Color(nsColor: .windowBackgroundColor), radius: 1)
+                        .fixedSize()
+                        .offset(y: MapLabelLayout.iconSize.height / 2 + MapLabelLayout.labelOffset)
+                        .transition(.opacity)
                 }
             }
-            .padding(10)
-        }
-        .onChange(of: framingKey, initial: true) {
-            if !camera.positionedByUser { frameFlight() }
-        }
+            .animation(.easeInOut(duration: 0.15), value: showLabel)
+            .contentShape(Rectangle())
     }
+}
 
-    private func airport(_ a: Airport) -> some MapContent {
-        Annotation(a.code, coordinate: a.geoPoint.coordinate, anchor: .center) {
-            Circle()
-                .fill(Color(nsColor: .windowBackgroundColor))
-                .frame(width: 10, height: 10)
-                .overlay(Circle().stroke(Color.primary, lineWidth: 2))
+/// The aircraft being shown: larger, accent-coloured, with a label capsule (grey once the signal is lost).
+private struct SelectedMarker: View {
+    let f: Flight
+    let isLive: Bool
+
+    var body: some View {
+        let kind = AircraftClass(typeCode: f.typeCode)
+        let tint = isLive ? Color.accentColor : Color.gray
+        VStack(spacing: 2) {
+            Image(systemName: kind.symbol)
+                .font(.system(size: 24 * kind.iconScale, weight: .semibold))
+                .foregroundStyle(tint)
+                // The symbol points east; the map is always north-up.
+                .rotationEffect(.degrees(kind == .rotorcraft ? 0 : (f.track ?? 90) - 90))
+                .shadow(color: .white.opacity(0.9), radius: 0.8)
+                .shadow(color: .black.opacity(0.35), radius: 2)
+            Text(f.displayNumber)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 6).padding(.vertical, 1)
+                .background(Capsule().fill(tint))
+                .fixedSize()
         }
-    }
-
-    /// Fits the search-radius circle around the user.
-    private func frameNearby() {
-        guard let observer else { return }
-        let d = Double(model.radiusNM) / 60 * 1.15
-        let span = MKCoordinateSpan(latitudeDelta: d * 2, longitudeDelta: d * 2 / max(0.2, cos(observer.lat * .pi / 180)))
-        withAnimation { camera = .region(MKCoordinateRegion(center: observer.coordinate, span: span)) }
-    }
-
-    /// Fits origin, destination (including the arc between them) and the aircraft, or the aircraft
-    /// and the observer when the route is unknown.
-    private func frameFlight() {
-        var points: [GeoPoint] = []
-        if let f = model.flight {
-            points.append(f.geoPoint)
-            if f.route != nil {
-                points += model.plannedPath
-            } else if let observer, FlightService.gcDistance(observer.lat, observer.lon, f.lat, f.lon) < 300 {
-                points.append(observer)
-            }
-            points += model.history.map(\.point)
-        } else if let observer {
-            points.append(observer)
-        }
-        guard !points.isEmpty else { return }
-
-        var rect = MKMapRect.null
-        for p in points {
-            rect = rect.union(MKMapRect(origin: MKMapPoint(p.coordinate), size: MKMapSize(width: 0, height: 0)))
-        }
-        // At least ~30 km across, plus a margin so markers aren't on the edge.
-        let minSide = MKMapPointsPerMeterAtLatitude(points[0].lat) * 30_000
-        let dx = max(rect.width * 0.15, (minSide - rect.width) / 2, 0)
-        let dy = max(rect.height * 0.2, (minSide - rect.height) / 2, 0)
-        withAnimation { camera = .rect(rect.insetBy(dx: -dx, dy: -dy)) }
+        // Keep the symbol (not the label) centred on the position.
+        .offset(y: 9)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(f.displayNumber), \(isLive ? "current position" : "last known position")")
     }
 }
 
@@ -457,256 +636,590 @@ private struct FlightDetailSidebar: View {
 
     var body: some View {
         if let f = model.flight {
-            VStack(alignment: .leading, spacing: 0) {
-                header(f)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 16)
-                Form {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    header(f)
                     photoSection
                     if let r = f.route {
-                        routeSection(f, from: r.from, to: r.to)
+                        routeCard(f, from: r.from, to: r.to)
                     } else if let origin = model.departedFrom {
-                        routeSection(f, from: origin, to: nil)
-                    }
-                    flightSection(f)
-                    aircraftSection(f)
-                    if let sky = model.skyPosition {
-                        lookUpSection(sky)
-                    }
-                    if Shared.location != nil {
-                        Section("From you") {
-                            LabeledContent("Distance", value: o.distance(f.distance))
-                            LabeledContent("Direction", value: "\(Int(f.bearing.rounded()) % 360)° \(FlightMath.compassPoint(f.bearing))")
+                        routeCard(f, from: origin, to: nil)
+                    } else if f.looksLikeAirline {
+                        DetailCard("Route") {
+                            Label("Route not available for \(f.callsign)", systemImage: "questionmark.circle")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .padding(.vertical, 4)
                         }
                     }
-                    if let url = model.adsbLolURL {
-                        Section {
-                            Link(destination: url) {
-                                Label("View on adsb.lol", systemImage: "safari")
-                            }
-                        }
-                    }
+                    liveDataSection(f)
+                    if Shared.location != nil { fromYouCard(f) }
+                    aircraftCard(f)
+                    linksCard(f)
                 }
-                .formStyle(.grouped)
+                .padding(16)
             }
         } else {
             VStack(spacing: 8) {
-                ProgressView()
+                ProgressView().controlSize(.small)
                 Text("Looking up \(model.hex.uppercased())…").foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
+    // MARK: Header
+
     private func header(_ f: Flight) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                AirlineLogo(code: f.logoKey?.id, size: 28)
-                    .environment(\.displayOptions, o)
-                Text(f.airlineName.isEmpty ? (f.aircraft?.model ?? "") : f.airlineName)
-                    .font(.headline)
-                    .lineLimit(2)
-            }
-            HStack(alignment: .firstTextBaseline) {
-                Text(f.displayNumber.isEmpty ? model.hex.uppercased() : f.displayNumber)
-                    .font(.title.weight(.semibold))
-                if !f.callsign.isEmpty, f.callsign != f.displayNumber {
-                    Text(f.callsign).foregroundStyle(.secondary)
-                }
-            }
-            status
-        }
-    }
-
-    @ViewBuilder private var status: some View {
-        if model.isLive {
-            Label("Live", systemImage: "dot.radiowaves.left.and.right")
-                .font(.caption)
-                .foregroundStyle(.green)
-        } else if let seen = model.lastSeen {
-            Text("Last seen \(seen.formatted(date: .omitted, time: .shortened))")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        } else {
-            Text("Not currently reported").font(.caption).foregroundStyle(.secondary)
-        }
-    }
-
-    private func routeSection(_ f: Flight, from: Airport, to: Airport?) -> some View {
-        Section {
-            HStack(alignment: .top) {
-                airport(from, alignment: .leading)
-                Spacer()
-                Image(systemName: "arrow.right").foregroundStyle(.secondary).padding(.top, 6)
-                Spacer()
-                if let to {
-                    airport(to, alignment: .trailing)
-                } else {
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text("—").font(.system(size: 26, weight: .semibold, design: .rounded))
-                        Text("Unknown").font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-            }
-            if let p = f.progress, let flown = model.flownNM, let left = model.remainingNM {
-                VStack(alignment: .leading, spacing: 4) {
-                    ProgressView(value: p)
-                    Text("\(o.distance(flown)) flown · \(o.distance(left)) to go")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            if let t = model.timeToGo {
-                LabeledContent("Est. arrival") {
-                    VStack(alignment: .trailing) {
-                        Text(Date().addingTimeInterval(t).formatted(date: .omitted, time: .shortened))
-                        Text("in \(FlightMath.durationText(t))").font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-            }
-        } header: {
-            Text("Route")
-        } footer: {
-            if let note = model.routeNote {
-                Text(note).font(.caption).foregroundStyle(.secondary)
-            }
-        }
-    }
-
-    private func airport(_ a: Airport, alignment: HorizontalAlignment) -> some View {
-        VStack(alignment: alignment, spacing: 2) {
-            Text(a.code).font(.system(size: 26, weight: .semibold, design: .rounded))
-            Text(a.city).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-        }
-    }
-
-    private func flightSection(_ f: Flight) -> some View {
-        Section("Flight") {
-            LabeledContent("Altitude") {
-                HStack(spacing: 4) {
-                    if !model.onGround, abs(f.verticalRate) > 300 {
-                        Image(systemName: f.verticalRate > 0 ? "arrow.up.right" : "arrow.down.right")
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 12) {
+                Badge(f: f, size: 40)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(DetailFormat.title(for: f, hex: model.hex))
+                        .font(.title.weight(.bold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                        .textSelection(.enabled)
+                    if !identityLine(f).isEmpty {
+                        Text(identityLine(f))
+                            .font(.callout)
                             .foregroundStyle(.secondary)
+                            .lineLimit(2)
                     }
-                    Text(model.onGround ? "On ground" : o.altitude(f.altitude))
                 }
             }
-            if !model.onGround {
-                LabeledContent("Vertical rate",
-                               value: abs(f.verticalRate) < 100 ? "Level"
-                                   : "\(Int(f.verticalRate).formatted(.number.sign(strategy: .always()))) fpm")
-            }
-            LabeledContent("Ground speed", value: o.speed(f.speed))
-            if let track = f.track {
-                LabeledContent("Track", value: String(format: "%03d° ", Int(track.rounded()) % 360) + FlightMath.compassPoint(track))
-            }
-            if let squawk = model.squawk {
-                LabeledContent("Squawk", value: squawk)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+            HStack(spacing: 6) {
+                StatusPill(model: model)
+                if let alert = DetailFormat.squawkAlert(model.squawk) {
+                    Pill(text: "\(alert) · \(model.squawk ?? "")", symbol: "exclamationmark.triangle.fill", tint: .red)
+                }
             }
         }
     }
 
-    private func aircraftSection(_ f: Flight) -> some View {
-        Section("Aircraft") {
-            if let modelName = f.aircraft?.model { LabeledContent("Model", value: modelName) }
-            if !f.typeCode.isEmpty { LabeledContent("Type", value: f.typeCode) }
-            LabeledContent("Registration", value: f.reg)
-            LabeledContent("ICAO hex", value: f.id.uppercased())
-            if let owner = f.aircraft?.owner, owner != f.airlineName { LabeledContent("Operator", value: owner) }
-            if let year = model.buildYear {
-                let age = Calendar.current.component(.year, from: Date()) - year
-                LabeledContent("Built", value: age > 0 ? "\(String(year)) (\(age) yr)" : String(year))
-            }
+    /// "Southwest Airlines · SWA2383": who flies it, plus the callsign when it differs from the number.
+    private func identityLine(_ f: Flight) -> String {
+        var parts: [String] = []
+        if !f.airlineName.isEmpty {
+            parts.append(f.airlineName)
+        } else if let m = f.aircraft?.model {
+            parts.append(m)
+        } else if !f.looksLikeAirline {
+            parts.append("Private / general aviation")
         }
+        if !f.callsign.isEmpty, f.callsign != DetailFormat.title(for: f, hex: model.hex) { parts.append(f.callsign) }
+        return parts.joined(separator: " · ")
     }
+
+    // MARK: Photo
 
     /// The airframe photo with its required credit; both open the photo's page.
     /// Hidden entirely when there's no photo.
     @ViewBuilder private var photoSection: some View {
-        switch model.photo {
-        case .loading(let ratio):
-            Section {
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(.quaternary)
+        Group {
+            switch model.photo {
+            case .loading(let ratio):
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.primary.opacity(0.06))
                     .aspectRatio(ratio, contentMode: .fit)
-                    .overlay { ProgressView().controlSize(.small) }
+                    .overlay {
+                        Image(systemName: "airplane")
+                            .font(.system(size: 28, weight: .light))
+                            .foregroundStyle(.quaternary)
+                    }
                     .accessibilityLabel("Loading aircraft photo")
-            }
-        case .loaded(let photo, let image):
-            Section {
-                Link(destination: photo.pageURL) {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(photo.aspectRatio, contentMode: .fit)
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
+            case .loaded(let photo, let image):
+                VStack(alignment: .leading, spacing: 5) {
+                    Link(destination: photo.pageURL) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .aspectRatio(photo.aspectRatio, contentMode: .fit)
+                            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open this photo on Planespotters.net")
+                    .accessibilityLabel("Photo of \(model.flight?.reg ?? model.hex.uppercased()), \(photo.credit)")
+                    Link(photo.credit, destination: photo.pageURL)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
-                .buttonStyle(.plain)
-                .help("Open this photo on Planespotters.net")
-                .accessibilityLabel("Photo of \(model.flight?.reg ?? model.hex.uppercased()), \(photo.credit)")
-            } footer: {
-                Link(photo.credit, destination: photo.pageURL)
+                .transition(.opacity)
+            case .unavailable:
+                EmptyView()
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: photoPhase)
+    }
+
+    private var photoPhase: Int {
+        switch model.photo {
+        case .loading: 0
+        case .loaded: 1
+        case .unavailable: 2
+        }
+    }
+
+    // MARK: Route
+
+    private func routeCard(_ f: Flight, from: Airport, to: Airport?) -> some View {
+        DetailCard("Route", footer: model.routeNote) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    endpoint(from.code, from.city, role: "From", alignment: .leading)
+                    Spacer(minLength: 8)
+                    if let to {
+                        endpoint(to.code, model.destinationEstimated ? "\(to.city) (est.)" : to.city,
+                                 role: model.destinationEstimated ? "To, estimated" : "To", alignment: .trailing)
+                    } else {
+                        endpoint("—", "Unknown", role: "Destination", alignment: .trailing)
+                    }
+                }
+                RouteLine(iconSize: 13, progress: to == nil ? nil : f.progress)
+                    .frame(height: 18)
+                if to != nil, let flown = model.flownNM, let left = model.remainingNM {
+                    HStack {
+                        Text("\(DetailFormat.distance(flown, units: o.units)) flown")
+                        Spacer()
+                        Text("\(DetailFormat.distance(left, units: o.units)) to go")
+                    }
                     .font(.caption)
+                    .monospacedDigit()
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .accessibilityElement(children: .combine)
+                }
+                timing
             }
-        case .unavailable:
-            EmptyView()
         }
     }
 
-    private func lookUpSection(_ sky: SkyPosition) -> some View {
-        Section("Look up") {
-            HStack(spacing: 12) {
-                SkyDome(position: sky)
-                    .frame(width: 52, height: 52)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(Self.pointing(sky))
-                    Text("Slant range \(o.distance(sky.slantRangeNM))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+    @ViewBuilder private var timing: some View {
+        let departed = model.departureTime
+        let arrival = model.arrival
+        if departed != nil || arrival != nil {
+            Divider()
+            VStack(spacing: 0) {
+                if let departed {
+                    TimingRow(label: "Departed", time: departed.formatted(date: .omitted, time: .shortened),
+                              detail: DetailFormat.ago(departed))
+                }
+                switch arrival {
+                case .landed?:
+                    TimingRow(label: "Arrival", time: "Landed", detail: nil)
+                case .landing?:
+                    TimingRow(label: "Arrival", time: "Landing now", detail: nil)
+                case .estimate(let t)?:
+                    TimingRow(label: "Arrival (est.)",
+                              time: "≈ " + Date().addingTimeInterval(t).formatted(date: .omitted, time: .shortened),
+                              detail: "in \(FlightMath.durationText(t)) at current speed")
+                case nil:
+                    EmptyView()
                 }
             }
-            .accessibilityElement(children: .combine)
         }
     }
 
-    /// "32° up · NE (45°)", or "Below the horizon · NE (45°)".
-    static func pointing(_ sky: SkyPosition) -> String {
-        let direction = "\(sky.compassPoint) (\(Int(sky.azimuth.rounded()) % 360)°)"
-        guard sky.isAboveHorizon else { return "Below the horizon · \(direction)" }
-        let up = sky.elevation < 1 ? "<1°" : "\(Int(sky.elevation.rounded()))°"
-        return "\(up) up · \(direction)"
+    private func endpoint(_ code: String, _ city: String, role: String, alignment: HorizontalAlignment) -> some View {
+        VStack(alignment: alignment, spacing: 1) {
+            Text(code).font(.system(size: 28, weight: .bold)).textSelection(.enabled)
+            Text(city).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(role): \(code), \(city)")
+    }
+
+    // MARK: Live data
+
+    private func liveDataSection(_ f: Flight) -> some View {
+        let stale = !model.isLive
+        return VStack(alignment: .leading, spacing: 6) {
+            SectionHeader(title: "Live Data",
+                          trailing: stale ? model.lastSeen.map { "Last reported \($0.formatted(date: .omitted, time: .shortened))" } : nil)
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible())], spacing: 8) {
+                if model.onGround {
+                    Tile(label: "Altitude", value: "On ground")
+                } else {
+                    Tile(label: "Altitude", value: o.altitude(f.altitude),
+                         symbol: abs(f.verticalRate) > 300 ? (f.verticalRate > 0 ? "arrow.up.right" : "arrow.down.right") : nil,
+                         spoken: abs(f.verticalRate) > 300 ? (f.verticalRate > 0 ? "climbing" : "descending") : nil)
+                    Tile(label: "Vertical Speed", value: DetailFormat.verticalRate(f.verticalRate, units: o.units))
+                }
+                Tile(label: "Ground Speed", value: o.speed(f.speed))
+                if let track = f.track { Tile(label: "Track", value: DetailFormat.heading(track)) }
+                if let squawk = model.squawk {
+                    Tile(label: "Squawk", value: squawk, tint: DetailFormat.squawkAlert(squawk) == nil ? nil : .red)
+                }
+            }
+            .opacity(stale ? 0.6 : 1)
+        }
+    }
+
+    // MARK: From you
+
+    private func fromYouCard(_ f: Flight) -> some View {
+        DetailCard("From You") {
+            VStack(spacing: 0) {
+                if let sky = model.skyPosition {
+                    let text = DetailFormat.lookUp(sky)
+                    HStack(spacing: 12) {
+                        SkyDome(position: sky)
+                            .frame(width: 64, height: 64)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(text.headline).font(.callout.weight(.semibold))
+                            Text(text.detail).font(.caption).foregroundStyle(.secondary)
+                        }
+                        .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 6)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Where to look: \(text.headline). \(text.detail)")
+                    Divider()
+                    InfoRow(label: "Line of sight", value: DetailFormat.distance(sky.slantRangeNM, units: o.units))
+                    Divider()
+                }
+                InfoRow(label: "Ground distance", value: DetailFormat.distance(f.distance, units: o.units))
+                if model.skyPosition == nil {
+                    Divider()
+                    InfoRow(label: "Direction", value: DetailFormat.heading(f.bearing))
+                }
+            }
+        }
+    }
+
+    // MARK: Aircraft
+
+    private func aircraftCard(_ f: Flight) -> some View {
+        var rows: [(String, String)] = []
+        if let m = f.aircraft?.model { rows.append(("Model", m)) }
+        if !f.typeCode.isEmpty { rows.append(("Type", f.typeCode)) }
+        rows.append(("Registration", f.reg))
+        rows.append(("ICAO hex", f.id.uppercased()))
+        if let owner = f.aircraft?.owner, owner != f.airlineName { rows.append(("Operator", owner)) }
+        if let year = model.buildYear { rows.append(("Built", DetailFormat.built(year))) }
+        return DetailCard("Aircraft") {
+            VStack(spacing: 0) {
+                ForEach(Array(rows.enumerated()), id: \.offset) { i, row in
+                    if i > 0 { Divider() }
+                    InfoRow(label: row.0, value: row.1)
+                }
+            }
+        }
+    }
+
+    // MARK: Links
+
+    private func linksCard(_ f: Flight) -> some View {
+        DetailCard(nil) {
+            VStack(spacing: 0) {
+                if let url = model.adsbLolURL {
+                    LinkRow(title: "View on adsb.lol", symbol: "dot.radiowaves.left.and.right", url: url)
+                }
+                if let url = model.planespottersURL {
+                    Divider()
+                    LinkRow(title: "Planespotters.net", symbol: "camera", url: url)
+                }
+                if let url = model.adsbLolURL {
+                    Divider()
+                    ShareLink(item: url, subject: Text(DetailFormat.title(for: f, hex: model.hex)),
+                              message: Text(shareMessage(f))) {
+                        LinkRowLabel(title: "Share Flight", symbol: "square.and.arrow.up", trailing: nil)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private func shareMessage(_ f: Flight) -> String {
+        let sub = DetailFormat.subtitle(for: f)
+        let title = DetailFormat.title(for: f, hex: model.hex)
+        return sub.isEmpty ? title : "\(title) · \(sub)"
     }
 }
 
-/// A small sky chart: the outer circle is the horizon, the centre is straight up, north at the
-/// top (as if lying on your back with your head to the south). The dot marks the aircraft.
+// MARK: - Sidebar components
+
+/// Live / On Ground / Last seen status capsule.
+private struct StatusPill: View {
+    @ObservedObject var model: FlightDetailModel
+
+    var body: some View {
+        if model.isLive {
+            if model.arrival == .landed {
+                Pill(text: "Landed", symbol: "airplane.arrival", tint: .secondary)
+            } else if model.onGround {
+                Pill(text: "On Ground", symbol: "road.lanes", tint: .secondary)
+            } else {
+                LivePill()
+            }
+        } else if let seen = model.lastSeen {
+            TimelineView(.periodic(from: .now, by: 30)) { ctx in
+                Pill(text: "Signal lost · \(DetailFormat.ago(seen, now: ctx.date))", symbol: "antenna.radiowaves.left.and.right.slash",
+                     tint: .orange)
+                    .help("Last position received at \(seen.formatted(date: .omitted, time: .standard))")
+            }
+        } else {
+            Pill(text: "Not currently reported", symbol: "antenna.radiowaves.left.and.right.slash", tint: .secondary)
+        }
+    }
+}
+
+private struct LivePill: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "circle.fill")
+                .font(.system(size: 6))
+                .symbolEffect(.pulse, options: .repeating, isActive: !reduceMotion)
+            Text("Live")
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(.green)
+        .padding(.horizontal, 8).padding(.vertical, 3)
+        .background(Capsule().fill(Color.green.opacity(0.15)))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Live")
+    }
+}
+
+private struct Pill: View {
+    let text: String
+    let symbol: String
+    let tint: Color
+
+    var body: some View {
+        Label(text, systemImage: symbol)
+            .font(.caption.weight(.semibold))
+            .labelStyle(.titleAndIcon)
+            .foregroundStyle(tint)
+            .lineLimit(1)
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Capsule().fill(tint.opacity(0.15)))
+    }
+}
+
+/// The airline logo, or the aircraft's class symbol in a rounded tile when there's no logo.
+private struct Badge: View {
+    let f: Flight
+    let size: CGFloat
+    @Environment(\.displayOptions) private var o
+
+    var body: some View {
+        Group {
+            if o.showLogos, AirlineLogos.file(for: f.logoKey?.id) != nil {
+                AirlineLogo(code: f.logoKey?.id, size: size)
+            } else {
+                let kind = AircraftClass(typeCode: f.typeCode)
+                RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
+                    .fill(Color.primary.opacity(0.07))
+                    .overlay {
+                        Image(systemName: kind.symbol)
+                            .font(.system(size: size * 0.45 * kind.iconScale, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(kind == .rotorcraft ? 0 : -45))
+                    }
+            }
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
+private struct SectionHeader: View {
+    let title: String
+    var trailing: String?
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+            Spacer()
+            if let trailing {
+                Text(trailing).font(.caption).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 2)
+    }
+}
+
+/// A titled, rounded group of content, like a grouped form section.
+private struct DetailCard<Content: View>: View {
+    let title: String?
+    let footer: String?
+    let content: Content
+
+    init(_ title: String?, footer: String? = nil, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.footer = footer
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let title { SectionHeader(title: title) }
+            content
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.045)))
+                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5))
+            if let footer {
+                Label(footer, systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 2)
+            }
+        }
+    }
+}
+
+private struct InfoRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(label).foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            Text(value)
+                .multilineTextAlignment(.trailing)
+                .monospacedDigit()
+                .textSelection(.enabled)
+        }
+        .font(.callout)
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct TimingRow: View {
+    let label: String
+    let time: String
+    let detail: String?
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label).foregroundStyle(.secondary)
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 1) {
+                Text(time).fontWeight(.semibold)
+                if let detail { Text(detail).font(.caption).foregroundStyle(.secondary) }
+            }
+            .monospacedDigit()
+        }
+        .font(.callout)
+        .padding(.vertical, 5)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// A big-number fact tile (altitude, speed, …).
+private struct Tile: View {
+    let label: String
+    let value: String
+    var symbol: String? = nil
+    var spoken: String? = nil
+    var tint: Color? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            HStack(spacing: 3) {
+                Text(value)
+                    .font(.title3.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(tint ?? .primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                if let symbol {
+                    Image(systemName: symbol).font(.caption.weight(.bold)).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.045)))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label), \(value)\(spoken.map { ", \($0)" } ?? "")")
+    }
+}
+
+private struct LinkRow: View {
+    let title: String
+    let symbol: String
+    let url: URL
+
+    var body: some View {
+        Link(destination: url) {
+            LinkRowLabel(title: title, symbol: symbol, trailing: "arrow.up.forward")
+        }
+        .buttonStyle(.plain)
+        .help(url.absoluteString)
+    }
+}
+
+private struct LinkRowLabel: View {
+    let title: String
+    let symbol: String
+    let trailing: String?
+
+    var body: some View {
+        HStack {
+            Label(title, systemImage: symbol).foregroundStyle(Color.accentColor)
+            Spacer()
+            if let trailing { Image(systemName: trailing).font(.caption.weight(.semibold)).foregroundStyle(.tertiary) }
+        }
+        .font(.callout)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
+    }
+}
+
+/// A small sky chart: the outer circle is the horizon, the centre is straight up. Drawn like a
+/// map (north up, east right) so it reads the same way as the map beside it. The dot marks the
+/// aircraft; a hollow dot means it's below the horizon in that direction.
 private struct SkyDome: View {
     let position: SkyPosition
 
     var body: some View {
         GeometryReader { geo in
             let size = min(geo.size.width, geo.size.height)
-            let r = size / 2 - 3
+            let r = size / 2 - 1
             let centre = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
             // Distance from the centre: 0 at the zenith, r at the horizon (clamped for below it).
             let d = r * (1 - max(0, min(90, position.elevation)) / 90)
             let az = position.azimuth * .pi / 180
             let dot = CGPoint(x: centre.x + d * sin(az), y: centre.y - d * cos(az))
             ZStack {
-                Circle().fill(.quaternary.opacity(0.5))
-                Circle().stroke(.secondary, lineWidth: 1)
-                Circle().stroke(.tertiary, lineWidth: 0.5).padding(r / 3)       // 30° up
-                Circle().stroke(.tertiary, lineWidth: 0.5).padding(r * 2 / 3)   // 60° up
-                Text("N")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .position(x: centre.x, y: centre.y - r + 6)
+                Circle().fill(Color.blue.opacity(0.08))
+                Circle().strokeBorder(Color.secondary.opacity(0.6), lineWidth: 1)
+                Circle().stroke(Color.secondary.opacity(0.25), lineWidth: 0.5).padding(r / 3)       // 30° up
+                Circle().stroke(Color.secondary.opacity(0.25), lineWidth: 0.5).padding(r * 2 / 3)   // 60° up
+                ForEach(0..<4, id: \.self) { i in
+                    let label = ["N", "E", "S", "W"][i]
+                    let a = Double(i) * .pi / 2
+                    Text(label)
+                        .font(.system(size: 7, weight: label == "N" ? .bold : .medium))
+                        .foregroundStyle(label == "N" ? Color.primary : Color.secondary)
+                        .position(x: centre.x + (r - 6) * sin(a), y: centre.y - (r - 6) * cos(a))
+                }
+                Path { p in p.move(to: centre); p.addLine(to: dot) }
+                    .stroke(Color.accentColor.opacity(0.5), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
                 Circle()
                     .fill(position.isAboveHorizon ? Color.accentColor : Color.clear)
-                    .overlay(Circle().stroke(position.isAboveHorizon ? Color.clear : Color.secondary, lineWidth: 1.5))
-                    .frame(width: 8, height: 8)
+                    .overlay(Circle().stroke(position.isAboveHorizon ? Color.white : Color.secondary, lineWidth: 1.5))
+                    .frame(width: 9, height: 9)
                     .position(dot)
             }
             .frame(width: size, height: size)
@@ -723,7 +1236,8 @@ private struct OpenFlightDetailKey: EnvironmentKey {
 }
 
 extension EnvironmentValues {
-    /// Opens another aircraft's detail window (clicking a nearby flight on the map).
+    /// Opens another aircraft's details (clicking a nearby flight on the map). Hosts override
+    /// this to switch in place.
     var openFlightDetail: @MainActor (Flight) -> Void {
         get { self[OpenFlightDetailKey.self] }
         set { self[OpenFlightDetailKey.self] = newValue }

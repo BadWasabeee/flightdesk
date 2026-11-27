@@ -20,6 +20,8 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
     @Published private(set) var database: PlaneAlertDB?
     @Published private(set) var databaseStatus = ""
     @Published private(set) var lastTestResult = ""
+    /// Aircraft currently silenced with "Mute for 24 Hours".
+    @Published private(set) var mutedCount = 0
 
     /// Supplies an aircraft's transponder squawk. Nil until the live feed model carries squawks;
     /// once `Flight.squawk` exists, wire it with `SpotterAlerts.squawk = { $0.squawk }`.
@@ -43,9 +45,19 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
         return settings.menuBarReadout || !rules.isEmpty
     }
 
+    static let categoryID = "spotter.alert"
+    private static let showAction = "spotter.show"
+    private static let muteAction = "spotter.mute"
+
     /// Call from `applicationDidFinishLaunching` so clicks on notifications delivered while quit are handled.
     func start() {
         center.delegate = self
+        center.setNotificationCategories([UNNotificationCategory(
+            identifier: Self.categoryID,
+            actions: [UNNotificationAction(identifier: Self.showAction, title: "Show Details", options: [.foreground]),
+                      UNNotificationAction(identifier: Self.muteAction, title: "Mute for 24 Hours", options: [])],
+            intentIdentifiers: [], options: [])])
+        mutedCount = ledger.mutedCount(now: Date())
         Task { await refreshAuthorization() }
         if settings.activeRules.contains(.interesting) { ensureDatabase() }
     }
@@ -67,22 +79,30 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
             if authorization == .notDetermined { await requestAuthorizationIfNeeded() }
             guard authorization.canNotify else { return }       // don't burn dedupe slots while notifications are off
             ledger.prune(now: now)
+            mutedCount = ledger.mutedCount(now: now)
             let fresh = ledger.admit(candidates, now: now)
             guard !fresh.isEmpty else { return }
-            Shared.defaults.set(try? JSONEncoder().encode(ledger), forKey: AlertLedger.key)
+            saveLedger()
             for alert in fresh { await post(alert) }
         }
     }
 
-    private func post(_ alert: SpotterAlert) async {
+    private func saveLedger() {
+        Shared.defaults.set(try? JSONEncoder().encode(ledger), forKey: AlertLedger.key)
+    }
+
+    private func post(_ alert: SpotterAlert, identifier: String? = nil) async {
         let content = UNMutableNotificationContent()
         content.title = alert.title
+        content.subtitle = alert.subtitle
         content.body = alert.body(display: AppSettings.load().display)
         content.sound = .default
         if alert.rule == .emergency { content.interruptionLevel = .timeSensitive }
+        // One stack per rule in Notification Center (emergencies, watchlist, military…).
         content.threadIdentifier = "spotter.\(alert.rule.rawValue)"
+        content.categoryIdentifier = Self.categoryID
         content.userInfo = ["hex": alert.flight.id, "flight": (try? JSONEncoder().encode(alert.flight)) ?? Data()]
-        let request = UNNotificationRequest(identifier: "spotter.\(alert.rule.rawValue).\(alert.flight.id)",
+        let request = UNNotificationRequest(identifier: identifier ?? "spotter.\(alert.rule.rawValue).\(alert.flight.id)",
                                             content: content, trigger: nil)
         do { try await center.add(request) } catch { fdLog.error("Spotter notification failed: \(error.localizedDescription)") }
     }
@@ -96,9 +116,31 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
                 return
             }
             let flight = lastFlights.first ?? PanelModel.sample.flights[0]
-            await post(SpotterAlert(flight: flight, rule: .watchlist, label: "Test", entry: database?[flight.id]))
+            await post(SpotterAlert(flight: flight, rule: .watchlist, label: "Test alert", entry: database?[flight.id]),
+                       identifier: "spotter.test")
             lastTestResult = "Sent a test alert for \(flight.displayNumber)."
         }
+    }
+
+    // MARK: Muting
+
+    /// Silences every rule for one aircraft for 24 hours and clears its delivered alerts.
+    func mute(hex: String) {
+        ledger.mute(hex: hex, now: Date())
+        mutedCount = ledger.mutedCount(now: Date())
+        saveLedger()
+        Task {
+            let ids = await center.deliveredNotifications()
+                .filter { ($0.request.content.userInfo["hex"] as? String)?.lowercased() == hex.lowercased() }
+                .map(\.request.identifier)
+            center.removeDeliveredNotifications(withIdentifiers: ids)
+        }
+    }
+
+    func unmuteAll() {
+        ledger.unmuteAll()
+        mutedCount = 0
+        saveLedger()
     }
 
     // MARK: Authorization
@@ -129,17 +171,23 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
         completionHandler([.banner, .list, .sound])
     }
 
-    /// Clicking an alert opens that aircraft's detail window.
+    /// Clicking an alert (or Show Details) opens that aircraft's detail window; Mute silences it for a day.
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                             withCompletionHandler completionHandler: @escaping () -> Void) {
         let info = response.notification.request.content.userInfo
         let hex = info["hex"] as? String
         let snapshot = (info["flight"] as? Data).flatMap { try? JSONDecoder().decode(Flight.self, from: $0) }
-        let opened = response.actionIdentifier == UNNotificationDefaultActionIdentifier
+        let action = response.actionIdentifier
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
-                if let hex, opened {
-                    FlightDetail.show(hex: hex, snapshot: snapshot)
+                if let hex {
+                    switch action {
+                    case UNNotificationDefaultActionIdentifier, Self.showAction:
+                        FlightDetail.show(hex: hex, snapshot: snapshot)
+                    case Self.muteAction:
+                        SpotterAlerts.shared.mute(hex: hex)
+                    default: break
+                    }
                 }
                 completionHandler()
             }
@@ -176,7 +224,7 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
             }
             guard force || (stale && canRetry) else { return }
             lastDownloadAttempt = Date()
-            if database == nil { databaseStatus = "Downloading list…" }
+            if database == nil { databaseStatus = "Downloading the list…" }
             do {
                 let (data, response) = try await Self.downloadSession.data(from: Self.databaseURL)
                 guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
@@ -186,14 +234,14 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
                 setDatabase(db, updated: Date())
             } catch {
                 fdLog.error("plane-alert-db download failed: \(error.localizedDescription)")
-                databaseStatus = database == nil ? "Couldn't download the list — will retry later." : databaseStatus
+                databaseStatus = database == nil ? "Couldn’t download the list. FlightDesk will try again later." : databaseStatus
             }
         }
     }
 
     private func setDatabase(_ db: PlaneAlertDB, updated: Date?) {
         database = db
-        let when = updated.map { " · updated \($0.formatted(date: .abbreviated, time: .omitted))" } ?? ""
+        let when = updated.map { " · updated \($0.formatted(.relative(presentation: .named)))" } ?? ""
         databaseStatus = "\(db.entries.count.formatted()) aircraft\(when)"
     }
 

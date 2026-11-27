@@ -31,8 +31,10 @@ struct PanelRoot: View {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     let store = LiveStore()
     var panel: NSWindow!
-    var settingsWindow: NSWindow?
+    private var settingsController: SettingsWindowController?
+    var settingsWindow: NSWindow? { settingsController?.window }
     var settingsTab = SettingsTab.general
+    private var welcomeWindow: NSWindow?
     var statusItem: NSStatusItem!
     let menu = NSMenu()
     lazy var mainWindow = MainWindowController(store: store)
@@ -57,6 +59,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
+        // Borderless windows keep a stale shadow when their content resizes.
+        NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: panel, queue: .main) { note in
+            (note.object as? NSWindow)?.invalidateShadow()
+        }
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         host.view.menu = menu
@@ -93,7 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 $0.showMainWindow()
                 guard !UserDefaults.standard.bool(forKey: "onboarded.v2") else { return }
                 UserDefaults.standard.set(true, forKey: "onboarded.v2")
-                $0.openSettings(tab: .widget)
+                $0.showWelcome()
             }
         }
         runSnapshotIfRequested()
@@ -116,7 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     /// `flightdesk://flight/<hex>` from the widget opens that aircraft's detail window.
     func application(_ application: NSApplication, open urls: [URL]) {
-        // flightdesk://settings/<general|display|widget|alerts> opens that Settings tab.
+        // flightdesk://settings/<general|display|widget|alerts|sources> opens that Settings tab.
         if let tab = urls.lazy.compactMap(SettingsTab.init(url:)).first {
             lastLinkOpen = Date()
             openedFromLink = true
@@ -164,20 +170,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     // MARK: Menu
 
+    /// The status menu is open (it rebuilds in place when fresh data arrives).
+    private var menuIsOpen = false
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+        // Nothing visible keeps `store.model` fresh, so fetch now if it's old and update the open menu.
+        guard Date().timeIntervalSince(store.model.updated ?? .distantPast) > 30 else { return }
+        Task {
+            await store.refresh()
+            if menuIsOpen { menuNeedsUpdate(menu) }
+        }
+    }
+
+    func menuDidClose(_ menu: NSMenu) { menuIsOpen = false }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        add("Open FlightDesk", #selector(showMainWindow))
-        let place = store.placeName.isEmpty ? "No location set" : "Location: \(store.placeName)"
-        menu.addItem(withTitle: place, action: nil, keyEquivalent: "").isEnabled = false
+        add("Open FlightDesk", #selector(showMainWindow), "o")
         menu.addItem(.separator())
-        add("About FlightDesk", #selector(about))
-        add("Settings…", #selector(showSettings), ",")
-        add("Refresh Widgets Now", #selector(refreshWidgets), "r")
+
+        // Live: the nearest few aircraft, each opening its detail window.
+        if store.placeName.isEmpty {
+            add("Set Your Location…", #selector(showLocationSettings)).image = symbol("location")
+        } else {
+            menu.addItem(.sectionHeader(title: "Near \(store.placeName)"))
+            let nearest = store.model.flights.sorted { $0.distance < $1.distance }.prefix(3)
+            if nearest.isEmpty {
+                let status = store.model.status.isEmpty ? "Looking for aircraft…" : store.model.status
+                menu.addItem(withTitle: status, action: nil, keyEquivalent: "").isEnabled = false
+            }
+            for f in nearest {
+                let item = add(Self.menuTitle(for: f, display: store.settings.display), #selector(openFlightFromMenu(_:)))
+                item.representedObject = f.id
+                item.image = symbol("airplane")
+                item.toolTip = [f.airlineName, f.typeCode].filter { !$0.isEmpty }.joined(separator: " · ")
+            }
+        }
+        menu.addItem(.separator())
         add("Show Live Desktop Panel", #selector(togglePanel)).state = store.settings.showPanel ? .on : .off
-        add("Launch at Login", #selector(toggleLogin)).state = SMAppService.mainApp.status == .enabled ? .on : .off
+        add("Refresh Now", #selector(refreshWidgets), "r")
         menu.addItem(.separator())
+        add("Settings…", #selector(showSettings), ",")
+        add("About FlightDesk", #selector(about))
         add("FlightDesk on GitHub", #selector(openGitHub))
+        menu.addItem(.separator())
         add("Quit FlightDesk", #selector(quit), "q")
+    }
+
+    /// "DL1342  MKE→BOS · 4.0 nm NE" (route only when known).
+    static func menuTitle(for f: Flight, display: DisplayOptions) -> String {
+        let d = display.withStandardStyle
+        var parts: [String] = []
+        if let r = f.route, !r.from.code.isEmpty, !r.to.code.isEmpty { parts.append("\(r.from.code)→\(r.to.code)") }
+        else if !f.typeCode.isEmpty { parts.append(f.typeCode) }
+        parts.append("\(d.distance(f.distance)) \(f.direction)")
+        return "\(f.displayNumber)  " + parts.joined(separator: " · ")
+    }
+
+    private func symbol(_ name: String) -> NSImage? {
+        NSImage(systemSymbolName: name, accessibilityDescription: nil)
     }
 
     @discardableResult
@@ -188,72 +240,144 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         return i
     }
 
+    @objc private func openFlightFromMenu(_ sender: NSMenuItem) {
+        guard let hex = sender.representedObject as? String else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        showFlight(hex: hex)
+    }
+
+    @objc private func showLocationSettings() { openSettings(tab: .general) }
+
     @objc func about() {
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.orderFrontStandardAboutPanel(options: [
-            .credits: NSAttributedString(string: "Live aircraft from adsb.lol · routes & aircraft from adsbdb.com",
-                                         attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]),
-        ])
+        NSApp.orderFrontStandardAboutPanel(options: [.credits: Self.aboutCredits()])
     }
+
+    /// Centered, linked credits for the data sources.
+    private static func aboutCredits() -> NSAttributedString {
+        let para = NSMutableParagraphStyle()
+        para.alignment = .center
+        para.paragraphSpacing = 2
+        let base: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: para,
+        ]
+        let out = NSMutableAttributedString()
+        for (i, c) in DataCredits.all.enumerated() {
+            out.append(NSAttributedString(string: "\(c.role): ", attributes: base))
+            var link = base
+            link[.link] = c.url
+            out.append(NSAttributedString(string: c.name, attributes: link))
+            if i < DataCredits.all.count - 1 { out.append(NSAttributedString(string: "\n", attributes: base)) }
+        }
+        var gh = base
+        gh[.link] = URL(string: "https://github.com/BadWasabeee/flightdesk")!
+        out.append(NSAttributedString(string: "\n\n", attributes: base))
+        out.append(NSAttributedString(string: "Open source on GitHub", attributes: gh))
+        return out
+    }
+
     @objc func openGitHub() { NSWorkspace.shared.open(URL(string: "https://github.com/BadWasabeee/flightdesk")!) }
     @objc func showSettings() { openSettings(tab: settingsTab) }
     @objc func refreshWidgets() { store.reloadWidgets(); Task { await store.refresh() } }
     @objc func togglePanel() { store.settings.showPanel.toggle() }
     @objc func quit() { NSApp.terminate(nil) }
-    @objc func toggleLogin() {
-        if SMAppService.mainApp.status == .enabled { try? SMAppService.mainApp.unregister() }
-        else { try? SMAppService.mainApp.register() }
-    }
 
     // MARK: Settings window
 
     func openSettings(tab: SettingsTab) {
         settingsTab = tab
-        let root = SettingsView(store: store, tab: tab) { [weak self] in self?.settingsTab = $0 }
-        if let w = settingsWindow {
-            // Rebuild so the requested tab is selected.
-            w.contentViewController = NSHostingController(rootView: root)
-        } else {
-            let w = NSWindow(contentViewController: NSHostingController(rootView: root))
-            w.title = "FlightDesk Settings"
-            w.styleMask = [.titled, .closable]
-            w.isReleasedWhenClosed = false
-            w.delegate = self
-            w.center()
-            settingsWindow = w
-        }
-        NSApp.activate(ignoringOtherApps: true)
-        settingsWindow?.makeKeyAndOrderFront(nil)
+        // Built once and kept, so the toolbar and title stay put; deep links just select the tab.
+        let controller = settingsController ?? SettingsWindowController(store: store) { [weak self] in self?.settingsTab = $0 }
+        settingsController = controller
+        controller.show(tab)
         Task { await store.refresh() }
+    }
+
+    // MARK: Welcome
+
+    /// The first-run window: location, widget and alerts in one place.
+    @objc func showWelcome() {
+        if let w = welcomeWindow { w.makeKeyAndOrderFront(nil); return }
+        let view = WelcomeView(store: store,
+                               onSetUpAlerts: { [weak self] in self?.closeWelcome(); self?.openSettings(tab: .alerts) },
+                               onDone: { [weak self] in self?.closeWelcome() })
+        let host = NSHostingController(rootView: view)
+        host.sizingOptions = [.preferredContentSize]
+        let w = NSWindow(contentViewController: host)
+        w.styleMask = [.titled, .closable, .fullSizeContentView]
+        w.titlebarAppearsTransparent = true
+        w.titleVisibility = .hidden
+        w.title = "Welcome to FlightDesk"
+        w.isMovableByWindowBackground = true
+        w.isReleasedWhenClosed = false
+        w.tabbingMode = .disallowed
+        w.center()
+        welcomeWindow = w
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.async { w.makeFirstResponder(nil) }
+    }
+
+    private func closeWelcome() {
+        welcomeWindow?.close()
+        welcomeWindow = nil
     }
 
     // MARK: Debug snapshots
 
-    /// FLIGHTDESK_SNAPSHOT_DIR=/path renders every widget size + the panel to PNGs, then quits.
+    /// FLIGHTDESK_SNAPSHOT_DIR=/path renders every widget size, the designed empty/error states
+    /// and the floating panel to PNGs, then quits. FLIGHTDESK_SNAPSHOT_SAMPLE=1 uses the gallery sky;
+    /// FLIGHTDESK_SNAPSHOT_STYLE=led|standard and FLIGHTDESK_SNAPSHOT_SCHEME=light|dark override the look.
     private func runSnapshotIfRequested() {
         guard let dir = ProcessInfo.processInfo.environment["FLIGHTDESK_SNAPSHOT_DIR"] else { return }
-        Task { await AirlineLogos.prefetch(Set(PanelModel.sample.flights.compactMap(\.logoKey))) }
+        Task { await AirlineLogos.prefetch(Set((PanelModel.gallery.flights + PanelModel.sample.flights).compactMap(\.logoKey))) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
             let env = ProcessInfo.processInfo.environment
-            let m = (self.store.model.flights.isEmpty || env["FLIGHTDESK_SNAPSHOT_SAMPLE"] != nil) ? PanelModel.sample : self.store.model
+            let m = (self.store.model.flights.isEmpty || env["FLIGHTDESK_SNAPSHOT_SAMPLE"] != nil) ? PanelModel.gallery : self.store.model
             var o = self.store.settings.display
             if let style = env["FLIGHTDESK_SNAPSHOT_STYLE"].flatMap(BoardStyle.init(rawValue:)) { o.style = style }
-            let sizes: [(String, PanelLayout, CGSize)] = [
-                ("small", .small, CGSize(width: 170, height: 170)),
-                ("medium", .medium, CGSize(width: 364, height: 170)),
-                ("large", .large, CGSize(width: 364, height: 382)),
-                ("xlarge", .extraLarge, CGSize(width: 765, height: 382)),
+            let scheme: ColorScheme = env["FLIGHTDESK_SNAPSHOT_SCHEME"] == "dark" ? .dark : .light
+            let small = CGSize(width: 170, height: 170), medium = CGSize(width: 364, height: 170)
+            let large = CGSize(width: 364, height: 382), xlarge = CGSize(width: 765, height: 382)
+            var noList = o
+            noList.showList = false
+            func state(_ status: String) -> PanelModel {
+                var s = PanelModel(radiusNM: 25)
+                s.status = status
+                s.placeName = status.contains("location") ? "" : "Denver"
+                return s
+            }
+            let shots: [(String, PanelModel, PanelLayout, CGSize, DisplayOptions)] = [
+                ("small", m, .small, small, o),
+                ("medium", m, .medium, medium, o),
+                ("large", m, .large, large, o),
+                ("xlarge", m, .extraLarge, xlarge, o),
+                ("large-few", PanelModel.sample, .large, large, o),
+                ("large-nolist", m, .large, large, noList),
+                ("xlarge-nolist", m, .extraLarge, xlarge, noList),
+                ("state-quiet-medium", state("Quiet skies — Nothing within \(o.radius(25)) right now"), .medium, medium, o),
+                ("state-offline-small", state("Can’t reach flight data — Retrying in a couple of minutes"), .small, small, o),
+                ("state-nolocation-medium", state("No location set — Choose one in FlightDesk or with Edit Widget"), .medium, medium, o),
+                ("state-loading-large", state(""), .large, large, o),
             ]
-            for (name, layout, size) in sizes {
-                self.render(PanelContent(model: m, layout: layout, accessory: AnyView(Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 9, weight: .bold)).foregroundStyle(o.isStandard ? Color.secondary : o.theme.color.opacity(0.55))))
+            for (name, model, layout, size, opts) in shots {
+                self.render(PanelContent(model: model, layout: layout, accessory: AnyView(RefreshGlyph()))
                     .frame(width: size.width, height: size.height)
-                    .environment(\.displayOptions, o)
-                    .background(o.isStandard ? AnyView(Color(nsColor: .windowBackgroundColor)) : AnyView(PanelBackground()))
-                    .environment(\.displayOptions, o)
-                    .environment(\.colorScheme, env["FLIGHTDESK_SNAPSHOT_SCHEME"] == "dark" ? .dark : .light)
+                    .background(opts.isStandard ? AnyView(Color(nsColor: .windowBackgroundColor)) : AnyView(PanelBackground()))
+                    .environment(\.displayOptions, opts)
+                    .environment(\.colorScheme, scheme)
                     .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous)), to: "\(dir)/\(name).png")
             }
+            // The floating desktop panel, with its chrome.
+            self.render(PanelContent(model: m, layout: .panel)
+                .environment(\.displayOptions, o)
+                .frame(width: 460)
+                .fixedSize(horizontal: false, vertical: true)
+                .modifier(PanelChrome(options: o))
+                .padding(20)
+                .environment(\.colorScheme, scheme), to: "\(dir)/panel.png")
             NSApp.terminate(nil)
         }
     }

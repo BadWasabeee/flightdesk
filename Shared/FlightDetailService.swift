@@ -251,3 +251,147 @@ struct FlightTrack: Equatable, Sendable {
         startAltitudeFt = parsed.first?.1.map { $0 * 3.28084 }
     }
 }
+
+// MARK: - Detail presentation (pure, unit-tested)
+
+/// Formatting and small decisions for the flight detail view, kept free of UI frameworks so
+/// they can be unit-tested.
+enum DetailFormat {
+    /// Distance with sensible precision: one decimal under 10, whole grouped numbers above
+    /// ("6,424 nm", "3.7 nm").
+    static func distance(_ nm: Double, units: UnitSystem, locale: Locale = .autoupdatingCurrent) -> String {
+        let metric = units == .metric
+        let value = max(0, metric ? nm * 1.852 : nm)
+        let number = value < 9.95
+            ? value.formatted(.number.precision(.fractionLength(1)).locale(locale))
+            : Int(value.rounded()).formatted(.number.locale(locale))
+        return "\(number) \(metric ? "km" : "nm")"
+    }
+
+    /// "Level", "+1,250 fpm" (rounded to 50) or, for metric users, "−6.4 m/s".
+    static func verticalRate(_ fpm: Double, units: UnitSystem, locale: Locale = .autoupdatingCurrent) -> String {
+        guard abs(fpm) >= 100 else { return "Level" }
+        if units == .metric {
+            let ms = fpm * 0.00508
+            return "\(ms.formatted(.number.precision(.fractionLength(1)).sign(strategy: .always()).locale(locale))) m/s"
+        }
+        let rounded = Int((fpm / 50).rounded()) * 50
+        return "\(rounded.formatted(.number.sign(strategy: .always()).locale(locale))) fpm"
+    }
+
+    /// Three-digit heading with its compass point: "095° E".
+    static func heading(_ degrees: Double) -> String {
+        let d = (Int(degrees.rounded()) % 360 + 360) % 360
+        return String(format: "%03d° ", d) + FlightMath.compassPoint(Double(d))
+    }
+
+    /// "2009 · 17 years old", or just the year for a brand-new airframe.
+    static func built(_ year: Int, now: Date = Date(), calendar: Calendar = .current) -> String {
+        let age = calendar.component(.year, from: now) - year
+        guard age > 0 else { return String(year) }
+        return "\(String(year)) · \(age) \(age == 1 ? "year" : "years") old"
+    }
+
+    /// "just now", "4 min ago", "2 h 5 m ago".
+    static func ago(_ date: Date, now: Date = Date()) -> String {
+        let s = now.timeIntervalSince(date)
+        if s < 60 { return "just now" }
+        if s < 3_600 { return "\(Int(s / 60)) min ago" }
+        return "\(FlightMath.durationText(s)) ago"
+    }
+
+    /// The headline identifier for an aircraft: its flight number, callsign or registration.
+    static func title(for f: Flight?, hex: String) -> String {
+        guard let f, !f.displayNumber.isEmpty else { return hex.uppercased() }
+        return f.displayNumber
+    }
+
+    /// "LAS → MKE · Southwest Airlines"; empty when nothing is known beyond the number.
+    static func subtitle(for f: Flight?) -> String {
+        guard let f else { return "" }
+        var parts: [String] = []
+        if let r = f.route { parts.append("\(r.from.code) → \(r.to.code)") }
+        if !f.airlineName.isEmpty { parts.append(f.airlineName) } else if let model = f.aircraft?.model { parts.append(model) }
+        return parts.joined(separator: " · ")
+    }
+
+    /// What an emergency transponder code means, or nil for an ordinary code.
+    static func squawkAlert(_ code: String?) -> String? {
+        switch code {
+        case "7500": "Hijack"
+        case "7600": "Radio Failure"
+        case "7700": "Emergency"
+        default: nil
+        }
+    }
+
+    /// Arrival state shown on the route card.
+    enum Arrival: Equatable {
+        case landed
+        case landing
+        /// Time to go at the current ground speed (an estimate, labelled as such).
+        case estimate(TimeInterval)
+    }
+
+    /// Arrival state from the live position, or nil when there's nothing honest to say
+    /// (on the ground away from the destination, or too slow for an estimate).
+    static func arrival(remainingNM: Double, speedKT: Double, altitudeFt: Int, verticalRate: Double, onGround: Bool) -> Arrival? {
+        if onGround { return remainingNM < 5 ? .landed : nil }
+        if remainingNM < 10, altitudeFt < 3_000, verticalRate < -200 { return .landing }
+        return FlightMath.timeToGo(remainingNM: remainingNM, speedKT: speedKT).map(Arrival.estimate)
+    }
+
+    /// How much to draw for other aircraft at a map zoom level (visible latitude span in degrees):
+    /// nothing at continental scale, bare icons regionally, labelled icons close in.
+    enum MapDetail: Int, Comparable {
+        case hidden, icons, labelled
+        init(latitudeSpan: Double) {
+            self = latitudeSpan < 5 ? .labelled : latitudeSpan < 14 ? .icons : .hidden
+        }
+        static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
+    }
+
+    /// A map region in degrees.
+    struct Framing: Equatable {
+        var center: GeoPoint
+        var latitudeDelta: Double
+        var longitudeDelta: Double
+    }
+
+    /// The smallest region containing `points` plus a margin, handling routes across the
+    /// antimeridian (the region spans the longitudes' largest gap's complement).
+    static func framing(_ points: [GeoPoint], margin: Double = 0.18, minimumDegrees: Double = 0.3) -> Framing? {
+        let pts = points.filter { $0.lat.isFinite && $0.lon.isFinite }
+        guard !pts.isEmpty else { return nil }
+        func wrap(_ l: Double) -> Double { ((l + 180).truncatingRemainder(dividingBy: 360) + 360).truncatingRemainder(dividingBy: 360) - 180 }
+        let lons = pts.map { wrap($0.lon) }.sorted()
+        var start = lons[0], biggestGap = 360 - (lons[lons.count - 1] - lons[0])
+        for i in lons.indices.dropFirst() where lons[i] - lons[i - 1] > biggestGap {
+            biggestGap = lons[i] - lons[i - 1]
+            start = lons[i]
+        }
+        let lonSpan = 360 - biggestGap
+        let lats = pts.map { min(85, max(-85, $0.lat)) }
+        let minLat = lats.min()!, maxLat = lats.max()!
+        // Centre on the Mercator midpoint so the route sits in the middle of the map.
+        func y(_ lat: Double) -> Double { log(tan(.pi / 4 + lat * .pi / 360)) }
+        let midY = (y(minLat) + y(maxLat)) / 2
+        let centerLat = (2 * atan(exp(midY)) - .pi / 2) * 180 / .pi
+        let halfLat = max(maxLat - centerLat, centerLat - minLat)
+        let latDelta = min(170, max(minimumDegrees, 2 * halfLat * (1 + 2 * margin)))
+        let cosLat = max(0.2, cos(centerLat * .pi / 180))
+        let lonDelta = min(360, max(minimumDegrees / cosLat, lonSpan * (1 + 2 * margin)))
+        return Framing(center: GeoPoint(lat: centerLat, lon: wrap(start + lonSpan / 2)),
+                       latitudeDelta: latDelta, longitudeDelta: lonDelta)
+    }
+
+    /// What to say about where to look: a headline ("Look 32° up, toward NE") and a detail line.
+    static func lookUp(_ sky: SkyPosition) -> (headline: String, detail: String) {
+        let bearing = String(format: "%03d°", Int(sky.azimuth.rounded()) % 360)
+        guard sky.isAboveHorizon else {
+            return ("Below your horizon", "Toward \(sky.compassPoint) (\(bearing)), hidden by the Earth’s curve")
+        }
+        let up = sky.elevation < 1 ? "less than 1°" : "\(Int(sky.elevation.rounded()))°"
+        return ("Look \(up) up, toward \(sky.compassPoint)", "Bearing \(bearing)")
+    }
+}

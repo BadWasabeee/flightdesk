@@ -45,22 +45,44 @@ enum WidgetUnits: String, AppEnum {
 /// Per-widget overrides shown in "Edit Widget". Everything else comes from FlightDesk Settings.
 struct FlightWidgetIntent: WidgetConfigurationIntent {
     static var title: LocalizedStringResource = "Flights Overhead"
-    static var description = IntentDescription("Live aircraft near you. Display options are set in FlightDesk Settings; these override them for this widget.")
+    static var description = IntentDescription("Choose what this widget shows. Options left on “Same as FlightDesk Settings” follow the app.")
 
-    @Parameter(title: "Location", description: "City, airport or “lat, lon”. Leave blank to use the location set in FlightDesk.")
+    @Parameter(title: "Location",
+               description: "A city, airport code or coordinates (“39.7, -104.9”). Leave empty to use the location set in FlightDesk.")
     var location: String?
 
-    @Parameter(title: "Style", default: .app)
+    @Parameter(title: "Style", description: "LED Board glows like a departures board. Standard follows Light and Dark Mode.",
+               default: .app)
     var styleChoice: WidgetStyle
 
-    @Parameter(title: "Radius", default: .app)
-    var radiusChoice: WidgetRadius
-
-    @Parameter(title: "LED Color", default: .app)
+    @Parameter(title: "LED Color", description: "The color of the LED Board style.", default: .app)
     var colorChoice: WidgetTheme
+
+    @Parameter(title: "Radius", description: "How far from the location to look for aircraft.", default: .app)
+    var radiusChoice: WidgetRadius
 
     @Parameter(title: "Units", default: .app)
     var unitsChoice: WidgetUnits
+
+    static var parameterSummary: some ParameterSummary {
+        // LED Color means nothing to the Standard style, so don't offer it there.
+        When(\.$styleChoice, .equalTo, WidgetStyle.standard) {
+            Summary {
+                \.$location
+                \.$styleChoice
+                \.$radiusChoice
+                \.$unitsChoice
+            }
+        } otherwise: {
+            Summary {
+                \.$location
+                \.$styleChoice
+                \.$colorChoice
+                \.$radiusChoice
+                \.$unitsChoice
+            }
+        }
+    }
 
     /// App settings with this widget's overrides applied.
     func effective() -> (settings: AppSettings, radius: SearchRadius) {
@@ -86,12 +108,13 @@ struct FlightEntry: TimelineEntry {
 }
 
 struct Provider: AppIntentTimelineProvider {
+    /// The gallery and first-render placeholder: a full sky, drawn in the user's chosen style.
     func placeholder(in context: Context) -> FlightEntry {
-        FlightEntry(date: .now, model: .sample, options: DisplayOptions())
+        FlightEntry(date: .now, model: .gallery, options: AppSettings.load().display)
     }
 
     func snapshot(for config: FlightWidgetIntent, in context: Context) async -> FlightEntry {
-        if context.isPreview { return FlightEntry(date: .now, model: .sample, options: config.effective().settings.display) }
+        if context.isPreview { return FlightEntry(date: .now, model: .gallery, options: config.effective().settings.display) }
         return await timeline(for: config, in: context).entries.first ?? placeholder(in: context)
     }
 
@@ -101,13 +124,14 @@ struct Provider: AppIntentTimelineProvider {
         let opts = settings.display
         var model = PanelModel(radiusNM: radius.nm)
 
+        // Status strings read "Title — Detail"; `PanelNotice` turns them into a designed state.
         var loc: (lat: Double, lon: Double, name: String)?
-        if let text = config.location, !text.trimmingCharacters(in: .whitespaces).isEmpty {
+        if let text = config.location?.trimmingCharacters(in: .whitespaces), !text.isEmpty {
             loc = await FlightService.resolve(text)
-            if loc == nil { model.status = "Can't find “\(text)”" }
+            if loc == nil { model.status = "Can't find “\(text)” — Edit the widget and try a city, airport code or coordinates" }
         } else {
             loc = Shared.location
-            if loc == nil { model.status = "Open FlightDesk or edit this widget to set a location" }
+            if loc == nil { model.status = "No location set — Choose one in FlightDesk or with Edit Widget" }
         }
         guard let loc else {
             return Timeline(entries: [FlightEntry(date: now, model: model, options: opts)], policy: .after(now + 900))
@@ -118,10 +142,10 @@ struct Provider: AppIntentTimelineProvider {
             model.flights = try await FlightService.nearby(lat: loc.lat, lon: loc.lon,
                                                            radiusNM: radius.nm, includeGA: settings.includeGA)
             model.updated = now
-            if model.flights.isEmpty { model.status = "Quiet skies — nothing within \(opts.radius(radius.nm))" }
+            if model.flights.isEmpty { model.status = "Quiet skies — Nothing within \(opts.radius(radius.nm)) right now" }
         } catch {
             fdLog.error("Widget fetch failed: \(error.localizedDescription)")
-            model.status = "No connection — retrying"
+            model.status = "Can’t reach flight data — Retrying in a couple of minutes"
             return Timeline(entries: [FlightEntry(date: now, model: model, options: opts)], policy: .after(now + 120))
         }
 
@@ -156,20 +180,25 @@ struct FlightWidgetView: View {
         }
     }
 
+    /// Where a click on the widget background goes. Small widgets allow only this one target,
+    /// so it opens the featured flight; without a location it opens FlightDesk's location setting.
+    private var widgetURL: URL? {
+        if let f = entry.model.featured { return family == .systemSmall ? FlightLink.url(for: f.id) : nil }
+        if entry.model.placeName.isEmpty { return URL(string: "\(FlightLink.scheme)://settings/general") }
+        return nil
+    }
+
     var body: some View {
         var o = entry.options
-        // Clear / Tinted / Monochrome desktop widget styles: macOS renders the widget on its own
-        // backing and tints accentable content, so drop our glow and texture.
+        // Clear / Tinted desktop styles and the dimmed (vibrant) state behind windows: macOS draws
+        // the widget on its own backing and tints accentable content, so drop glow and texture.
         if renderingMode != .fullColor { o.glow = false; o.dotMatrix = false }
-        // Clicking a flight opens its detail window in the app. Small widgets allow only one
-        // tap target, so the whole widget links to the featured flight.
-        let featuredURL = entry.model.featured.map { FlightLink.url(for: $0.id) }
-        return PanelContent(model: entry.model, layout: layout, accessory: AnyView(refreshButton(o)))
+        return PanelContent(model: entry.model, layout: layout, accessory: AnyView(refreshButton))
             .environment(\.displayOptions, o)
             .environment(\.flightLinkStyle, family == .systemSmall ? .none : .link)
-            .widgetURL(family == .systemSmall ? featuredURL : nil)
+            .widgetURL(widgetURL)
             .containerBackground(for: .widget) {
-                // Standard: the system background, light or dark to match the Mac's appearance.
+                // Standard: the system widget background, light or dark to match the Mac's appearance.
                 if o.isStandard {
                     Color(nsColor: .windowBackgroundColor)
                 } else {
@@ -178,14 +207,11 @@ struct FlightWidgetView: View {
             }
     }
 
-    private func refreshButton(_ o: DisplayOptions) -> some View {
-        Button(intent: RefreshFlightsIntent()) {
-            Image(systemName: "arrow.clockwise")
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(o.isStandard ? Color.secondary : o.theme.color.opacity(0.55))
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("Refresh flights")
+    private var refreshButton: some View {
+        Button(intent: RefreshFlightsIntent()) { RefreshGlyph() }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Refresh flights")
+            .help("Refresh flights")
     }
 }
 
@@ -195,8 +221,9 @@ struct FlightDeskWidget: Widget {
             FlightWidgetView(entry: $0)
         }
         .configurationDisplayName("Flights Overhead")
-        .description("Live aircraft near you, as an LED flight board or a clean system look.")
+        .description("The aircraft flying near you right now, on a glowing LED board or in a clean system style.")
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge, .systemExtraLarge])
+        // The board draws its own 14–16 pt margins so the LED texture and the layout grid line up.
         .contentMarginsDisabled()
     }
 }

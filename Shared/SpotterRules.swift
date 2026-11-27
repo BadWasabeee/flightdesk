@@ -153,6 +153,33 @@ struct WatchItem: Codable, Identifiable, Hashable {
             case .type: "A388, B748, C17"
             }
         }
+        /// SF Symbol shown next to entries of this kind.
+        var symbol: String {
+            switch self {
+            case .registration: "tag"
+            case .hex: "number"
+            case .callsign: "antenna.radiowaves.left.and.right"
+            case .type: "airplane"
+            }
+        }
+        /// One line explaining what an entry of this kind matches.
+        var explanation: String {
+            switch self {
+            case .registration: "Matches one airframe by its tail number, e.g. G-EUPT."
+            case .hex: "Matches one airframe by its 6-character transponder address."
+            case .callsign: "Matches every callsign that starts with this, e.g. DAL for all Delta flights."
+            case .type: "Matches every aircraft of an ICAO type, e.g. A388 or B748."
+            }
+        }
+        /// Shown when the typed value can't be an entry of this kind.
+        var validationHint: String {
+            switch self {
+            case .hex: "A hex code is 6 characters, 0–9 and A–F."
+            case .type: "A type code is 2–4 letters and digits and starts with a letter."
+            case .callsign: "Use up to 8 letters and digits."
+            case .registration: "Use 2–10 letters, digits and dashes."
+            }
+        }
     }
 
     var id = UUID()
@@ -311,7 +338,7 @@ enum SpotterEngine {
             case .emergency:
                 label = squawk.flatMap { code in emergencySquawks[code].map { "\($0) · squawk \(code)" } }
             case .watchlist:
-                label = settings.watchlist.contains { $0.matches(f) } ? "Watchlist" : nil
+                label = settings.watchlist.first { $0.matches(f) }.map { "Watchlist · \($0.value)" }
             case .interesting:
                 if let e = entry {
                     if settings.interestingGroups.contains(e.group) { label = PlaneAlertDB.groupTitle(e.group) }
@@ -319,7 +346,7 @@ enum SpotterEngine {
                     else { label = nil }
                 } else { label = nil }
             case .heavy:
-                label = AircraftClass(typeCode: f.typeCode) == .wideBody ? "Heavy" : nil
+                label = AircraftClass(typeCode: f.typeCode) == .wideBody ? "Wide-body" : nil
             case .proximity:
                 label = f.distance <= Double(settings.proximityNM) ? "Close approach" : nil
             }
@@ -342,7 +369,20 @@ struct AlertLedger: Codable, Equatable {
     static let window: TimeInterval = 2 * 3600
     static let key = "spotter.ledger.v1"
 
+    /// How long "Mute This Aircraft" silences one aircraft.
+    static let muteDuration: TimeInterval = 24 * 3600
+
     private(set) var sent: [String: Date] = [:]
+    /// Aircraft (lowercase hex) silenced from a notification's action, with when the mute ends.
+    private(set) var muted: [String: Date] = [:]
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sent = c.value(.sent, [:])
+        muted = c.value(.muted, [:])
+    }
 
     private static func key(_ rule: SpotterRule, _ hex: String) -> String { "\(rule.rawValue)|\(hex.lowercased())" }
 
@@ -353,15 +393,30 @@ struct AlertLedger: Codable, Equatable {
 
     mutating func record(_ rule: SpotterRule, hex: String, now: Date) { sent[Self.key(rule, hex)] = now }
 
-    mutating func prune(now: Date) { sent = sent.filter { now.timeIntervalSince($0.value) < Self.window } }
+    /// Silences every rule for one aircraft until `now + duration`.
+    mutating func mute(hex: String, now: Date, for duration: TimeInterval = AlertLedger.muteDuration) {
+        muted[hex.lowercased()] = now.addingTimeInterval(duration)
+    }
+
+    func isMuted(hex: String, now: Date) -> Bool { (muted[hex.lowercased()] ?? .distantPast) > now }
+
+    /// Aircraft muted at `now`.
+    func mutedCount(now: Date) -> Int { muted.values.filter { $0 > now }.count }
+
+    mutating func unmuteAll() { muted.removeAll() }
+
+    mutating func prune(now: Date) {
+        sent = sent.filter { now.timeIntervalSince($0.value) < Self.window }
+        muted = muted.filter { $0.value > now }
+    }
 
     /// Picks at most one alert per aircraft (its highest-priority rule not sent recently) and records every
     /// fresh rule for that aircraft so lesser rules don't follow up. At most `limit` aircraft per call;
-    /// the rest stay unrecorded and are offered again next time.
+    /// the rest stay unrecorded and are offered again next time. Muted aircraft are skipped.
     mutating func admit(_ candidates: [SpotterAlert], now: Date, limit: Int = 3) -> [SpotterAlert] {
         var order: [String] = []
         var byHex: [String: [SpotterAlert]] = [:]
-        for a in candidates where !isRecent(a.rule, hex: a.flight.id, now: now) {
+        for a in candidates where !isRecent(a.rule, hex: a.flight.id, now: now) && !isMuted(hex: a.flight.id, now: now) {
             if byHex[a.flight.id] == nil { order.append(a.flight.id) }
             byHex[a.flight.id, default: []].append(a)
         }
@@ -384,10 +439,17 @@ extension SpotterAlert {
         return flight.typeCode.isEmpty ? "Aircraft" : flight.typeCode
     }
 
-    /// e.g. "Military · Boeing C-17A Globemaster III overhead".
-    var title: String { "\(label) · \(aircraftName) \(flight.distance <= 3 ? "overhead" : "nearby")" }
+    /// e.g. "Boeing C-17A Globemaster III overhead".
+    var aircraftHeadline: String { "\(aircraftName) \(flight.distance <= 3 ? "overhead" : "nearby")" }
 
-    /// e.g. "RCH123 · 07-7183 · US Air Force\n24,000 ft · 4.2 nm NE".
+    /// What the notification leads with: the aircraft, except for emergencies where the squawk comes first.
+    /// e.g. "Boeing C-17A Globemaster III overhead", "Emergency · squawk 7700".
+    var title: String { rule == .emergency ? label : aircraftHeadline }
+
+    /// Why it alerted, e.g. "Military", "Watchlist · B748"; for emergencies, the aircraft.
+    var subtitle: String { rule == .emergency ? aircraftHeadline : label }
+
+    /// e.g. "RCH123 · 07-7183 · US Air Force\n24,000 ft ▲ · 4.2 nm NE".
     func body(display: DisplayOptions) -> String {
         var d = display
         d.style = .standard

@@ -209,6 +209,17 @@ final class ReceiverFeedTests: XCTestCase {
         XCTAssertTrue(ReceiverFeed.describe(ReceiverError.noAircraftData(host: "pi.local"), base: "pi.local").contains("aircraft.json"))
     }
 
+    func testConnectedSummary() {
+        let url = URL(string: "http://pi.local/tar1090/data/aircraft.json")!
+        let r = ReceiverFeed.connected(total: 1214, near: 37, radius: "185 km", software: "readsb", elapsed: 0.045, url: url)
+        XCTAssertTrue(r.ok)
+        XCTAssertEqual(r.message, "Connected to readsb · \(1214.formatted()) aircraft, 37 within 185 km")
+        XCTAssertEqual(r.detail, "http://pi.local/tar1090/data/aircraft.json · 45 ms")
+        let plain = ReceiverFeed.connected(total: 3, near: nil, radius: nil, software: nil, elapsed: 2.34, url: url)
+        XCTAssertEqual(plain.message, "Connected · 3 aircraft")
+        XCTAssertEqual(plain.detail, "http://pi.local/tar1090/data/aircraft.json · 2.3 s")
+    }
+
     // MARK: Live receiver (opt-in)
 
     /// Discovery against a real or simulated receiver. Set `FLIGHTDESK_RECEIVER_URL` (pass it to
