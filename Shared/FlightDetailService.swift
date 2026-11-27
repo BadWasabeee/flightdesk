@@ -194,7 +194,7 @@ enum FlightDetailService {
         async let aircraft = LookupCache.shared.aircraft(f.id)
         let result = await (route, aircraft)
         await LookupCache.shared.save()
-        if let code = result.0?.airlineCode { await AirlineLogos.prefetch([code]) }
+        if let key = AirlineLogos.Key(icao: f.airlineICAO, iata: result.0?.airlineCode) { await AirlineLogos.prefetch([key]) }
         return result
     }
 }

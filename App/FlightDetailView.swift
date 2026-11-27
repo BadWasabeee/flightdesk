@@ -453,7 +453,7 @@ private struct FlightDetailSidebar: View {
     private func header(_ f: Flight) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                AirlineLogo(code: f.airlineCode, size: 28)
+                AirlineLogo(code: f.logoKey?.id, size: 28)
                     .environment(\.displayOptions, o)
                 Text(f.airlineName.isEmpty ? (f.aircraft?.model ?? "") : f.airlineName)
                     .font(.headline)

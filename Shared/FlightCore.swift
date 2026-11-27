@@ -346,7 +346,7 @@ enum FlightService {
             for await (i, r, a) in group { list[i].route = r; list[i].aircraft = a }
         }
         await LookupCache.shared.save()
-        await AirlineLogos.prefetch(Set(list.compactMap(\.airlineCode)))
+        await AirlineLogos.prefetch(Set(list.compactMap(\.logoKey)))
         fdLog.info("Fetched \(list.count) flights within \(radiusNM) nm")
         return list
     }
@@ -527,35 +527,83 @@ extension PanelModel {
 
 // MARK: - Airline logos
 
-/// Square airline logos, downloaded once into the shared container so the widget can draw them
-/// synchronously. Source: Kiwi.com's public airline logo CDN, keyed by IATA code.
-enum AirlineLogos {
-    private static var dir: URL { Shared.containerURL.appendingPathComponent("logos", isDirectory: true) }
-    private static let maxAge: TimeInterval = 30 * 86_400
-    private static let missAge: TimeInterval = 7 * 86_400
-    /// The CDN answers unknown airlines with a generic image instead of a 404.
-    private static let placeholders: Set<String> = [
-        "53545c0ed6a76040fb5afe0af343ff29feb7545fceae2caaa0680c711c95657b",   // grey plane
-        "1fe23e6d0b1ae8e9a8b8102f7dde086e9e3dd4de6a82f5ee73fa4616fd820855",   // "K" badge
-    ]
+// AppKit/ImageIO are only needed here: SVG logos are rasterized to PNG once, and every logo is
+// checked for a transparent background before it is cached.
+import AppKit
+import ImageIO
 
-    private static func valid(_ code: String) -> Bool {
-        (2...3).contains(code.count) && code.allSatisfy { $0.isLetter || $0.isNumber }
+extension Flight {
+    /// ICAO airline designator from an airline-style callsign ("SWA2210" → "SWA"). Known even
+    /// when no route has been verified.
+    var airlineICAO: String? { looksLikeAirline ? String(callsign.prefix(3)).uppercased() : nil }
+    /// Which airline logo to show for this flight.
+    var logoKey: AirlineLogos.Key? { AirlineLogos.Key(icao: airlineICAO, iata: airlineCode) }
+}
+
+/// Transparent-background airline logos, downloaded once into the shared container so the widget
+/// can draw them synchronously. Only airline codes are ever sent, never a location.
+///
+/// Sources, tried in order until one has a usable logo:
+/// 1. Soaring Symbols (curated SVG icons, by ICAO or IATA via its MIT-licensed catalog), via jsDelivr.
+/// 2. Jxck-S/airline-logos on GitHub (transparent PNG logos by ICAO, two sets), via jsDelivr
+///    with raw.githubusercontent.com as a fallback.
+/// 3. sexym0nk3y/airline-logos on GitHub (PNG logos by ICAO), same hosts.
+/// 4. Kiwi.com's public logo CDN (by IATA).
+/// Everything except the curated icons must pass `isUsable` (a transparent background), so
+/// square tiles, placeholders and blank images are skipped.
+enum AirlineLogos {
+    /// An airline to look up: its ICAO designator (preferred) and/or IATA code.
+    struct Key: Hashable, Sendable {
+        let icao: String?
+        let iata: String?
+
+        init?(icao: String?, iata: String?) {
+            let icao = icao?.uppercased(), iata = iata?.uppercased()
+            self.icao = icao.flatMap { $0.count == 3 && $0.allSatisfy(\.isLetter) && $0.allSatisfy(\.isASCII) ? $0 : nil }
+            self.iata = iata.flatMap { $0.count == 2 && $0.allSatisfy { ($0.isLetter || $0.isNumber) && $0.isASCII } ? $0 : nil }
+            if self.icao == nil && self.iata == nil { return nil }
+        }
+
+        /// The cache file name (and the `code` passed to `AirlineLogo`).
+        var id: String { icao ?? iata ?? "" }
     }
 
-    /// Local file for an airline's logo, if one has been downloaded.
+    private static var dir: URL { Shared.containerURL.appendingPathComponent("logos-v2", isDirectory: true) }
+    private static var legacyDir: URL { Shared.containerURL.appendingPathComponent("logos", isDirectory: true) }
+    private static let maxAge: TimeInterval = 30 * 86_400
+    private static let missAge: TimeInterval = 7 * 86_400
+    /// Longest side of a cached logo, in pixels.
+    private static let side = 128
+
+    /// Images the sources serve for airlines they don't really have (SHA-256 of the file).
+    private static let placeholders: Set<String> = [
+        "53545c0ed6a76040fb5afe0af343ff29feb7545fceae2caaa0680c711c95657b",   // Kiwi: grey plane
+        "1fe23e6d0b1ae8e9a8b8102f7dde086e9e3dd4de6a82f5ee73fa4616fd820855",   // Kiwi: "K" badge
+        "10cb7d062c8cb9098ebaa9e17e6ce29d9d6faad9f49597ee49293bc78f66556f",   // Jxck-S: blue/green square
+        "c893c140ac2e42bfea1f787471fc6a8e708d32afbcb60d581b9ccad54270e17f",   // Jxck-S: plain black disc
+    ]
+
+    private static func valid(_ id: String) -> Bool {
+        (2...3).contains(id.count) && id.allSatisfy { ($0.isLetter || $0.isNumber) && $0.isASCII }
+    }
+
+    /// Local file for an airline's logo (by `Key.id`), if one has been downloaded.
     static func file(for code: String?) -> URL? {
         guard let code = code?.uppercased(), valid(code) else { return nil }
         let u = dir.appendingPathComponent("\(code).png")
         return FileManager.default.fileExists(atPath: u.path) ? u : nil
     }
 
-    static func prefetch(_ codes: Set<String>) async {
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    static func prefetch(_ keys: Set<Key>) async {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Drop the old solid-background logos — only inside our own app-group container, never a shared Caches folder.
+        if !Shared.groupID.isEmpty, fm.fileExists(atPath: legacyDir.path) { try? fm.removeItem(at: legacyDir) }
+        // One request per airline even if it's passed under several keys (e.g. with and without IATA).
+        var byID: [String: Key] = [:]
+        for k in keys where byID[k.id]?.iata == nil { byID[k.id] = k }
         await withTaskGroup(of: Void.self) { g in
-            for code in codes.map({ $0.uppercased() }) where valid(code) {
-                g.addTask { await fetch(code) }
-            }
+            for key in byID.values { g.addTask { await fetch(key) } }
         }
     }
 
@@ -563,19 +611,214 @@ enum AirlineLogos {
         (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate).map { -$0.timeIntervalSinceNow }
     }
 
-    private static func fetch(_ code: String) async {
-        let png = dir.appendingPathComponent("\(code).png"), miss = dir.appendingPathComponent("\(code).none")
+    // MARK: Sources
+
+    private struct Candidate {
+        /// Mirrors of the same file, tried in order while they fail (not on 404).
+        var urls: [URL]
+        /// Curated SVG: rasterized, and trusted without the transparency check.
+        var isSVG = false
+    }
+
+    private static func github(_ repo: String, _ branch: String, _ path: String) -> Candidate {
+        Candidate(urls: [URL(string: "https://cdn.jsdelivr.net/gh/\(repo)@\(branch)/\(path)"),
+                         URL(string: "https://raw.githubusercontent.com/\(repo)/\(branch)/\(path)")].compactMap { $0 })
+    }
+
+    private static func candidates(for key: Key) async -> [Candidate] {
+        var list: [Candidate] = []
+        if let slug = await SoaringSymbols.shared.slug(icao: key.icao, iata: key.iata),
+           let u = URL(string: "\(SoaringSymbols.base)/dist/airlines/\(slug)/icon.svg") {
+            list.append(Candidate(urls: [u], isSVG: true))
+        }
+        if let icao = key.icao {
+            list.append(github("Jxck-S/airline-logos", "main", "flightaware_logos/\(icao).png"))
+            list.append(github("Jxck-S/airline-logos", "main", "radarbox_logos/\(icao).png"))
+            list.append(github("sexym0nk3y/airline-logos", "main", "logos/\(icao).png"))
+        }
+        if let iata = key.iata, let u = URL(string: "https://images.kiwi.com/airlines/128x128/\(iata).png") {
+            list.append(Candidate(urls: [u]))
+        }
+        return list
+    }
+
+    private enum Download { case data(Data), notFound, failed }
+
+    private static func download(_ urls: [URL]) async -> Download {
+        for url in urls {
+            guard let (data, resp) = try? await FlightService.session.data(from: url),
+                  let code = (resp as? HTTPURLResponse)?.statusCode else { continue }
+            if code == 200 { return .data(data) }
+            if code == 404 { return .notFound }
+        }
+        return .failed
+    }
+
+    private static func fetch(_ key: Key) async {
+        let id = key.id
+        guard valid(id) else { return }
+        let png = dir.appendingPathComponent("\(id).png"), miss = dir.appendingPathComponent("\(id).none")
         if let a = age(png), a < maxAge { return }
         if let a = age(miss), a < missAge { return }
-        guard let url = URL(string: "https://images.kiwi.com/airlines/128x128/\(code).png"),
-              let (data, resp) = try? await FlightService.session.data(from: url),
-              (resp as? HTTPURLResponse)?.statusCode == 200 else { return }
-        if data.count < 1_000 || !data.starts(with: [0x89, 0x50, 0x4E, 0x47])
-            || placeholders.contains(SHA256.hash(data: data).hex) {
-            try? Data().write(to: miss)
-        } else {
-            try? data.write(to: png, options: .atomic)
+        // Only record a miss when every source answered; a network failure shouldn't hide logos for a week.
+        var definitive = true
+        for c in await candidates(for: key) {
+            switch await download(c.urls) {
+            case .data(let data):
+                let out = c.isSVG ? rasterizedSVG(data) : (isUsable(data) ? trimmedPNG(data) : nil)
+                if let out {
+                    try? out.write(to: png, options: .atomic)
+                    try? FileManager.default.removeItem(at: miss)
+                    return
+                }
+            case .notFound: continue
+            case .failed: definitive = false
+            }
         }
+        // An expired logo stays in place (still shown) if no source has a newer one.
+        if definitive { try? Data().write(to: miss) }
+    }
+
+    // MARK: Image checks
+
+    /// Whether downloaded PNG data is a real logo on a transparent background: not a known
+    /// placeholder, transparent around the edges and corners, not blank, and not all white.
+    static func isUsable(_ data: Data) -> Bool {
+        guard data.count >= 200, data.starts(with: [0x89, 0x50, 0x4E, 0x47]),
+              !placeholders.contains(SHA256.hash(data: data).hex),
+              let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return false }
+        switch img.alphaInfo {
+        case .none, .noneSkipFirst, .noneSkipLast: return false
+        default: break
+        }
+        let n = 64
+        guard let px = rgba(img, width: n, height: n) else { return false }
+        func alpha(_ x: Int, _ y: Int) -> UInt8 { px[(y * n + x) * 4 + 3] }
+        // Corners (inset 2 px, past any anti-aliased border) must be see-through.
+        guard [alpha(2, 2), alpha(n - 3, 2), alpha(2, n - 3), alpha(n - 3, n - 3)].allSatisfy({ $0 < 16 }) else { return false }
+        var clear = 0, solid = 0, white = 0
+        for i in 0..<(n * n) {
+            let a = px[i * 4 + 3]
+            if a < 16 { clear += 1 }
+            if a > 128 {
+                solid += 1
+                // Premultiplied: near-white when every channel is close to alpha.
+                if (0..<3).allSatisfy({ Int(px[i * 4 + $0]) * 10 >= Int(a) * 9 }) { white += 1 }
+            }
+        }
+        let total = Double(n * n)
+        return Double(clear) / total >= 0.15            // a background tile, not a logo
+            && Double(solid) / total >= 0.03            // blank
+            && Double(white) < Double(solid) * 0.9      // invisible on light backgrounds
+    }
+
+    /// An SVG rendered to PNG (longest side `side` px), so the widget only ever reads PNGs.
+    static func rasterizedSVG(_ data: Data) -> Data? {
+        guard data.count > 20, let img = NSImage(data: data), img.size.width > 0, img.size.height > 0 else { return nil }
+        let k = CGFloat(side) / max(img.size.width, img.size.height)
+        let w = max(1, Int((img.size.width * k).rounded())), h = max(1, Int((img.size.height * k).rounded()))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        img.draw(in: NSRect(x: 0, y: 0, width: w, height: h))
+        NSGraphicsContext.restoreGraphicsState()
+        return ctx.makeImage().flatMap(trimmed).flatMap(pngData)
+    }
+
+    /// PNG data with transparent margins cropped, so logos from different sources fill the same space.
+    private static func trimmedPNG(_ data: Data) -> Data? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
+        return trimmed(img).flatMap(pngData)
+    }
+
+    private static func trimmed(_ img: CGImage) -> CGImage? {
+        let w = img.width, h = img.height
+        guard let px = rgba(img, width: w, height: h) else { return nil }
+        var minX = w, minY = h, maxX = -1, maxY = -1
+        for y in 0..<h {
+            for x in 0..<w where px[(y * w + x) * 4 + 3] > 8 {
+                minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+            }
+        }
+        guard maxX >= minX else { return nil }
+        // Rows in `px` run top-down, matching CGImage cropping coordinates.
+        let pad = 1
+        let r = CGRect(x: max(0, minX - pad), y: max(0, minY - pad),
+                       width: min(w, maxX + pad + 1) - max(0, minX - pad),
+                       height: min(h, maxY + pad + 1) - max(0, minY - pad))
+        return img.cropping(to: r)
+    }
+
+    /// Premultiplied RGBA pixels, top row first.
+    private static func rgba(_ img: CGImage, width: Int, height: Int) -> [UInt8]? {
+        var px = [UInt8](repeating: 0, count: width * height * 4)
+        let ok = px.withUnsafeMutableBytes { buf -> Bool in
+            guard let ctx = CGContext(data: buf.baseAddress, width: width, height: height, bitsPerComponent: 8,
+                                      bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(img, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        return ok ? px : nil
+    }
+
+    private static func pngData(_ img: CGImage) -> Data? {
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, "public.png" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, img, nil)
+        return CGImageDestinationFinalize(dest) ? out as Data : nil
+    }
+}
+
+/// The Soaring Symbols catalog (MIT-licensed data), reduced to code → slug and cached for a week.
+actor SoaringSymbols {
+    static let shared = SoaringSymbols()
+    static let base = "https://cdn.jsdelivr.net/npm/soaring-symbols@0"
+    private var loading: Task<[String: String], Never>?
+
+    private var file: URL { Shared.containerURL.appendingPathComponent("logos-v2/soaring-symbols.json") }
+
+    func slug(icao: String?, iata: String?) async -> String? {
+        if loading == nil { loading = Task { await Self.load(from: file) } }
+        guard let map = await loading?.value else { return nil }
+        return icao.flatMap { map["ICAO:\($0)"] } ?? iata.flatMap { map["IATA:\($0)"] }
+    }
+
+    private static func load(from file: URL) async -> [String: String] {
+        let cached = (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode([String: String].self, from: $0) }
+        let age = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+            .map { -$0.timeIntervalSinceNow } ?? .infinity
+        if let cached, age < 7 * 86_400 { return cached }
+        guard let url = URL(string: "\(base)/dist/airlines.json"),
+              let (data, resp) = try? await FlightService.session.data(from: url),
+              (resp as? HTTPURLResponse)?.statusCode == 200 else { return cached ?? [:] }
+        let map = parse(data)
+        if map.isEmpty { return cached ?? [:] }
+        if let out = try? JSONEncoder().encode(map) { try? out.write(to: file, options: .atomic) }
+        return map
+    }
+
+    /// Codes of active airlines that have a colour icon. A shared IATA code (a controlled duplicate)
+    /// goes to the airline that holds it outright.
+    static func parse(_ data: Data) -> [String: String] {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) else { return [:] }
+        let airlines = (obj as? [[String: Any]]) ?? ((obj as? [String: Any])?["airlines"] as? [[String: Any]]) ?? []
+        var map: [String: String] = [:]
+        for a in airlines {
+            guard let slug = a["slug"] as? String, !slug.isEmpty,
+                  slug.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }),
+                  a["defunct"] as? Bool != true,
+                  let icon = (a["assets"] as? [String: Any])?["icon"] as? [String: Any],
+                  icon["color"] as? Bool == true else { continue }
+            if let icao = (a["icao"] as? String)?.uppercased(), map["ICAO:\(icao)"] == nil { map["ICAO:\(icao)"] = slug }
+            if let iata = (a["iata"] as? String)?.uppercased(), a["iata_duplicate"] as? Bool != true,
+               map["IATA:\(iata)"] == nil { map["IATA:\(iata)"] = slug }
+        }
+        return map
     }
 }
 

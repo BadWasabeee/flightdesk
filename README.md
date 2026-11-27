@@ -100,13 +100,14 @@ Each widget refresh fetches nearby aircraft and adds aircraft and route details 
 | Routes, airlines, aircraft models | [adsbdb](https://www.adsbdb.com) |
 | Recorded flight tracks (detail window) | [OpenSky Network](https://opensky-network.org), anonymous access |
 | Airport locations (bundled) | [OurAirports](https://ourairports.com/data/), public domain |
+| Airline logos (downloaded at runtime, not included in this repo) | [Soaring Symbols](https://github.com/soaring-symbols/soaring-symbols) icons (catalog data MIT), then [Jxck-S/airline-logos](https://github.com/Jxck-S/airline-logos) and [sexym0nk3y/airline-logos](https://github.com/sexym0nk3y/airline-logos) via [jsDelivr](https://www.jsdelivr.com) / GitHub, then [Kiwi.com](https://www.kiwi.com)'s logo CDN; only transparent-background logos are kept. Logos are trademarks of their respective airlines. |
 
 These are free community services. Please be kind to them, and consider supporting them or contributing a feeder.
 
 ## Privacy
 
 - The flight detail window looks up the selected aircraft's track on the [OpenSky Network](https://opensky-network.org) by its ICAO address only.
-- Airline logos are fetched by airline code from Kiwi.com's public logo CDN (no location is sent). Turn off **Show airline logos** to disable this.
+- Airline logos are fetched by airline code only (ICAO and/or IATA, never your location) from jsDelivr, GitHub (raw.githubusercontent.com) and Kiwi.com's logo CDN, then cached on your Mac. Turn off **Show airline logos** to disable this.
 
 - Your location stays on your Mac. Requests to adsb.lol include only a **rounded** position (about 1 km).
 - adsbdb receives only flight callsigns and aircraft hex codes.

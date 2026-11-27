@@ -206,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     /// FLIGHTDESK_SNAPSHOT_DIR=/path renders every widget size + the panel to PNGs, then quits.
     private func runSnapshotIfRequested() {
         guard let dir = ProcessInfo.processInfo.environment["FLIGHTDESK_SNAPSHOT_DIR"] else { return }
-        Task { await AirlineLogos.prefetch(Set(PanelModel.sample.flights.compactMap(\.airlineCode))) }
+        Task { await AirlineLogos.prefetch(Set(PanelModel.sample.flights.compactMap(\.logoKey))) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
             let env = ProcessInfo.processInfo.environment
             let m = (self.store.model.flights.isEmpty || env["FLIGHTDESK_SNAPSHOT_SAMPLE"] != nil) ? PanelModel.sample : self.store.model

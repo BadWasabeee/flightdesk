@@ -204,7 +204,9 @@ struct RouteLine: View {
 }
 
 /// Airline logo from the shared cache. Draws nothing until the logo has been downloaded.
+/// Logos have transparent backgrounds, so they're drawn as-is, fitted into a `size` square.
 struct AirlineLogo: View {
+    /// `AirlineLogos.Key.id` (usually `Flight.logoKey?.id`).
     let code: String?
     var size: CGFloat
     /// Keep the space even without a logo, so list columns stay aligned.
@@ -214,8 +216,8 @@ struct AirlineLogo: View {
     var body: some View {
         if o.showLogos, let u = AirlineLogos.file(for: code), let img = NSImage(contentsOf: u) {
             logo(Image(nsImage: img).resizable().interpolation(.high))
+                .aspectRatio(contentMode: .fit)
                 .frame(width: size, height: size)
-                .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
         } else if reserve && o.showLogos {
             Color.clear.frame(width: size, height: size)
         }
@@ -263,7 +265,7 @@ struct FeaturedView: View {
     private var small: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 4) {
-                AirlineLogo(code: f.airlineCode, size: 12)
+                AirlineLogo(code: f.logoKey?.id, size: 12)
                 LEDText(f.airlineName.isEmpty ? f.typeCode : f.airlineName, 9, dim: true)
                 Spacer(minLength: 2)
                 LEDText(f.displayNumber, 10)
@@ -299,7 +301,7 @@ struct FeaturedView: View {
     private var regular: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                AirlineLogo(code: f.airlineCode, size: layout == .medium ? 13 : 16)
+                AirlineLogo(code: f.logoKey?.id, size: layout == .medium ? 13 : 16)
                 LEDText(f.airlineName.isEmpty ? "—" : f.airlineName, 13, dim: true)
                 Spacer()
                 LEDText(f.displayNumber, 13)
@@ -343,7 +345,7 @@ struct RowView: View {
     var body: some View {
         HStack(spacing: 6) {
             HStack(spacing: 4) {
-                AirlineLogo(code: f.airlineCode, size: 12, reserve: true)
+                AirlineLogo(code: f.logoKey?.id, size: 12, reserve: true)
                 LEDText(f.displayNumber, 11)
             }
             .frame(width: o.showLogos ? 76 : 62, alignment: .leading)
