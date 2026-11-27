@@ -4,5 +4,18 @@
 <dict>
 	<key>FDAppGroupID</key>
 	<string>$(APP_GROUP_ID)</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER).flight</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>flightdesk</string>
+			</array>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+		</dict>
+	</array>
 </dict>
 </plist>

@@ -28,6 +28,46 @@ extension EnvironmentValues {
 
 enum PanelLayout { case small, medium, large, extraLarge, panel }
 
+/// How flights in a `PanelContent` respond to clicks.
+enum FlightLinkStyle {
+    /// Not clickable (settings preview, snapshots).
+    case none
+    /// Widget: each flight is a `Link` to its `FlightLink` deep link.
+    case link
+    /// In-app: run the action directly.
+    case action(@MainActor (Flight) -> Void)
+}
+
+private struct FlightLinkStyleKey: EnvironmentKey { static let defaultValue = FlightLinkStyle.none }
+extension EnvironmentValues {
+    var flightLinkStyle: FlightLinkStyle {
+        get { self[FlightLinkStyleKey.self] }
+        set { self[FlightLinkStyleKey.self] = newValue }
+    }
+}
+
+/// Makes a featured flight or list row clickable according to `\.flightLinkStyle`.
+private struct FlightTarget: ViewModifier {
+    let flight: Flight
+    @Environment(\.flightLinkStyle) private var style
+
+    func body(content: Content) -> some View {
+        switch style {
+        case .none:
+            content
+        case .link:
+            Link(destination: FlightLink.url(for: flight.id)) { content.contentShape(Rectangle()) }
+                .buttonStyle(.plain)
+        case .action(let action):
+            content
+                .contentShape(Rectangle())
+                .onTapGesture { action(flight) }
+                .help("Show flight details")
+                .accessibilityAddTraits(.isButton)
+        }
+    }
+}
+
 extension DisplayOptions {
     /// Hairline separators.
     var ruleColor: Color { isStandard ? Color.primary.opacity(0.15) : theme.color.opacity(0.18) }
@@ -376,8 +416,10 @@ struct PanelContent: View {
 
     @ViewBuilder private var featured: some View {
         if let f = model.featured {
-            FeaturedView(f: f, layout: layout).id(f.id).transition(.opacity)
+            FeaturedView(f: f, layout: layout)
                 .frame(height: layout == .panel ? 118 : nil, alignment: .top)
+                .modifier(FlightTarget(flight: f))
+                .id(f.id).transition(.opacity)
         } else {
             LEDText((model.status.isEmpty ? "Loading…" : model.status),
                     layout == .small ? 10 : 12, lines: 3)
@@ -388,7 +430,9 @@ struct PanelContent: View {
 
     private func rows(wide: Bool) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            ForEach(model.others.prefix(rowCount)) { RowView(f: $0, wide: wide) }
+            ForEach(model.others.prefix(rowCount)) { f in
+                RowView(f: f, wide: wide).modifier(FlightTarget(flight: f))
+            }
         }
     }
 }

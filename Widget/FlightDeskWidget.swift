@@ -161,8 +161,13 @@ struct FlightWidgetView: View {
         // Clear / Tinted / Monochrome desktop widget styles: macOS renders the widget on its own
         // backing and tints accentable content, so drop our glow and texture.
         if renderingMode != .fullColor { o.glow = false; o.dotMatrix = false }
+        // Clicking a flight opens its detail window in the app. Small widgets allow only one
+        // tap target, so the whole widget links to the featured flight.
+        let featuredURL = entry.model.featured.map { FlightLink.url(for: $0.id) }
         return PanelContent(model: entry.model, layout: layout, accessory: AnyView(refreshButton(o)))
             .environment(\.displayOptions, o)
+            .environment(\.flightLinkStyle, family == .systemSmall ? .none : .link)
+            .widgetURL(family == .systemSmall ? featuredURL : nil)
             .containerBackground(for: .widget) {
                 // Standard: the system background, light or dark to match the Mac's appearance.
                 if o.isStandard {

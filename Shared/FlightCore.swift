@@ -582,3 +582,21 @@ enum AirlineLogos {
 private extension Digest {
     var hex: String { map { String(format: "%02x", $0) }.joined() }
 }
+
+// MARK: - Deep links (widget → app)
+
+/// flightdesk://flight/<icao-hex> opens the flight detail window in the app.
+enum FlightLink {
+    static let scheme = "flightdesk"
+
+    static func url(for hex: String) -> URL {
+        URL(string: "\(scheme)://flight/\(hex.lowercased())")!
+    }
+
+    /// The aircraft hex from a FlightDesk deep link, or nil for anything else.
+    static func hex(from url: URL) -> String? {
+        guard url.scheme == scheme, url.host == "flight" else { return nil }
+        let h = url.lastPathComponent.lowercased()
+        return h.range(of: "^~?[0-9a-f]{6}$", options: .regularExpression) != nil ? h : nil
+    }
+}

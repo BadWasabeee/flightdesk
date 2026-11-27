@@ -21,6 +21,7 @@
 - **Live data.** Aircraft positions come from real-time ADS-B/MLAT. Between fetches, the widget moves each aircraft along its live heading, speed and climb rate every 15 s.
 - **Verified routes.** Origin and destination come from a public database. Each route is checked against the aircraft's live position and heading, and routes that don't fit are hidden. This catches stale or reused callsigns.
 - **Live progress.** The plane slides along the route line to show how far into the flight it is.
+- **Flight details.** Click a flight in the widget (or the desktop panel) to open a live map with its route, track and full details.
 - **Airline logos.** Downloaded once and cached (can be turned off in Settings).
 - **Two looks.** Choose an LED board (amber, green, red, blue, cyan or white, with optional glow and dot-matrix texture) or **Standard**, which uses system colours and follows Light and Dark Mode. Both work with the macOS *Clear* and *Tinted* widget styles.
 - **Configurable.** Set the location, radius (5–100 nm), units (ft/kt/nm or metric) and which details appear. Each widget can also override the location, radius, style, colour and units.

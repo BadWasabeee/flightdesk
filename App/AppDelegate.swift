@@ -20,6 +20,7 @@ struct PanelRoot: View {
         let o = store.settings.display
         PanelContent(model: store.model, layout: .panel)
             .environment(\.displayOptions, o)
+            .environment(\.flightLinkStyle, .action { FlightDetail.show(hex: $0.id, snapshot: $0) })
             .frame(width: 460)
             .fixedSize(horizontal: false, vertical: true)
             .modifier(PanelChrome(options: o))
@@ -34,6 +35,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     var settingsTab = SettingsTab.general
     var statusItem: NSStatusItem!
     let menu = NSMenu()
+    /// Settings opened by a reopen or first launch, held briefly so a deep link arriving
+    /// around the same time (widget click) can cancel it.
+    private var pendingSettings: DispatchWorkItem?
+    /// When the last `flightdesk://` link was handled.
+    private var lastLinkOpen = Date.distantPast
+    /// Links delivered before launch finished.
+    private var pendingLinks: [String] = []
+    private var didLaunch = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         let host = NSHostingController(rootView: PanelRoot(store: store))
@@ -65,17 +74,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         applyPanelSettings()
         store.start()
 
-        if !UserDefaults.standard.bool(forKey: "onboarded.v2") {
-            UserDefaults.standard.set(true, forKey: "onboarded.v2")
-            openSettings(tab: .widget)
+        didLaunch = true
+        pendingLinks.forEach { showFlight(hex: $0) }
+        pendingLinks.removeAll()
+
+        // Onboarding waits for a normal launch: when launched by a deep link the detail window wins.
+        let defaultLaunch = note.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool ?? true
+        if defaultLaunch, !UserDefaults.standard.bool(forKey: "onboarded.v2") {
+            scheduleSettings {
+                UserDefaults.standard.set(true, forKey: "onboarded.v2")
+                $0.openSettings(tab: .widget)
+            }
         }
         runSnapshotIfRequested()
     }
 
-    // Clicking the widget (or relaunching the app) opens Settings.
+    // Clicking an empty part of the widget (or relaunching the app) opens Settings.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        openSettings(tab: settingsTab)
+        guard Date().timeIntervalSince(lastLinkOpen) > 1 else { return true }
+        scheduleSettings { $0.openSettings(tab: $0.settingsTab) }
         return true
+    }
+
+    // MARK: Deep links
+
+    /// `flightdesk://flight/<hex>` from the widget opens that aircraft's detail window.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let hexes = urls.compactMap(FlightLink.hex(from:))
+        guard !hexes.isEmpty else { return }
+        lastLinkOpen = Date()
+        pendingSettings?.cancel()
+        pendingSettings = nil
+        if didLaunch { hexes.forEach(showFlight(hex:)) } else { pendingLinks += hexes }
+    }
+
+    private func showFlight(hex: String) {
+        FlightDetail.show(hex: hex, snapshot: store.model.flights.first { $0.id == hex })
+    }
+
+    /// Opens Settings after a short grace period, unless a deep link cancels it first.
+    /// The system's reopen and open-URL events for one widget click can arrive in either order.
+    private func scheduleSettings(_ open: @escaping @MainActor (AppDelegate) -> Void) {
+        pendingSettings?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.pendingSettings = nil
+                open(self)
+            }
+        }
+        pendingSettings = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     func applyPanelSettings() {
