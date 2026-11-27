@@ -96,10 +96,27 @@ If you run dump1090-fa (PiAware / SkyAware), readsb, tar1090 or ultrafeeder, ope
 
 FlightDesk then asks your receiver first and computes distances itself. If the receiver can't be reached it falls back to the internet feeds and retries the receiver a minute later. Turn on **Only use my receiver** to never use the internet feeds. macOS asks once for permission to access your local network; you can change this in System Settings › Privacy & Security › Local Network. Plain `http://` works for IP addresses and `.local` names.
 
+## Shortcuts & Siri
+
+FlightDesk adds actions to the Shortcuts app and phrases you can say to Siri or type in Spotlight. You don't have to set anything up:
+
+| Say or type | What happens |
+| --- | --- |
+| "What's flying over me in FlightDesk" | Siri describes the nearest aircraft, for example *"United 1543, a Boeing 737 from Chicago to Denver, 4 nautical miles north at 7,300 feet, descending. Also nearby: Delta 1342."* The card shows the closest few |
+| "Nearby flights in FlightDesk" | The nearest flights, nearest first |
+| "Find flight in FlightDesk" | Asks for a callsign (UAL1543), flight number (UA1543), registration (N12345) or hex address, and tells you about it if FlightDesk can see it |
+| "Open radar in FlightDesk" | Opens the main window on the live map |
+| "Open FlightDesk settings" / "Open alerts settings in FlightDesk" | Opens Settings at that tab |
+
+In Shortcuts, **What's Flying Overhead**, **Nearby Flights** (maximum count and an optional radius) and **Find Flight** return *Flight* items. Each one has a callsign, flight number, airline, registration, aircraft type, origin, destination, altitude, ground speed, distance, bearing, direction, vertical trend, situation (emergency, diversion and so on), a spoken summary and a `flightdesk://flight/<hex>` link. **Show Flight in FlightDesk** opens a flight in the main window, in the same window a widget click uses.
+
+Answers use your FlightDesk location, radius, private/GA setting and units. They reuse the data the app and widget fetched in the last few seconds, and otherwise make one request through the same rate-limited sources. Without a location set, Siri asks you to choose one in Settings first.
+
 ## How it works
 
 ```
-App/      Mac app: main radar window and menus, location, settings, floating panel, widget refresh scheduling
+App/      Mac app: main radar window and menus, location, settings, floating panel, widget refresh scheduling,
+          Shortcuts and Siri actions (App/Intents)
 Widget/   WidgetKit extension: timeline provider, Edit Widget options, refresh intent
 Shared/   Models, data service, route verification, dead reckoning, views (used by both targets)
 Tests/    Unit tests for route verification, projection, parsing and settings decoding

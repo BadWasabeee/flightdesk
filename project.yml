@@ -82,6 +82,10 @@ targets:
       - Tests
       - path: Shared
         excludes: ["Resources/**"]
+      # Siri/Shortcuts wording, matching and entity mapping (these depend only on Shared).
+      - path: App/Intents/FlightSpeech.swift
+      - path: App/Intents/FlightEntity.swift
+      - path: App/Intents/IntentFlights.swift
       # Airport table for route checks, read lazily by AirportDB.
       - path: Shared/Resources/airports.csv
         buildPhase: resources

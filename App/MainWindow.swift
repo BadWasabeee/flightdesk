@@ -385,6 +385,16 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSMenuItemValidati
         withAnimation(Self.motion) { radar?.showDetail(hex: hex, snapshot: snap) }
     }
 
+    /// Opens the main window on the live map, leaving Settings and any flight detail (Shortcuts' Open Radar).
+    func showRadar() {
+        showWindow(nil)
+        guard let radar else { return }
+        withAnimation(Self.motion) {
+            radar.closeSettings()
+            radar.closeDetail()
+        }
+    }
+
     /// Opens the main window on Settings at `tab`, or at the tab last shown.
     func showSettings(_ tab: SettingsTab? = nil) {
         showWindow(nil)

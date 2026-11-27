@@ -43,7 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     /// Links delivered before launch finished.
     private var pendingLinks: [String] = []
     private var didLaunch = false
-    /// A deep link has been handled (used to keep a link-triggered launch from opening the main window).
+    /// A deep link or intent has been handled (used to keep a launch it triggered from opening the main window).
     private var openedFromLink = false
     /// A Settings deep link that arrived before launch finished.
     private var pendingSettingsTab: SettingsTab?
@@ -94,6 +94,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             pendingSettingsTab = nil
             openSettings(tab: tab)
         }
+        pendingIntentActions.forEach { $0(self) }
+        pendingIntentActions.removeAll()
 
         // A normal launch opens the main window, with onboarding in front the first time. Launched by
         // a deep link the detail window wins; launched at login the app starts in the menu bar only.
@@ -145,6 +147,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         pendingWindow = nil
         openedFromLink = true
         if didLaunch { hexes.forEach(showFlight(hex:)) } else { pendingLinks += hexes }
+    }
+
+    // MARK: Shortcuts and Siri
+
+    /// Actions from intents that arrived before launch finished.
+    private var pendingIntentActions: [@MainActor (AppDelegate) -> Void] = []
+
+    /// Runs an intent that shows something in the main window. Like a deep link, it replaces the
+    /// window a launch would otherwise open; before launch finishes it waits for it.
+    func performIntent(_ action: @escaping @MainActor (AppDelegate) -> Void) {
+        lastLinkOpen = Date()
+        openedFromLink = true
+        pendingWindow?.cancel()
+        pendingWindow = nil
+        if didLaunch { action(self) } else { pendingIntentActions.append(action) }
+    }
+
+    /// A spoken or Shortcuts answer is running without UI: a launch it caused shouldn't open the
+    /// main window (the reopen/launch window is only pending for a moment after launch).
+    func intentWillAnswer() {
+        if didLaunch {
+            pendingWindow?.cancel()
+            pendingWindow = nil
+        } else {
+            openedFromLink = true
+        }
     }
 
     private func showFlight(hex: String) {
