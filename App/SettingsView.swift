@@ -1,7 +1,16 @@
 import SwiftUI
 import ServiceManagement
 
-enum SettingsTab: Hashable { case general, display, widget, alerts }
+enum SettingsTab: String, Hashable { case general, display, widget, alerts }
+
+extension SettingsTab {
+    /// flightdesk://settings/<tab>
+    init?(url: URL) {
+        guard url.scheme == FlightLink.scheme, url.host == "settings" else { return nil }
+        let tab = url.lastPathComponent.lowercased()
+        self.init(rawValue: tab.isEmpty || tab == "/" ? "general" : tab)
+    }
+}
 
 struct SettingsView: View {
     @ObservedObject var store: LiveStore

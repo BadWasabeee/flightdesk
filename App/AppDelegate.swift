@@ -44,6 +44,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     /// Links delivered before launch finished.
     private var pendingLinks: [String] = []
     private var didLaunch = false
+    /// A deep link has been handled (used to keep a link-triggered launch from opening the main window).
+    private var openedFromLink = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
         let loginLaunch = LaunchContext.isLoginItem
@@ -84,8 +86,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
         // A normal launch opens the main window, with onboarding in front the first time. Launched by
         // a deep link the detail window wins; launched at login the app starts in the menu bar only.
-        let defaultLaunch = note.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool ?? true
-        if defaultLaunch, !loginLaunch {
+        // (`launchIsDefaultUserInfoKey` isn't reliable here; a deep link arriving during launch
+        // cancels this scheduled window instead.)
+        if !loginLaunch, !openedFromLink {
             scheduleSettings {
                 $0.showMainWindow()
                 guard !UserDefaults.standard.bool(forKey: "onboarded.v2") else { return }
@@ -113,11 +116,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     /// `flightdesk://flight/<hex>` from the widget opens that aircraft's detail window.
     func application(_ application: NSApplication, open urls: [URL]) {
+        // flightdesk://settings/<general|display|widget|alerts> opens that Settings tab.
+        if let tab = urls.lazy.compactMap(SettingsTab.init(url:)).first {
+            lastLinkOpen = Date()
+            openedFromLink = true
+            pendingSettings?.cancel()
+            pendingSettings = nil
+            openSettings(tab: tab)
+        }
         let hexes = urls.compactMap(FlightLink.hex(from:))
         guard !hexes.isEmpty else { return }
         lastLinkOpen = Date()
         pendingSettings?.cancel()
         pendingSettings = nil
+        openedFromLink = true
         if didLaunch { hexes.forEach(showFlight(hex:)) } else { pendingLinks += hexes }
     }
 
