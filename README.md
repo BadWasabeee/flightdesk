@@ -20,7 +20,7 @@
 - **Native desktop widget (WidgetKit).** Comes in Small, Medium, Large and Extra Large. It lives in *Edit Widgets* next to Apple's own widgets.
 - **Live data.** Aircraft positions come from real-time ADS-B/MLAT. Between fetches, the widget moves each aircraft along its live heading, speed and climb rate every 15 s.
 - **Verified routes.** Origin and destination come from a public database. Each route is checked against the aircraft's live position and heading, and routes that don't fit are hidden. This catches stale or reused callsigns.
-- **Two looks.** Choose an LED board (amber, green, red, blue, cyan or white, with optional glow and dot-matrix texture) or **Liquid Glass**. It also supports the macOS *Clear* and *Tinted* widget styles.
+- **Two looks.** Choose an LED board (amber, green, red, blue, cyan or white, with optional glow and dot-matrix texture) or **Liquid Glass**. For a fully transparent glass widget, set **System Settings › Appearance › Icon & widget style** to *Clear* (or *Tinted*). FlightDesk renders white text on the system's Liquid Glass. The optional floating desktop panel always uses real Liquid Glass.
 - **Configurable.** Set the location, radius (5–100 nm), units (ft/kt/nm or metric) and which details appear. Each widget can also override the location, radius, style, colour and units.
 - **Menu-bar app.** Includes a Settings window with a live preview and an optional floating panel that updates every 15 s.
 - **Private by design.** No accounts, no API keys and no analytics. See [Privacy](#privacy).

@@ -100,13 +100,6 @@ struct PanelBackground: View {
     }
 }
 
-/// Widget background for the Liquid Glass style: a translucent tinted platter that lets the
-/// desktop show through. (In the system's Clear/Tinted widget styles macOS supplies its own glass.)
-/// Liquid Glass widget background: clear, so the desktop shows through like the system widgets.
-struct WidgetGlassBackground: View {
-    var body: some View { Color.clear }
-}
-
 /// Window chrome for the floating panel and the settings preview.
 struct PanelChrome: ViewModifier {
     let options: DisplayOptions
@@ -182,7 +175,7 @@ struct FeaturedView: View {
     }
 
     private var subtitle: String {
-        f.looksLikeAirline ? "ROUTE NOT VERIFIED" : "PRIVATE · \(f.reg)"
+        f.looksLikeAirline ? "Route not verified" : "Private · \(f.reg)"
     }
 
     private var small: some View {

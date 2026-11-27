@@ -166,8 +166,10 @@ struct FlightWidgetView: View {
             .environment(\.displayOptions, o)
             .environment(\.colorScheme, o.isGlass ? .dark : colorScheme)
             .containerBackground(for: .widget) {
+                // Liquid Glass: no background of our own. macOS draws its standard widget backing,
+                // or real Liquid Glass when the system widget style is set to Clear or Tinted.
                 if o.isGlass {
-                    WidgetGlassBackground()
+                    Color.clear
                 } else {
                     PanelBackground().environment(\.displayOptions, o)
                 }
