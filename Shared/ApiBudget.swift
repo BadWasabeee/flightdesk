@@ -50,43 +50,71 @@ enum ApiService: String, CaseIterable, Codable, Sendable {
 
 /// Today's request counts per service, and pauses for services that are close to (or over) their
 /// rate limit. Shared between the app and the widget through the app group.
+///
+/// Each process writes only its own defaults key (`api.budget.v2.app` / `.widget`), and readers
+/// merge them: counts add up, the longest pause wins. With a single writer per key, the app and
+/// widget can never lose each other's increments.
 enum ApiBudget {
-    private struct State: Codable {
+    struct State: Codable, Equatable {
         var day: String
         var counts: [ApiService: Int] = [:]
         /// Service → when it may be used again.
         var pausedUntil: [ApiService: Date] = [:]
     }
 
-    private static let key = "api.budget.v1"
+    private static let keyPrefix = "api.budget.v2."
+    /// Every process that records requests.
+    private static let processTags = ["app", "widget"]
+    private static let processTag = Bundle.main.bundleURL.pathExtension == "appex" ? "widget" : "app"
+    private static var ownKey: String { keyPrefix + processTag }
     private static let lock = NSLock()
 
-    private static var today: String {
+    static var today: String { day(of: Date()) }
+
+    static func day(of date: Date) -> String {
         let f = DateFormatter()
         f.calendar = Calendar(identifier: .gregorian)
         f.locale = Locale(identifier: "en_US_POSIX")
         f.dateFormat = "yyyy-MM-dd"
-        return f.string(from: Date())
+        return f.string(from: date)
     }
 
-    private static func load() -> State {
-        let day = today
-        guard let data = Shared.defaults.data(forKey: key),
-              var s = try? JSONDecoder().decode(State.self, from: data) else { return State(day: day) }
+    private static func decode(_ key: String) -> State? {
+        Shared.defaults.data(forKey: key).flatMap { try? JSONDecoder().decode(State.self, from: $0) }
+    }
+
+    /// One process's state, reset for a new day and without expired pauses.
+    private static func normalized(_ s: State?, day: String, now: Date) -> State {
+        guard var s else { return State(day: day) }
         if s.day != day { s.day = day; s.counts = [:] }
-        s.pausedUntil = s.pausedUntil.filter { $0.value > Date() }
+        s.pausedUntil = s.pausedUntil.filter { $0.value > now }
         return s
     }
 
-    private static func save(_ s: State) {
-        if let data = try? JSONEncoder().encode(s) { Shared.defaults.set(data, forKey: key) }
+    /// Combines per-process states: counts for `day` are summed, and each service's latest pause wins.
+    static func merge(_ states: [State], day: String, now: Date = Date()) -> State {
+        var out = State(day: day)
+        for s in states.map({ normalized($0, day: day, now: now) }) {
+            out.counts.merge(s.counts, uniquingKeysWith: +)
+            out.pausedUntil.merge(s.pausedUntil, uniquingKeysWith: max)
+        }
+        return out
     }
+
+    /// Everyone's state, merged.
+    private static func load() -> State {
+        merge(processTags.compactMap { decode(keyPrefix + $0) }, day: today)
+    }
+
+    /// The single shared key used before per-process counting.
+    private static let removeLegacyKey: Void = Shared.defaults.removeObject(forKey: "api.budget.v1")
 
     private static func update(_ change: (inout State) -> Void) {
         lock.lock(); defer { lock.unlock() }
-        var s = load()
+        _ = removeLegacyKey
+        var s = normalized(decode(ownKey), day: today, now: Date())
         change(&s)
-        save(s)
+        if let data = try? JSONEncoder().encode(s) { Shared.defaults.set(data, forKey: ownKey) }
     }
 
     /// Requests made today, per service.
@@ -105,8 +133,9 @@ enum ApiBudget {
 
     /// Counts a finished request and reads the service's rate-limit headers.
     static func record(_ response: HTTPURLResponse) {
-        guard let host = response.url?.host else { return }
-        let service = ApiService(host: host)
+        guard let url = response.url, let host = url.host else { return }
+        // The plane-alert-db list also comes from GitHub, but isn't a logo.
+        let service = url.pathExtension == "csv" ? .other : ApiService(host: host)
         let pause = pauseInterval(service: service, status: response.statusCode, headers: response.allHeaderFields)
         update { s in
             s.counts[service, default: 0] += 1

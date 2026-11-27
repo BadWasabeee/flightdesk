@@ -435,19 +435,17 @@ private struct FlightBadge: View {
     @Environment(\.colorScheme) private var scheme
 
     /// True when the cached logo reads well at badge size (not a wide wordmark, not too dark).
-    private func isLegible(_ image: NSImage) -> Bool {
-        guard let url = AirlineLogos.file(for: f.logoKey?.id) else { return false }
-        if case .logo = FlightMarkKind.resolve(f, logo: url, logoSize: image.size,
-                                               brightness: LogoTone.brightness(of: image, at: url),
+    private func isLegible(_ logo: LogoStore.Logo) -> Bool {
+        if case .logo = FlightMarkKind.resolve(f, logo: logo.url, logoSize: logo.size, brightness: logo.brightness,
                                                darkBackground: scheme == .dark) { return true }
         return false
     }
 
     var body: some View {
         Group {
-            if o.showLogos, let image = LogoCache.image(for: f.logoKey?.id) {
-                if isLegible(image) {
-                    Image(nsImage: image)
+            if o.showLogos, let logo = LogoStore.logo(for: f.logoKey?.id) {
+                if isLegible(logo) {
+                    Image(nsImage: logo.image)
                         .resizable()
                         .interpolation(.high)
                         .aspectRatio(contentMode: .fit)
@@ -469,21 +467,6 @@ private struct FlightBadge: View {
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
-    }
-}
-
-/// Decoded airline logos, so list rows don't read and decode PNGs on every refresh.
-/// Misses aren't remembered: a logo can arrive on disk at any time.
-@MainActor
-private enum LogoCache {
-    private static var images: [String: NSImage] = [:]
-
-    static func image(for code: String?) -> NSImage? {
-        guard let code, !code.isEmpty else { return nil }
-        if let image = images[code] { return image }
-        guard let url = AirlineLogos.file(for: code), let image = NSImage(contentsOf: url) else { return nil }
-        images[code] = image
-        return image
     }
 }
 

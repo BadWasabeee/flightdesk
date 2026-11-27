@@ -6,8 +6,8 @@ import AppIntents
 
 enum WidgetRadius: String, AppEnum {
     case app, nm5 = "5", nm10 = "10", nm25 = "25", nm50 = "50", nm100 = "100"
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Radius"
-    static var caseDisplayRepresentations: [WidgetRadius: DisplayRepresentation] = [
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Radius"
+    static let caseDisplayRepresentations: [WidgetRadius: DisplayRepresentation] = [
         .app: "Same as FlightDesk Settings", .nm5: "5 nm (9 km)", .nm10: "10 nm (19 km)",
         .nm25: "25 nm (46 km)", .nm50: "50 nm (93 km)", .nm100: "100 nm (185 km)",
     ]
@@ -16,8 +16,8 @@ enum WidgetRadius: String, AppEnum {
 
 enum WidgetTheme: String, AppEnum {
     case app, amber, green, red, blue, cyan, white
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "LED Color"
-    static var caseDisplayRepresentations: [WidgetTheme: DisplayRepresentation] = [
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "LED Color"
+    static let caseDisplayRepresentations: [WidgetTheme: DisplayRepresentation] = [
         .app: "Same as FlightDesk Settings", .amber: "Amber", .green: "Green", .red: "Red",
         .blue: "Blue", .cyan: "Cyan", .white: "White",
     ]
@@ -26,8 +26,8 @@ enum WidgetTheme: String, AppEnum {
 
 enum WidgetStyle: String, AppEnum {
     case app, led, standard
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Style"
-    static var caseDisplayRepresentations: [WidgetStyle: DisplayRepresentation] = [
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Style"
+    static let caseDisplayRepresentations: [WidgetStyle: DisplayRepresentation] = [
         .app: "Same as FlightDesk Settings", .led: "LED Board", .standard: "Standard",
     ]
     func resolve(_ s: AppSettings) -> BoardStyle { BoardStyle(rawValue: rawValue) ?? s.display.style }
@@ -35,8 +35,8 @@ enum WidgetStyle: String, AppEnum {
 
 enum WidgetUnits: String, AppEnum {
     case app, imperial, metric
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Units"
-    static var caseDisplayRepresentations: [WidgetUnits: DisplayRepresentation] = [
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Units"
+    static let caseDisplayRepresentations: [WidgetUnits: DisplayRepresentation] = [
         .app: "Same as FlightDesk Settings", .imperial: "Aviation (ft, kt, nm)", .metric: "Metric (m, km/h, km)",
     ]
     func resolve(_ s: AppSettings) -> UnitSystem { UnitSystem(rawValue: rawValue) ?? s.display.units }
@@ -46,8 +46,8 @@ enum WidgetUnits: String, AppEnum {
 /// An on/off option that can also follow the app's setting.
 enum WidgetToggle: String, AppEnum {
     case app, on, off
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Option"
-    static var caseDisplayRepresentations: [WidgetToggle: DisplayRepresentation] = [
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Option"
+    static let caseDisplayRepresentations: [WidgetToggle: DisplayRepresentation] = [
         .app: "Same as FlightDesk Settings", .on: "On", .off: "Off",
     ]
     func resolve(_ app: Bool) -> Bool {
@@ -56,8 +56,8 @@ enum WidgetToggle: String, AppEnum {
 }
 
 struct FlightWidgetIntent: WidgetConfigurationIntent {
-    static var title: LocalizedStringResource = "Flights Overhead"
-    static var description = IntentDescription("Choose what this widget shows. Options left on “Same as FlightDesk Settings” follow the app.")
+    static let title: LocalizedStringResource = "Flights Overhead"
+    static let description = IntentDescription("Choose what this widget shows. Options left on “Same as FlightDesk Settings” follow the app.")
 
     @Parameter(title: "Location",
                description: "A city, airport code or coordinates (“39.7, -104.9”). Leave empty to use the location set in FlightDesk.")
@@ -148,8 +148,8 @@ struct FlightWidgetIntent: WidgetConfigurationIntent {
 
 /// The ↻ button in the widget header. Running it makes WidgetKit reload the timeline.
 struct RefreshFlightsIntent: AppIntent {
-    static var title: LocalizedStringResource = "Refresh Flights"
-    static var isDiscoverable = false
+    static let title: LocalizedStringResource = "Refresh Flights"
+    static let isDiscoverable = false
     func perform() async throws -> some IntentResult { .result() }
 }
 
@@ -189,6 +189,8 @@ struct Provider: AppIntentTimelineProvider {
             return Timeline(entries: [FlightEntry(date: now, model: model, options: opts)], policy: .after(now + 900))
         }
         model.placeName = loc.name
+        // Tell the app which area this widget shows, so it can reload widgets when it changes.
+        WidgetDemand.record(WidgetArea(lat: loc.lat, lon: loc.lon, radiusNM: radius.nm, includeGA: settings.includeGA))
 
         do {
             model.flights = try await FlightService.nearby(lat: loc.lat, lon: loc.lon,

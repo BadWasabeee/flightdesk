@@ -347,7 +347,7 @@ struct WidgetSettings: View {
             } header: {
                 Text("Updates")
             } footer: {
-                Text("Between updates, widgets move each aircraft along its heading every 15 seconds. macOS may delay updates — click ↻ on a widget to refresh it.")
+                Text("While FlightDesk is running it checks the sky at this interval and updates widgets when aircraft arrive, leave or change course. Between updates, widgets move each aircraft along its heading every 15 seconds. macOS may delay updates — click ↻ on a widget to refresh it.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

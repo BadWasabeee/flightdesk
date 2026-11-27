@@ -163,6 +163,7 @@ enum ReceiverFeed {
         "/dump1090/data/aircraft.json",
     ]
 
+    /// Local network only: not counted in `ApiBudget`, and sends no User-Agent beyond the system's.
     static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 4
@@ -225,7 +226,7 @@ enum ReceiverFeed {
 
     /// Fetches and decodes one candidate URL.
     static func get(_ url: URL) async throws -> ReceiverAircraftFile {
-        let (data, resp) = try await session.data(from: url)
+        let (data, resp) = try await session.boundedData(from: url, limit: ResponseLimit.json)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard code == 200 else { throw ReceiverError.httpStatus(code) }
         guard let file = try? JSONDecoder().decode(ReceiverAircraftFile.self, from: data) else {
@@ -396,7 +397,8 @@ enum ReceiverFeed {
         struct Info: Decodable { let version: String? }
         let infoURL = url.deletingLastPathComponent().appendingPathComponent("receiver.json")
         var version = ""
-        if let (data, resp) = try? await session.data(from: infoURL), (resp as? HTTPURLResponse)?.statusCode == 200 {
+        if let (data, resp) = try? await session.boundedData(from: infoURL, limit: 64 << 10),
+           (resp as? HTTPURLResponse)?.statusCode == 200 {
             version = ((try? JSONDecoder().decode(Info.self, from: data))?.version ?? "").lowercased()
         }
         return softwareName(version: version, path: url.path.lowercased())

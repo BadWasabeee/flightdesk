@@ -29,26 +29,40 @@ enum Shared {
         defaults.set(name, forKey: "placeName")
     }
 
-    static var containerURL: URL {
-        (groupID.isEmpty ? nil : FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID))
-            ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-    }
+    /// True inside the unit-test runner, which has no app group.
+    static let isRunningTests = NSClassFromString("XCTestCase") != nil
+
+    /// The app-group container shared with the widget. If it's unavailable (missing group ID or
+    /// entitlement), a FlightDesk-only folder: `~/Library/Caches/<bundle id>/` — never the shared
+    /// Caches root, where other apps' files live.
+    static let containerURL: URL = {
+        assert(!groupID.isEmpty || isRunningTests, "FDAppGroupID is missing from Info.plist; check APP_GROUP_ID in Config/Base.xcconfig")
+        if !groupID.isEmpty, let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID) {
+            return url
+        }
+        let base = isRunningTests ? FileManager.default.temporaryDirectory
+            : FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let url = base.appendingPathComponent(Bundle.main.bundleIdentifier ?? "flightdesk", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        fdLog.error("App group container unavailable; using \(url.path, privacy: .public)")
+        return url
+    }()
 }
 
 // MARK: - Settings types (also used as native widget configuration options)
 
 enum LEDTheme: String, AppEnum, CaseIterable, Codable {
     case amber, green, red, blue, cyan, white
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "LED Color"
-    static var caseDisplayRepresentations: [LEDTheme: DisplayRepresentation] = [
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "LED Color"
+    static let caseDisplayRepresentations: [LEDTheme: DisplayRepresentation] = [
         .amber: "Amber", .green: "Green", .red: "Red", .blue: "Blue", .cyan: "Cyan", .white: "White",
     ]
 }
 
 enum UnitSystem: String, AppEnum, CaseIterable, Codable {
     case imperial, metric
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Units"
-    static var caseDisplayRepresentations: [UnitSystem: DisplayRepresentation] = [
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Units"
+    static let caseDisplayRepresentations: [UnitSystem: DisplayRepresentation] = [
         .imperial: "Aviation (ft, kt, nm)", .metric: "Metric (m, km/h, km)",
     ]
 }
@@ -56,8 +70,8 @@ enum UnitSystem: String, AppEnum, CaseIterable, Codable {
 enum SearchRadius: String, AppEnum, CaseIterable, Codable {
     case nm5 = "5", nm10 = "10", nm25 = "25", nm50 = "50", nm100 = "100"
     var nm: Int { Int(rawValue) ?? 25 }
-    static var typeDisplayRepresentation: TypeDisplayRepresentation = "Radius"
-    static var caseDisplayRepresentations: [SearchRadius: DisplayRepresentation] = [
+    static let typeDisplayRepresentation: TypeDisplayRepresentation = "Radius"
+    static let caseDisplayRepresentations: [SearchRadius: DisplayRepresentation] = [
         .nm5: "5 nm (9 km)", .nm10: "10 nm (19 km)", .nm25: "25 nm (46 km)",
         .nm50: "50 nm (93 km)", .nm100: "100 nm (185 km)",
     ]
@@ -325,12 +339,9 @@ private struct DBAircraftResponse: Decodable { let response: Inner
 // MARK: - Live data service
 
 enum FlightService {
-    static let session: URLSession = {
-        let c = URLSessionConfiguration.ephemeral
-        c.timeoutIntervalForRequest = 8
-        c.httpAdditionalHeaders = ["User-Agent": "FlightDesk/\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1") (+https://github.com/BadWasabeee/flightdesk)"]
-        return URLSession(configuration: c, delegate: UsageMeter(), delegateQueue: nil)
-    }()
+    /// Every internet request (app and widget) goes through this session or one made by
+    /// `Net.session`, so it carries the same User-Agent, timeouts and request accounting.
+    static let session = Net.session()
 
     /// Live aircraft around a point (adsb.lol, real-time ADS-B/MLAT), enriched with
     /// aircraft model and a route that has been checked against the live position.
@@ -430,8 +441,9 @@ enum FlightService {
     // MARK: Lookups (adsbdb). Second value = definitive answer (safe to cache).
 
     static func fetchRoute(_ callsign: String) async -> (RouteInfo?, Bool) {
-        guard let url = URL(string: "https://api.adsbdb.com/v0/callsign/\(callsign)") else { return (nil, true) }
-        guard let (data, resp) = try? await session.data(from: url) else { return (nil, false) }
+        guard let cs = AircraftID.callsign(callsign),
+              let url = RemoteURL.make("https://api.adsbdb.com/v0/callsign", [cs]) else { return (nil, true) }
+        guard let (data, resp) = try? await session.boundedData(from: url) else { return (nil, false) }
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard let r = try? JSONDecoder().decode(DBRouteResponse.self, from: data).response.flightroute else {
             return (nil, code == 200 || code == 404)
@@ -441,8 +453,10 @@ enum FlightService {
     }
 
     static func fetchAircraft(_ hex: String) async -> (AircraftInfo?, Bool) {
-        guard let url = URL(string: "https://api.adsbdb.com/v0/aircraft/\(hex)") else { return (nil, true) }
-        guard let (data, resp) = try? await session.data(from: url) else { return (nil, false) }
+        // Non-ICAO ("~…") addresses don't identify an airframe.
+        guard let id = AircraftID.hex(hex, allowNonICAO: false),
+              let url = RemoteURL.make("https://api.adsbdb.com/v0/aircraft", [id]) else { return (nil, true) }
+        guard let (data, resp) = try? await session.boundedData(from: url) else { return (nil, false) }
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard let a = try? JSONDecoder().decode(DBAircraftResponse.self, from: data).response.aircraft else {
             return (nil, code == 200 || code == 404)
@@ -457,11 +471,8 @@ enum FlightService {
     static func resolve(_ text: String) async -> (lat: Double, lon: Double, name: String)? {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return nil }
-        let key = "geo:" + t.lowercased()
-        if let c = Shared.defaults.array(forKey: key), c.count == 3,
-           let la = c[0] as? Double, let lo = c[1] as? Double, let n = c[2] as? String {
-            return (la, lo, n)
-        }
+        let key = t.lowercased()
+        if let c = GeocodeCache.lookup(key) { return (c.lat, c.lon, c.name) }
         var result: (lat: Double, lon: Double, name: String)?
         let parts = t.split(separator: ",").map { Double($0.trimmingCharacters(in: .whitespaces)) }
         if parts.count == 2, let la = parts[0], let lo = parts[1], abs(la) <= 90, abs(lo) <= 180 {
@@ -469,7 +480,7 @@ enum FlightService {
         } else if let m = try? await CLGeocoder().geocodeAddressString(t).first, let loc = m.location {
             result = (loc.coordinate.latitude, loc.coordinate.longitude, m.locality ?? m.name ?? t)
         }
-        if let r = result { Shared.defaults.set([r.lat, r.lon, r.name], forKey: key) }
+        if let r = result { GeocodeCache.store(key, GeocodeCache.Entry(lat: r.lat, lon: r.lon, name: r.name, at: Date())) }
         return result
     }
 
@@ -492,23 +503,36 @@ actor LookupCache {
 
     private var store: Store?
     private var dirty = false
-    private var url: URL { Shared.containerURL.appendingPathComponent("lookup-cache-v2.json") }
+    private let url: URL
+
+    init(url: URL = Shared.containerURL.appendingPathComponent("lookup-cache-v2.json")) {
+        self.url = url
+    }
 
     private func load() {
         if store == nil {
-            store = (try? JSONDecoder().decode(Store.self, from: Data(contentsOf: url))) ?? Store()
+            store = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Store.self, from: $0) } ?? Store()
         }
     }
 
     func route(_ callsign: String) async -> RouteInfo? {
+        guard let callsign = AircraftID.callsign(callsign) else { return nil }
         load()
         if let e = store?.routes[callsign], Date().timeIntervalSince(e.at) < 6 * 3600 { return e.value }
         let (v, definitive) = await FlightService.fetchRoute(callsign)
-        if definitive { store?.routes[callsign] = Entry(value: v, at: Date()); dirty = true }
+        if definitive { record(route: v, for: callsign) }
         return v
     }
 
+    /// Stores a route answer (nil = "no route") to be written on the next `save()`.
+    func record(route: RouteInfo?, for callsign: String, at date: Date = Date()) {
+        load()
+        store?.routes[callsign] = Entry(value: route, at: date)
+        dirty = true
+    }
+
     func aircraft(_ hex: String) async -> AircraftInfo? {
+        guard let hex = AircraftID.hex(hex, allowNonICAO: false) else { return nil }
         load()
         if let e = store?.aircraft[hex], Date().timeIntervalSince(e.at) < 30 * 86400 { return e.value }
         let (v, definitive) = await FlightService.fetchAircraft(hex)
@@ -516,18 +540,70 @@ actor LookupCache {
         return v
     }
 
+    /// Writes new lookups, merged with whatever the other process (app or widget) saved meanwhile,
+    /// so neither overwrites the other's entries.
     func save() {
-        guard dirty, var s = store else { return }
-        if s.routes.count > 1500 {
-            s.routes = Dictionary(uniqueKeysWithValues: s.routes.sorted { $0.value.at > $1.value.at }.prefix(1000).map { ($0.key, $0.value) })
+        guard dirty, let mine = store else { return }
+        var merged = mine
+        SharedFile.update(url) { data in
+            let disk = data.flatMap { try? JSONDecoder().decode(Store.self, from: $0) } ?? Store()
+            merged = Self.pruned(Self.merge(mine, disk))
+            return try? JSONEncoder().encode(merged)
         }
-        if s.aircraft.count > 3000 {
-            s.aircraft = Dictionary(uniqueKeysWithValues: s.aircraft.sorted { $0.value.at > $1.value.at }.prefix(2000).map { ($0.key, $0.value) })
-        }
-        store = s
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? JSONEncoder().encode(s).write(to: url, options: .atomic)
+        store = merged
         dirty = false
+    }
+
+    /// Union of two stores; where both have a key, the newer entry wins.
+    static func merge(_ a: Store, _ b: Store) -> Store {
+        func newer<T>(_ x: Entry<T>, _ y: Entry<T>) -> Entry<T> { x.at >= y.at ? x : y }
+        return Store(routes: a.routes.merging(b.routes, uniquingKeysWith: newer),
+                     aircraft: a.aircraft.merging(b.aircraft, uniquingKeysWith: newer))
+    }
+
+    /// Keeps the most recent entries once a table grows past its limit.
+    static func pruned(_ s: Store) -> Store {
+        func newest<T>(_ d: [String: Entry<T>], over limit: Int, keep: Int) -> [String: Entry<T>] {
+            guard d.count > limit else { return d }
+            return Dictionary(uniqueKeysWithValues: d.sorted { $0.value.at > $1.value.at }.prefix(keep).map { ($0.key, $0.value) })
+        }
+        return Store(routes: newest(s.routes, over: 1500, keep: 1000),
+                     aircraft: newest(s.aircraft, over: 3000, keep: 2000))
+    }
+}
+
+// MARK: - Geocoding cache
+
+/// Place searches resolved to coordinates (app and widget "Location" option), most recent ~200 kept.
+enum GeocodeCache {
+    struct Entry: Codable, Equatable { var lat: Double; var lon: Double; var name: String; var at: Date }
+
+    static let key = "geocode.v1"
+    static let maxEntries = 200
+
+    static func lookup(_ query: String, defaults: UserDefaults = Shared.defaults) -> Entry? {
+        migrateLegacyKeys(defaults)
+        return load(defaults)[query]
+    }
+
+    static func store(_ query: String, _ entry: Entry, defaults: UserDefaults = Shared.defaults) {
+        var all = load(defaults)
+        all[query] = entry
+        if all.count > maxEntries {
+            all = Dictionary(uniqueKeysWithValues: all.sorted { $0.value.at > $1.value.at }.prefix(maxEntries).map { ($0.key, $0.value) })
+        }
+        defaults.set(try? JSONEncoder().encode(all), forKey: key)
+    }
+
+    private static func load(_ defaults: UserDefaults) -> [String: Entry] {
+        defaults.data(forKey: key).flatMap { try? JSONDecoder().decode([String: Entry].self, from: $0) } ?? [:]
+    }
+
+    /// Earlier versions stored each search under its own unbounded "geo:<text>" key.
+    private static func migrateLegacyKeys(_ defaults: UserDefaults) {
+        guard !defaults.bool(forKey: "geocode.migrated") else { return }
+        for k in defaults.dictionaryRepresentation().keys where k.hasPrefix("geo:") { defaults.removeObject(forKey: k) }
+        defaults.set(true, forKey: "geocode.migrated")
     }
 }
 
@@ -628,10 +704,15 @@ enum AirlineLogos {
         (2...3).contains(id.count) && id.allSatisfy { ($0.isLetter || $0.isNumber) && $0.isASCII }
     }
 
+    /// Where an airline's logo (by `Key.id`) is cached, whether or not it has been downloaded.
+    static func path(for code: String?) -> URL? {
+        guard let code = code?.uppercased(), valid(code) else { return nil }
+        return dir.appendingPathComponent("\(code).png")
+    }
+
     /// Local file for an airline's logo (by `Key.id`), if one has been downloaded.
     static func file(for code: String?) -> URL? {
-        guard let code = code?.uppercased(), valid(code) else { return nil }
-        let u = dir.appendingPathComponent("\(code).png")
+        guard let u = path(for: code) else { return nil }
         return FileManager.default.fileExists(atPath: u.path) ? u : nil
     }
 
@@ -661,23 +742,32 @@ enum AirlineLogos {
         var isSVG = false
     }
 
-    private static func github(_ repo: String, _ branch: String, _ path: String) -> Candidate {
-        Candidate(urls: [URL(string: "https://cdn.jsdelivr.net/gh/\(repo)@\(branch)/\(path)"),
-                         URL(string: "https://raw.githubusercontent.com/\(repo)/\(branch)/\(path)")].compactMap { $0 })
+    /// GitHub logo repositories, pinned to a reviewed commit so the files can't change underneath us.
+    /// Update by checking the repo and replacing the SHA (`git ls-remote https://github.com/<repo> HEAD`).
+    static let pinnedRepos = [
+        "Jxck-S/airline-logos": "e0b218991caef4832e0db911136173e8eead942a",
+        "sexym0nk3y/airline-logos": "20b37a3d9833cb8521a9f4ab236ae28d6fe3573d",
+    ]
+
+    /// A file in a pinned GitHub repo, from jsDelivr with raw.githubusercontent.com as a fallback.
+    private static func github(_ repo: String, _ folder: String, _ file: String) -> Candidate {
+        guard let sha = pinnedRepos[repo] else { return Candidate(urls: []) }
+        return Candidate(urls: [RemoteURL.make("https://cdn.jsdelivr.net/gh/\(repo)@\(sha)/\(folder)", [file]),
+                                RemoteURL.make("https://raw.githubusercontent.com/\(repo)/\(sha)/\(folder)", [file])].compactMap { $0 })
     }
 
     private static func candidates(for key: Key) async -> [Candidate] {
         var list: [Candidate] = []
         if let slug = await SoaringSymbols.shared.slug(icao: key.icao, iata: key.iata),
-           let u = URL(string: "\(SoaringSymbols.base)/dist/airlines/\(slug)/icon.svg") {
+           let u = RemoteURL.make("\(SoaringSymbols.base)/dist/airlines", [slug, "icon.svg"]) {
             list.append(Candidate(urls: [u], isSVG: true))
         }
         if let icao = key.icao {
-            list.append(github("Jxck-S/airline-logos", "main", "flightaware_logos/\(icao).png"))
-            list.append(github("Jxck-S/airline-logos", "main", "radarbox_logos/\(icao).png"))
-            list.append(github("sexym0nk3y/airline-logos", "main", "logos/\(icao).png"))
+            list.append(github("Jxck-S/airline-logos", "flightaware_logos", "\(icao).png"))
+            list.append(github("Jxck-S/airline-logos", "radarbox_logos", "\(icao).png"))
+            list.append(github("sexym0nk3y/airline-logos", "logos", "\(icao).png"))
         }
-        if let iata = key.iata, let u = URL(string: "https://images.kiwi.com/airlines/128x128/\(iata).png") {
+        if let iata = key.iata, let u = RemoteURL.make("https://images.kiwi.com/airlines/128x128", ["\(iata).png"]) {
             list.append(Candidate(urls: [u]))
         }
         return list
@@ -687,8 +777,15 @@ enum AirlineLogos {
 
     private static func download(_ urls: [URL]) async -> Download {
         for url in urls {
-            guard let (data, resp) = try? await FlightService.session.data(from: url),
-                  let code = (resp as? HTTPURLResponse)?.statusCode else { continue }
+            let data: Data, resp: URLResponse
+            do {
+                (data, resp) = try await FlightService.session.boundedData(from: url, limit: ResponseLimit.logo)
+            } catch URLError.dataLengthExceedsMaximum {
+                return .notFound            // an oversized file is never usable as a logo
+            } catch {
+                continue
+            }
+            guard let code = (resp as? HTTPURLResponse)?.statusCode else { continue }
             if code == 200 { return .data(data) }
             if code == 404 { return .notFound }
         }
@@ -724,11 +821,11 @@ enum AirlineLogos {
 
     /// Whether downloaded PNG data is a real logo on a transparent background: not a known
     /// placeholder, transparent around the edges and corners, not blank, and not all white.
+    /// Files over 1 MB or 1024 px a side are rejected before decoding (see `ImageGuard`).
     static func isUsable(_ data: Data) -> Bool {
         guard data.count >= 200, data.starts(with: [0x89, 0x50, 0x4E, 0x47]),
               !placeholders.contains(SHA256.hash(data: data).hex),
-              let src = CGImageSourceCreateWithData(data as CFData, nil),
-              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return false }
+              let img = ImageGuard.thumbnail(data, ImageGuard.logo, maxPixel: side) else { return false }
         switch img.alphaInfo {
         case .none, .noneSkipFirst, .noneSkipLast: return false
         default: break
@@ -755,8 +852,11 @@ enum AirlineLogos {
     }
 
     /// An SVG rendered to PNG (longest side `side` px), so the widget only ever reads PNGs.
+    /// Only plain SVG documents under 1 MB are accepted, so a raster image (or an entity bomb)
+    /// served from an SVG URL never reaches the decoder.
     static func rasterizedSVG(_ data: Data) -> Data? {
-        guard data.count > 20, let img = NSImage(data: data), img.size.width > 0, img.size.height > 0 else { return nil }
+        guard ImageGuard.isPlainSVG(data), let img = NSImage(data: data),
+              img.size.width > 0, img.size.height > 0 else { return nil }
         let k = CGFloat(side) / max(img.size.width, img.size.height)
         let w = max(1, Int((img.size.width * k).rounded())), h = max(1, Int((img.size.height * k).rounded()))
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
@@ -769,11 +869,10 @@ enum AirlineLogos {
         return ctx.makeImage().flatMap(trimmed).flatMap(pngData)
     }
 
-    /// PNG data with transparent margins cropped, so logos from different sources fill the same space.
+    /// PNG data downscaled to at most `side` px and with transparent margins cropped, so logos from
+    /// different sources fill the same space.
     private static func trimmedPNG(_ data: Data) -> Data? {
-        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
-              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return nil }
-        return trimmed(img).flatMap(pngData)
+        ImageGuard.thumbnail(data, ImageGuard.logo, maxPixel: side).flatMap(trimmed).flatMap(pngData)
     }
 
     private static func trimmed(_ img: CGImage) -> CGImage? {
@@ -818,10 +917,13 @@ enum AirlineLogos {
 /// The Soaring Symbols catalog (MIT-licensed data), reduced to code → slug and cached for a week.
 actor SoaringSymbols {
     static let shared = SoaringSymbols()
-    static let base = "https://cdn.jsdelivr.net/npm/soaring-symbols@0"
+    /// Pinned to an exact release so icons and the catalog only change when this line does.
+    static let base = "https://cdn.jsdelivr.net/npm/soaring-symbols@0.6.1"
     private var loading: Task<[String: String], Never>?
 
-    private var file: URL { Shared.containerURL.appendingPathComponent("logos-v2/soaring-symbols.json") }
+    static let version = base.components(separatedBy: "@").last ?? ""
+    /// Per-version, so a new pin doesn't reuse slugs from another release's catalog.
+    private var file: URL { Shared.containerURL.appendingPathComponent("logos-v2/soaring-symbols-\(Self.version).json") }
 
     func slug(icao: String?, iata: String?) async -> String? {
         if loading == nil { loading = Task { await Self.load(from: file) } }
@@ -834,8 +936,8 @@ actor SoaringSymbols {
         let age = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
             .map { -$0.timeIntervalSinceNow } ?? .infinity
         if let cached, age < 7 * 86_400 { return cached }
-        guard let url = URL(string: "\(base)/dist/airlines.json"),
-              let (data, resp) = try? await FlightService.session.data(from: url),
+        guard let url = RemoteURL.make("\(base)/dist/airlines.json"),
+              let (data, resp) = try? await FlightService.session.boundedData(from: url),
               (resp as? HTTPURLResponse)?.statusCode == 200 else { return cached ?? [:] }
         let map = parse(data)
         if map.isEmpty { return cached ?? [:] }
@@ -873,15 +975,16 @@ private extension Digest {
 enum FlightLink {
     static let scheme = "flightdesk"
 
-    static func url(for hex: String) -> URL {
-        URL(string: "\(scheme)://flight/\(hex.lowercased())")!
+    /// The deep link for an aircraft, or nil when `hex` isn't a valid address (ids come from the feeds).
+    static func url(for hex: String) -> URL? {
+        guard let id = AircraftID.hex(hex) else { return nil }
+        return URL(string: "\(scheme)://flight/\(id)")
     }
 
     /// The aircraft hex from a FlightDesk deep link, or nil for anything else.
     static func hex(from url: URL) -> String? {
-        guard url.scheme == scheme, url.host == "flight" else { return nil }
-        let h = url.lastPathComponent.lowercased()
-        return h.range(of: "^~?[0-9a-f]{6}$", options: .regularExpression) != nil ? h : nil
+        guard url.scheme == scheme, url.host == "flight", url.pathComponents.count == 2 else { return nil }
+        return AircraftID.hex(url.lastPathComponent)
     }
 }
 
@@ -922,18 +1025,21 @@ enum LiveFeed: String, CaseIterable, Codable, Sendable {
         }
     }
 
-    func pointURL(lat: Double, lon: Double, radiusNM: Int) -> URL {
+    /// The point query, with the position rounded to 2 decimals (about 1 km). Nil for an invalid position.
+    func pointURL(lat: Double, lon: Double, radiusNM: Int) -> URL? {
+        guard lat.isFinite, lon.isFinite, abs(lat) <= 90, abs(lon) <= 180, (1...250).contains(radiusNM) else { return nil }
+        let la = String(format: "%.2f", lat), lo = String(format: "%.2f", lon), r = String(radiusNM)
         switch self {
-        case .adsbFi: URL(string: String(format: "https://opendata.adsb.fi/api/v2/lat/%.2f/lon/%.2f/dist/%d", lat, lon, radiusNM))!
-        case .adsbLol: URL(string: String(format: "https://api.adsb.lol/v2/point/%.2f/%.2f/%d", lat, lon, radiusNM))!
+        case .adsbFi: return RemoteURL.make("https://opendata.adsb.fi/api/v2", ["lat", la, "lon", lo, "dist", r])
+        case .adsbLol: return RemoteURL.make("https://api.adsb.lol/v2/point", [la, lo, r])
         }
     }
 
     func hexURL(_ hex: String) -> URL? {
-        guard let id = hex.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(["~"])) else { return nil }
+        guard let id = AircraftID.hex(hex) else { return nil }
         switch self {
-        case .adsbFi: return URL(string: "https://opendata.adsb.fi/api/v2/hex/\(id)")
-        case .adsbLol: return URL(string: "https://api.adsb.lol/v2/hex/\(id)")
+        case .adsbFi: return RemoteURL.make("https://opendata.adsb.fi/api/v2/hex", [id])
+        case .adsbLol: return RemoteURL.make("https://api.adsb.lol/v2/hex", [id])
         }
     }
 
@@ -954,7 +1060,7 @@ enum LiveFeed: String, CaseIterable, Codable, Sendable {
         for feed in available + order.filter({ !available.contains($0) }) {
             guard let u = url(feed) else { continue }
             do {
-                let (data, resp) = try await FlightService.session.data(from: u)
+                let (data, resp) = try await FlightService.session.boundedData(from: u)
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 if code == 200 {
                     await FeedHealth.shared.succeeded(feed)
@@ -1001,7 +1107,8 @@ actor FeedHealth {
     }
 }
 
-/// The latest nearby-aircraft list in the shared container, so the app and widget can reuse it.
+/// Recent nearby-aircraft lists in the shared container (one per area: position, radius and
+/// source mode), so the app and widget reuse each other's downloads.
 enum NearbyCache {
     struct Entry: Codable {
         var key: String
@@ -1010,25 +1117,34 @@ enum NearbyCache {
         /// Absent in entries written by older versions.
         var source: DataSource?
     }
-    private static var url: URL { Shared.containerURL.appendingPathComponent("nearby-cache.json") }
+    /// Areas kept (the app's own plus widgets with their own location or radius).
+    static let maxEntries = 6
+    static var defaultURL: URL { Shared.containerURL.appendingPathComponent("nearby-cache-v2.json") }
 
-    /// The latest entry whatever its key (any position or radius), if it's recent enough.
-    static func latest(maxAge: TimeInterval) -> Entry? {
-        guard let data = try? Data(contentsOf: url),
-              let e = try? JSONDecoder().decode(Entry.self, from: data),
-              -e.time.timeIntervalSinceNow < maxAge else { return nil }
-        return e
+    private static func entries(at url: URL) -> [Entry] {
+        (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode([Entry].self, from: $0) } ?? []
     }
 
-    static func read(key: String, maxAge: TimeInterval) -> Entry? {
-        guard let data = try? Data(contentsOf: url),
-              let e = try? JSONDecoder().decode(Entry.self, from: data),
-              e.key == key, -e.time.timeIntervalSinceNow < maxAge else { return nil }
-        return e
+    /// The most recent entry whatever its key (any position or radius), if it's recent enough.
+    static func latest(maxAge: TimeInterval, at url: URL = defaultURL, now: Date = Date()) -> Entry? {
+        entries(at: url).filter { now.timeIntervalSince($0.time) < maxAge }.max { $0.time < $1.time }
     }
 
-    static func write(_ flights: [Flight], key: String, source: DataSource? = nil) {
-        guard let data = try? JSONEncoder().encode(Entry(key: key, time: Date(), flights: flights, source: source)) else { return }
-        try? data.write(to: url, options: .atomic)
+    /// The entry for `key`, if it's recent enough.
+    static func read(key: String, maxAge: TimeInterval, at url: URL = defaultURL, now: Date = Date()) -> Entry? {
+        entries(at: url).first { $0.key == key && now.timeIntervalSince($0.time) < maxAge }
+    }
+
+    /// Stores `flights` for `key`, keeping other areas' entries (merged under a file coordinator
+    /// so the app and widget don't drop each other's writes).
+    static func write(_ flights: [Flight], key: String, source: DataSource? = nil, at url: URL = defaultURL, now: Date = Date()) {
+        let entry = Entry(key: key, time: now, flights: flights, source: source)
+        SharedFile.update(url) { data in
+            var list = data.flatMap { try? JSONDecoder().decode([Entry].self, from: $0) } ?? []
+            list.removeAll { $0.key == key || now.timeIntervalSince($0.time) > 3_600 }
+            list.append(entry)
+            list = Array(list.sorted { $0.time > $1.time }.prefix(maxEntries))
+            return try? JSONEncoder().encode(list)
+        }
     }
 }

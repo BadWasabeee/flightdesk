@@ -141,11 +141,21 @@ final class FlightDetailModel: ObservableObject {
         }
         guard !Task.isCancelled else { return }
         photo = .loading(aspectRatio: found.aspectRatio)
-        if let data = await AircraftPhotos.shared.imageData(for: found), let image = NSImage(data: data) {
+        if let data = await AircraftPhotos.shared.imageData(for: found),
+           let image = await Self.decodePhoto(data) {
             if !Task.isCancelled { photo = .loaded(found, image) }
         } else if !Task.isCancelled {
             photo = .unavailable
         }
+    }
+
+    /// Decodes a downloaded photo off the main thread, checked against `ImageGuard.photo` and
+    /// downscaled to at most 1200 px.
+    private nonisolated static func decodePhoto(_ data: Data) async -> NSImage? {
+        await Task.detached(priority: .userInitiated) { () -> NSImage? in
+            guard let cg = ImageGuard.thumbnail(data, ImageGuard.photo, maxPixel: 1200) else { return nil }
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }.value
     }
 
     private func pollNearby() async {
@@ -302,14 +312,16 @@ final class FlightDetailModel: ObservableObject {
         }
     }
 
-    var adsbLolURL: URL? { URL(string: "https://adsb.lol/?icao=\(hex)") }
+    var adsbLolURL: URL? {
+        AircraftID.hex(hex).flatMap { RemoteURL.make("https://adsb.lol/", query: [("icao", $0)]) }
+    }
 
     /// The photo's page, or a Planespotters search for the registration.
     var planespottersURL: URL? {
         if case .loaded(let p, _) = photo { return p.pageURL }
-        guard let reg = flight?.reg, reg.uppercased() != hex.uppercased(),
-              let q = reg.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(["-"])) else { return nil }
-        return URL(string: "https://www.planespotters.net/search?q=\(q)")
+        guard let reg = flight?.reg.trimmingCharacters(in: .whitespaces), !reg.isEmpty,
+              reg.uppercased() != hex.uppercased() else { return nil }
+        return RemoteURL.make("https://www.planespotters.net/search", query: [("q", reg)])
     }
 
     /// Where to look for the aircraft from the user's location, while it's airborne.

@@ -39,11 +39,14 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
         locationManager.delegate = self
         if Shared.location == nil { requestCurrentLocation() }
         Task { await refresh() }
-        timers.append(Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { _ in
-            Task { @MainActor in if self.wantsLive() { await self.refresh() } }
+        timers.append(Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.wantsLive() else { return }
+                await self.refresh()
+            }
         })
-        timers.append(Timer.scheduledTimer(withTimeInterval: 7, repeats: true) { _ in
-            Task { @MainActor in self.rotate() }
+        timers.append(Timer.scheduledTimer(withTimeInterval: 7, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.rotate() }
         })
         scheduleWidgetPump()
     }
@@ -77,7 +80,10 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
 
     // MARK: Widgets
 
+    /// Reloads every widget now (settings, location, Refresh). The next pump tick takes the data
+    /// as its new baseline instead of reloading again.
     func reloadWidgets() {
+        widgetBaselines = [:]
         WidgetCenter.shared.reloadTimelines(ofKind: Shared.widgetKind)
         lastWidgetReload = Date()
     }
@@ -92,24 +98,81 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
         }
     }
 
+    /// What each widget area showed at the last reload, by `WidgetArea.id`.
+    private var widgetBaselines: [String: (time: Date, flights: [Flight])] = [:]
+    /// Number of installed FlightDesk widgets, re-checked every few minutes.
+    private var installedWidgets: (count: Int, checked: Date)?
+
+    /// Every `widgetRefreshSeconds`: fetch fresh data for the areas widgets show (through the shared
+    /// cache, which the widget then reuses) and reload the widgets only when it changed meaningfully.
+    /// The same fetch feeds spotter alerts and the menu-bar readout.
     private func scheduleWidgetPump() {
         widgetTimer?.invalidate()
-        widgetTimer = Timer.scheduledTimer(withTimeInterval: Double(max(10, settings.widgetRefreshSeconds)), repeats: true) { _ in
-            Task { @MainActor in self.reloadWidgets(); await self.pumpBackgroundFlights() }
+        widgetTimer = Timer.scheduledTimer(withTimeInterval: Double(max(10, settings.widgetRefreshSeconds)), repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.widgetPumpTick() }
         }
     }
 
-    /// Feeds `onFlights` every aircraft in range (GA included) while hidden. Shares the widget's 20 s fetch cache.
-    private func pumpBackgroundFlights() async {
-        guard let onFlights, wantsBackgroundFlights(), let loc = Shared.location,
-              let all = try? await FlightService.allNearby(lat: loc.lat, lon: loc.lon, radiusNM: settings.radius.nm) else { return }
-        onFlights(all)
+    private var appWidgetArea: WidgetArea? {
+        Shared.location.map { WidgetArea(lat: $0.lat, lon: $0.lon, radiusNM: settings.radius.nm, includeGA: settings.includeGA) }
+    }
+
+    /// Areas to keep fresh: those widgets recorded, or the app's own until a widget has drawn.
+    private func widgetAreas() async -> [WidgetArea] {
+        let now = Date()
+        if now.timeIntervalSince(installedWidgets?.checked ?? .distantPast) > 600 {
+            let count = await withCheckedContinuation { (done: CheckedContinuation<Int, Never>) in
+                WidgetCenter.shared.getCurrentConfigurations { result in
+                    // On error assume widgets exist, so they keep updating.
+                    done.resume(returning: (try? result.get())?.filter { $0.kind == Shared.widgetKind }.count ?? 1)
+                }
+            }
+            installedWidgets = (count, now)
+        }
+        guard installedWidgets?.count != 0 else { return [] }
+        let recorded = WidgetDemand.current(now: now)
+        return recorded.isEmpty ? appWidgetArea.map { [$0] } ?? [] : recorded
+    }
+
+    private func widgetPumpTick() async {
+        var appAreaFlights: [Flight]?
+        var fresh: [String: [Flight]] = [:]
+        var changed = false
+        let appArea = appWidgetArea
+        for area in await widgetAreas() {
+            guard let all = try? await FlightService.allNearby(lat: area.lat, lon: area.lon, radiusNM: area.radiusNM) else { continue }
+            if area.lat == appArea?.lat, area.lon == appArea?.lon, area.radiusNM == appArea?.radiusNM { appAreaFlights = all }
+            let shown = WidgetRefresh.shown(all, includeGA: area.includeGA)
+            fresh[area.id] = shown
+            let now = Date()
+            if let base = widgetBaselines[area.id] {
+                if WidgetRefresh.isMeaningfulChange(drawn: base.flights, drawnAt: base.time, fresh: shown, now: now, observer: area.observer) {
+                    changed = true
+                }
+            } else {
+                // First look since a reload: the widget just drew about this.
+                widgetBaselines[area.id] = (now, shown)
+            }
+        }
+        if changed {
+            WidgetCenter.shared.reloadTimelines(ofKind: Shared.widgetKind)
+            lastWidgetReload = Date()
+            let now = Date()
+            widgetBaselines = fresh.mapValues { (now, $0) }
+        }
+        // Spotter alerts and the menu-bar readout see every aircraft in range (GA included) while hidden.
+        guard let onFlights, wantsBackgroundFlights(), let loc = Shared.location else { return }
+        if appAreaFlights == nil {
+            appAreaFlights = try? await FlightService.allNearby(lat: loc.lat, lon: loc.lon, radiusNM: settings.radius.nm)
+        }
+        if let all = appAreaFlights { onFlights(all) }
     }
 
     // MARK: Location
 
     func setLocation(lat: Double, lon: Double, name: String) {
         Shared.setLocation(lat: lat, lon: lon, name: name)
+        WidgetDemand.clear()
         placeName = name
         locationStatus = ""
         model = PanelModel()

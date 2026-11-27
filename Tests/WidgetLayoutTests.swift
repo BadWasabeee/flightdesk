@@ -171,7 +171,7 @@ final class WidgetLayoutTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(g.others.count, 10, "the XL gallery preview should have a full list")
         XCTAssertNotNil(g.featured?.route, "the gallery leads with a routed flight")
         XCTAssertEqual(Set(g.flights.map(\.id)).count, g.flights.count, "unique ids")
-        XCTAssertTrue(g.flights.allSatisfy { FlightLink.hex(from: FlightLink.url(for: $0.id)) == $0.id }, "deep-linkable ids")
+        XCTAssertTrue(g.flights.allSatisfy { FlightLink.url(for: $0.id).flatMap(FlightLink.hex(from:)) == $0.id }, "deep-linkable ids")
         XCTAssertEqual(g.flights.map(\.distance), g.flights.map(\.distance).sorted(), "nearest first, like live data")
     }
 }

@@ -211,12 +211,12 @@ enum FlightDetailService {
     /// widget; live positions extend it afterwards. Nil when unavailable, when OpenSky is near its
     /// limit, or when the track belongs to another leg.
     static func track(hex: String, current: GeoPoint?) async -> FlightTrack? {
-        let id = hex.lowercased().replacingOccurrences(of: "~", with: "")
-        guard id.count == 6, id.allSatisfy(\.isHexDigit) else { return nil }
+        // OpenSky keys tracks by the bare 24-bit address, without readsb's "~" marker.
+        guard let id = AircraftID.hex(hex.replacingOccurrences(of: "~", with: ""), allowNonICAO: false) else { return nil }
         if let cached = TrackCache.track(for: id, current: current) { return cached }
         guard ApiBudget.isAvailable(.openSky),
-              let url = URL(string: "https://opensky-network.org/api/tracks/all?icao24=\(id)&time=0"),
-              let (data, resp) = try? await FlightService.session.data(from: url),
+              let url = RemoteURL.make("https://opensky-network.org/api/tracks/all", query: [("icao24", id), ("time", "0")]),
+              let (data, resp) = try? await FlightService.session.boundedData(from: url),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let track = FlightTrack(data: data, current: current) else { return nil }
         TrackCache.store(data, for: id)

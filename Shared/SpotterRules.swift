@@ -61,7 +61,6 @@ struct PlaneAlertEntry: Equatable, Sendable {
     let group: String           // `#CMPG`: Mil, Gov, Pol or Civ
     let tags: [String]
     let category: String        // e.g. "USAF", "Historic", "Police Forces"
-    let link: String
 }
 
 /// The plane-alert-db list indexed by ICAO hex.
@@ -94,7 +93,7 @@ struct PlaneAlertDB: Equatable, Sendable {
         func column(_ name: String) -> Int? { names.firstIndex(of: name) }
         guard let iHex = column("icao") else { return nil }
         let iReg = column("registration"), iOp = column("operator"), iType = column("type"), iIcaoType = column("icao type")
-        let iGroup = column("cmpg"), iCat = column("category"), iLink = column("link")
+        let iGroup = column("cmpg"), iCat = column("category")
         let iTags = ["tag 1", "tag 2", "tag 3"].compactMap(column)
 
         var entries: [String: PlaneAlertEntry] = [:]
@@ -105,11 +104,10 @@ struct PlaneAlertDB: Equatable, Sendable {
                 guard let i, i < row.count else { return "" }
                 return row[i].trimmingCharacters(in: .whitespaces)
             }
-            let hex = value(iHex).lowercased()
-            guard hex.count == 6, hex.allSatisfy(\.isHexDigit) else { continue }
+            guard let hex = AircraftID.hex(value(iHex), allowNonICAO: false) else { continue }
             let e = PlaneAlertEntry(hex: hex, registration: value(iReg), operatorName: value(iOp), type: value(iType),
                                     icaoType: value(iIcaoType).uppercased(), group: value(iGroup),
-                                    tags: iTags.map(value).filter { !$0.isEmpty }, category: value(iCat), link: value(iLink))
+                                    tags: iTags.map(value).filter { !$0.isEmpty }, category: value(iCat))
             entries[hex] = e
             if !e.category.isEmpty { catCounts[e.category, default: 0] += 1 }
             if !e.group.isEmpty { groupCounts[e.group, default: 0] += 1 }
@@ -193,7 +191,7 @@ struct WatchItem: Codable, Identifiable, Hashable {
         let alnum = t.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) }
         switch kind {
         case .hex:
-            return t.count == 6 && t.allSatisfy(\.isHexDigit) ? t.lowercased() : nil
+            return AircraftID.hex(t, allowNonICAO: false)
         case .type:
             return (2...4).contains(t.count) && alnum && t.first!.isLetter ? t : nil
         case .callsign:

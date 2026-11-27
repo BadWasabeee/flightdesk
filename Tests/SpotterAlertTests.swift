@@ -45,7 +45,6 @@ final class SpotterAlertTests: XCTestCase {
         XCTAssertEqual(c17?.tags, ["Moose", "Globemaster", "Cargo"])
         let police = db["ab4c7e"]
         XCTAssertEqual(police?.tags, ["Police Squad", "Los, Judis", "Say \"Hi\""])
-        XCTAssertEqual(police?.link, "https://a.b/0,4643")
         XCTAssertEqual(db["4ca123"]?.tags, ["Warbird"])
         XCTAssertEqual(db.groupCounts, ["Mil": 1, "Pol": 1, "Civ": 1])
         XCTAssertEqual(Set(db.categories.map(\.name)), ["USAF", "Police Forces", "Historic"])

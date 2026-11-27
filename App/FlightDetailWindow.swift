@@ -15,9 +15,14 @@ enum FlightDetail {
 
     /// Shows details for `hex` via the `presenter` when one is installed, else in a window.
     /// `snapshot` fills the view immediately while live data loads.
+    /// Ignores anything that isn't a valid aircraft address (links and notifications carry remote data).
     static func show(hex: String, snapshot: Flight? = nil) {
+        guard let hex = AircraftID.hex(hex) else {
+            fdLog.error("Ignoring request to show an invalid aircraft address")
+            return
+        }
         if let presenter {
-            presenter(hex.lowercased(), snapshot)
+            presenter(hex, snapshot)
         } else {
             showInNewWindow(hex: hex, snapshot: snapshot)
         }

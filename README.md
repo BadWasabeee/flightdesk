@@ -104,6 +104,8 @@ Config/   xcconfig (Team ID, bundle IDs, App Group), entitlements, Info.plist ke
 
 The app and widget share settings, your location and a lookup cache through an App Group container.
 Each widget refresh fetches nearby aircraft and adds aircraft and route details for the closest ones. Lookups are cached for 6 h (routes) and 30 days (aircraft). It then builds a 5-minute timeline of dead-reckoned frames.
+While the app runs, it re-checks the areas the widgets show at the interval chosen in Settings › Widget and reloads the widgets only when the aircraft they would show have changed (arrived, left, or moved off their projected track).
+The app and widget both run in the App Sandbox; remote images are size-checked before decoding, and logo sources are pinned to fixed versions.
 
 ### Data sources
 
@@ -133,11 +135,13 @@ These are free community services. Please be kind to them, and consider supporti
 ## Contributing
 
 Issues and pull requests are welcome. Please run `./build.sh --test` before opening a PR.
-To render every widget size to PNG (handy for UI changes), run:
+To render every widget size to PNG (handy for UI changes), run a **Debug** build (snapshots are compiled out of Release).
+The app is sandboxed, so the output folder must be inside its container:
 
 ```sh
-FLIGHTDESK_SNAPSHOT_DIR=/tmp/shots FLIGHTDESK_SNAPSHOT_SAMPLE=1 FLIGHTDESK_SNAPSHOT_STYLE=standard FLIGHTDESK_SNAPSHOT_SCHEME=dark \
-  ~/Applications/FlightDesk.app/Contents/MacOS/FlightDesk
+SHOTS=~/Library/Containers/<bundle id>/Data/tmp/shots; mkdir -p "$SHOTS"
+FLIGHTDESK_SNAPSHOT_DIR="$SHOTS" FLIGHTDESK_SNAPSHOT_SAMPLE=1 FLIGHTDESK_SNAPSHOT_STYLE=standard FLIGHTDESK_SNAPSHOT_SCHEME=dark \
+  build/Build/Products/Debug/FlightDesk.app/Contents/MacOS/FlightDesk
 ```
 
 ## License

@@ -59,8 +59,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         panel.backgroundColor = .clear
         panel.hasShadow = true
         // Borderless windows keep a stale shadow when their content resizes.
-        NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: panel, queue: .main) { note in
-            (note.object as? NSWindow)?.invalidateShadow()
+        NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: panel, queue: .main) { [weak self] _ in
+            // Delivered on the main queue.
+            MainActor.assumeIsolated { self?.panel.invalidateShadow() }
         }
         panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
@@ -106,7 +107,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 $0.showWelcome()
             }
         }
+        #if DEBUG
         runSnapshotIfRequested()
+        #endif
     }
 
     // Clicking the Dock icon or an empty part of the widget opens the main window when no window
@@ -333,13 +336,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     // MARK: Debug snapshots
 
+    #if DEBUG
     /// FLIGHTDESK_SNAPSHOT_DIR=/path renders every widget size, the designed empty/error states
     /// and the floating panel to PNGs, then quits. FLIGHTDESK_SNAPSHOT_SAMPLE=1 uses the gallery sky;
     /// FLIGHTDESK_SNAPSHOT_STYLE=led|standard and FLIGHTDESK_SNAPSHOT_SCHEME=light|dark override the look.
+    /// Debug builds only; under the App Sandbox the directory must be inside the app's container
+    /// (for example `~/Library/Containers/<bundle id>/Data/tmp`).
     private func runSnapshotIfRequested() {
         guard let dir = ProcessInfo.processInfo.environment["FLIGHTDESK_SNAPSHOT_DIR"] else { return }
         Task { await AirlineLogos.prefetch(Set((PanelModel.gallery.flights + PanelModel.sample.flights).compactMap(\.logoKey))) }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self else { return }
             let env = ProcessInfo.processInfo.environment
             let m = (self.store.model.flights.isEmpty || env["FLIGHTDESK_SNAPSHOT_SAMPLE"] != nil) ? PanelModel.gallery : self.store.model
             var o = self.store.settings.display
@@ -395,4 +402,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
               let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else { return }
         try? png.write(to: URL(fileURLWithPath: path))
     }
+    #endif
 }

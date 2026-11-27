@@ -56,7 +56,11 @@ private struct FlightTarget: ViewModifier {
         case .none:
             content
         case .link:
-            Link(destination: FlightLink.url(for: flight.id)) { content.contentShape(Rectangle()) }
+            if let url = FlightLink.url(for: flight.id) {
+                Link(destination: url) { content.contentShape(Rectangle()) }
+            } else {
+                content
+            }
         case .action(let action):
             HoverTarget(content: content) { action(flight) }
         }
@@ -391,8 +395,8 @@ struct AirlineLogo: View {
     @Environment(\.displayOptions) private var o
 
     var body: some View {
-        if o.showLogos, let u = AirlineLogos.file(for: code), let img = NSImage(contentsOf: u) {
-            LogoImage(image: img)
+        if o.showLogos, let logo = LogoStore.logo(for: code) {
+            LogoImage(image: logo.image)
                 .frame(width: size, height: size)
         } else if reserve && o.showLogos {
             Color.clear.frame(width: size, height: size)
@@ -454,20 +458,8 @@ enum FlightMarkKind: Equatable {
 }
 
 /// Measures how light a logo is, so logos that would disappear against the board are swapped out.
+/// `LogoStore` computes it once per decoded logo.
 enum LogoTone {
-    private static let cache = NSCache<NSString, NSNumber>()
-
-    /// Cached brightness for the logo file at `url`.
-    static func brightness(of image: NSImage, at url: URL) -> Double {
-        let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?.timeIntervalSince1970 ?? 0
-        let key = "\(url.path)#\(date)" as NSString
-        if let hit = cache.object(forKey: key) { return hit.doubleValue }
-        guard let cg = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return 0.5 }
-        let b = brightness(cg)
-        cache.setObject(NSNumber(value: b), forKey: key)
-        return b
-    }
-
     /// Alpha-weighted perceived brightness (0…1) of an image's visible pixels.
     static func brightness(_ cg: CGImage) -> Double {
         let n = 24
@@ -503,11 +495,9 @@ struct FlightMark: View {
 
     var body: some View {
         if o.showLogos {
-            let url = AirlineLogos.file(for: flight.logoKey?.id)
-            let img = url.flatMap { NSImage(contentsOf: $0) }
-            let tone = img.flatMap { i in url.map { LogoTone.brightness(of: i, at: $0) } }
-            content(FlightMarkKind.resolve(flight, logo: url, logoSize: img?.size, brightness: tone,
-                                           darkBackground: !o.isStandard || scheme == .dark), img)
+            let logo = LogoStore.logo(for: flight.logoKey?.id)
+            content(FlightMarkKind.resolve(flight, logo: logo?.url, logoSize: logo?.size, brightness: logo?.brightness,
+                                           darkBackground: !o.isStandard || scheme == .dark), logo?.image)
                 .frame(width: size, height: size)
                 .accessibilityHidden(true)
         }

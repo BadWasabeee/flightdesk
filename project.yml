@@ -25,6 +25,8 @@ targets:
         excludes: ["AppIcon.icon/**"]
       - path: App/AppIcon.icon
         buildPhase: resources
+      - path: Config/Privacy/App/PrivacyInfo.xcprivacy
+        buildPhase: resources
       - Shared
     settings:
       base:
@@ -43,7 +45,11 @@ targets:
   FlightDeskWidget:
     type: app-extension
     platform: macOS
-    sources: [Widget, Shared]
+    sources:
+      - Widget
+      - Shared
+      - path: Config/Privacy/Widget/PrivacyInfo.xcprivacy
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: $(BUNDLE_ID_PREFIX).flightdesk.widget

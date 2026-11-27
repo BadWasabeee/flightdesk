@@ -49,22 +49,20 @@ actor AircraftPhotos {
 
     init(directory: URL = Shared.containerURL) {
         fileURL = directory.appendingPathComponent("aircraft-photos.json")
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 10
-        config.httpAdditionalHeaders = FlightService.session.configuration.httpAdditionalHeaders
-        // The image CDN sends long max-age headers, so this cache serves repeat views offline.
+        // Same User-Agent, timeouts and request accounting as `FlightService.session`, plus an
+        // on-disk URL cache: the image CDN sends long max-age headers, so repeat views work offline.
+        let config = Net.configuration(.default, request: 10, resource: 20)
         config.urlCache = URLCache(memoryCapacity: 4 << 20, diskCapacity: 40 << 20,
                                    directory: directory.appendingPathComponent("aircraft-photos", isDirectory: true))
         config.requestCachePolicy = .useProtocolCachePolicy
-        session = URLSession(configuration: config)
+        session = Net.session(config)
     }
 
     /// The photo for the aircraft with ICAO `hex`, trying `registration` when the hex has none.
     /// Nil when there is no photo or the service can't be reached.
     func photo(hex: String, registration: String?) async -> AircraftPhoto? {
-        let key = hex.lowercased()
         // Non-ICAO addresses ("~…", TIS-B) don't identify an airframe.
-        guard key.count == 6, key.allSatisfy(\.isHexDigit) else { return nil }
+        guard let key = AircraftID.hex(hex, allowNonICAO: false) else { return nil }
         loadIfNeeded()
         if let e = entries?[key], Self.isFresh(e) { return e.photo }
         if let task = inFlight[key] { return await task.value }
@@ -77,9 +75,10 @@ actor AircraftPhotos {
         return result
     }
 
-    /// Image bytes for `photo`, from the URL cache when possible.
+    /// Image bytes for `photo` (at most `ResponseLimit.photo`), from the URL cache when possible.
+    /// Decode with `ImageGuard.thumbnail(_:_:maxPixel:)` and `ImageGuard.photo`.
     func imageData(for photo: AircraftPhoto) async -> Data? {
-        guard let (data, resp) = try? await session.data(from: photo.imageURL),
+        guard let (data, resp) = try? await session.boundedData(from: photo.imageURL, limit: ResponseLimit.photo),
               (resp as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty else { return nil }
         return data
     }
@@ -89,10 +88,9 @@ actor AircraftPhotos {
     private enum Outcome { case found(AircraftPhoto), noPhoto, failed }
 
     private func fetch(key: String, registration: String) async -> AircraftPhoto? {
-        var outcome = await query("hex/\(key)")
-        if case .noPhoto = outcome, !registration.isEmpty,
-           let reg = registration.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(["-"])) {
-            outcome = await query("reg/\(reg)")
+        var outcome = await query(["hex", key])
+        if case .noPhoto = outcome, !registration.isEmpty {
+            outcome = await query(["reg", registration])
         }
         switch outcome {
         case .found(let photo):
@@ -107,11 +105,11 @@ actor AircraftPhotos {
         }
     }
 
-    private func query(_ path: String) async -> Outcome {
-        guard let url = URL(string: "https://api.planespotters.net/pub/photos/\(path)"),
-              let (data, resp) = try? await session.data(from: url) else { return .failed }
+    private func query(_ path: [String]) async -> Outcome {
+        guard let url = RemoteURL.make("https://api.planespotters.net/pub/photos", path),
+              let (data, resp) = try? await session.boundedData(from: url) else { return .failed }
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
-            fdLog.info("Planespotters \(path, privacy: .public): HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)")
+            fdLog.info("Planespotters \(path.first ?? "", privacy: .public): HTTP \((resp as? HTTPURLResponse)?.statusCode ?? 0)")
             return .failed
         }
         do {
@@ -153,20 +151,25 @@ actor AircraftPhotos {
         entries = (try? JSONDecoder().decode([String: Entry].self, from: Data(contentsOf: fileURL))) ?? [:]
     }
 
+    /// Saves `entry`, merged with what the other process (app or widget) wrote meanwhile.
     private func store(_ entry: Entry, for key: String) {
         loadIfNeeded()
         var all = entries ?? [:]
         all[key] = entry
-        if all.count > Self.maxEntries {
-            let now = Date()
-            all = all.filter { Self.isFresh($0.value, now: now) }
-            if all.count > Self.maxEntries {
-                all = Dictionary(uniqueKeysWithValues: all.sorted { $0.value.at > $1.value.at }
-                    .prefix(Self.maxEntries * 3 / 4).map { ($0.key, $0.value) })
-            }
+        SharedFile.update(fileURL) { data in
+            let disk = data.flatMap { try? JSONDecoder().decode([String: Entry].self, from: $0) } ?? [:]
+            all = Self.pruned(all.merging(disk) { mine, theirs in mine.at >= theirs.at ? mine : theirs })
+            return try? JSONEncoder().encode(all)
         }
         entries = all
-        try? FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? JSONEncoder().encode(all).write(to: fileURL, options: .atomic)
+    }
+
+    private static func pruned(_ entries: [String: Entry]) -> [String: Entry] {
+        guard entries.count > maxEntries else { return entries }
+        let now = Date()
+        let all = entries.filter { isFresh($0.value, now: now) }
+        guard all.count > maxEntries else { return all }
+        return Dictionary(uniqueKeysWithValues: all.sorted { $0.value.at > $1.value.at }
+            .prefix(maxEntries * 3 / 4).map { ($0.key, $0.value) })
     }
 }

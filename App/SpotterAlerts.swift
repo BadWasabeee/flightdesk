@@ -23,10 +23,6 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
     /// Aircraft currently silenced with "Mute for 24 Hours".
     @Published private(set) var mutedCount = 0
 
-    /// Supplies an aircraft's transponder squawk. Nil until the live feed model carries squawks;
-    /// once `Flight.squawk` exists, wire it with `SpotterAlerts.squawk = { $0.squawk }`.
-    static var squawk: ((Flight) -> String?)? = { $0.squawk }
-
     /// Called after settings change (the menu-bar readout listens).
     var onChange: (() -> Void)?
     /// Most recent flight list seen, nearest first.
@@ -40,9 +36,7 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
 
     /// True when something needs flight data even while no window is visible.
     var needsBackgroundFlights: Bool {
-        var rules = settings.activeRules
-        if Self.squawk == nil { rules.remove(.emergency) }   // can't match anything yet
-        return settings.menuBarReadout || !rules.isEmpty
+        settings.menuBarReadout || !settings.activeRules.isEmpty
     }
 
     static let categoryID = "spotter.alert"
@@ -70,9 +64,8 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
         guard !settings.activeRules.isEmpty else { return }
         if settings.activeRules.contains(.interesting) { ensureDatabase() }
         let now = Date()
-        let squawk = Self.squawk ?? { _ in nil }
         let candidates = SpotterEngine.applyQuietHours(
-            SpotterEngine.evaluate(flights, settings: settings, db: database, squawk: squawk), settings.quietHours, at: now)
+            SpotterEngine.evaluate(flights, settings: settings, db: database, squawk: \.squawk), settings.quietHours, at: now)
         guard !candidates.isEmpty else { return }
         Task {
             await refreshAuthorization()
@@ -97,7 +90,9 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
         content.subtitle = alert.subtitle
         content.body = alert.body(display: AppSettings.load().display)
         content.sound = .default
-        if alert.rule == .emergency { content.interruptionLevel = .timeSensitive }
+        // `.timeSensitive` would need the time-sensitive notifications entitlement; `.active` is the default
+        // and still sounds and shows a banner.
+        content.interruptionLevel = .active
         // One stack per rule in Notification Center (emergencies, watchlist, military…).
         content.threadIdentifier = "spotter.\(alert.rule.rawValue)"
         content.categoryIdentifier = Self.categoryID
@@ -175,8 +170,11 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
                                             withCompletionHandler completionHandler: @escaping () -> Void) {
         let info = response.notification.request.content.userInfo
-        let hex = info["hex"] as? String
-        let snapshot = (info["flight"] as? Data).flatMap { try? JSONDecoder().decode(Flight.self, from: $0) }
+        // Only act on a well-formed aircraft address, and only trust a snapshot of that same aircraft.
+        let hex = (info["hex"] as? String).flatMap { AircraftID.hex($0) }
+        let snapshot = (info["flight"] as? Data)
+            .flatMap { try? JSONDecoder().decode(Flight.self, from: $0) }
+            .flatMap { $0.id.lowercased() == hex ? $0 : nil }
         let action = response.actionIdentifier
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
@@ -200,13 +198,10 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
     private static let databaseMaxAge: TimeInterval = 7 * 86_400
     private var databaseFile: URL { Shared.containerURL.appendingPathComponent("plane-alert-db.csv") }
 
-    /// Anonymous, cookie-less session: the download carries no location or identifiers.
-    private static let downloadSession: URLSession = {
-        let c = URLSessionConfiguration.ephemeral
-        c.timeoutIntervalForRequest = 30
-        c.httpAdditionalHeaders = ["User-Agent": "FlightDesk"]
-        return URLSession(configuration: c)
-    }()
+    /// Anonymous, cookie-less session with FlightDesk's User-Agent and request accounting: the
+    /// download carries no location or identifiers. A longer overall timeout than the API session,
+    /// as the list is a few megabytes.
+    private static let downloadSession = Net.session(Net.configuration(request: 30, resource: 90))
 
     /// Loads the cached list, downloading it if missing or older than a week. Safe to call often.
     func ensureDatabase(force: Bool = false) {
@@ -226,7 +221,7 @@ final class SpotterAlerts: NSObject, ObservableObject, UNUserNotificationCenterD
             lastDownloadAttempt = Date()
             if database == nil { databaseStatus = "Downloading the list…" }
             do {
-                let (data, response) = try await Self.downloadSession.data(from: Self.databaseURL)
+                let (data, response) = try await Self.downloadSession.boundedData(from: Self.databaseURL, limit: ResponseLimit.csv)
                 guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
                 guard let db = await Task.detached(priority: .utility, operation: { PlaneAlertDB(csv: data) }).value,
                       db.entries.count > 100 else { throw URLError(.cannotParseResponse) }
