@@ -89,7 +89,7 @@ Polling pauses while FlightDesk is in the background. The radar refetches every 
 
 ```sh
 ./build.sh --ios
-xcrun simctl location booted set 43.08,-88.26   # optional: pretend to be near Milwaukee
+xcrun simctl location booted set 41.88,-87.63   # optional: pretend to be in Chicago
 ```
 
 This builds the `FlightDeskiOS` scheme, boots an iPhone simulator if none is running (iPhone 17 Pro on the newest iOS), installs the app and launches it. No signing setup is needed for the Simulator.
