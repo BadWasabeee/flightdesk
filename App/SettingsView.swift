@@ -1,7 +1,7 @@
 import SwiftUI
 import ServiceManagement
 
-enum SettingsTab: Hashable { case general, display, widget }
+enum SettingsTab: Hashable { case general, display, widget, alerts }
 
 struct SettingsView: View {
     @ObservedObject var store: LiveStore
@@ -22,6 +22,8 @@ struct SettingsView: View {
                 .tabItem { Label("Display", systemImage: "paintpalette") }.tag(SettingsTab.display)
             WidgetSettings(store: store)
                 .tabItem { Label("Widget", systemImage: "square.grid.2x2") }.tag(SettingsTab.widget)
+            SpotterSettingsView(store: store)
+                .tabItem { Label("Alerts", systemImage: "bell.badge") }.tag(SettingsTab.alerts)
         }
         .frame(width: 560, height: 640)
         .onChange(of: tab) { _, t in onTabChange(t) }
@@ -35,6 +37,10 @@ struct GeneralSettings: View {
     @State private var query = ""
     @State private var searching = false
     @State private var loginEnabled = SMAppService.mainApp.status == .enabled
+    @State private var receiver = ReceiverSettings.current
+    @State private var testingReceiver = false
+    @State private var receiverTest: ReceiverFeed.TestResult?
+    @State private var served: ServedSource?
 
     var body: some View {
         Form {
@@ -69,9 +75,51 @@ struct GeneralSettings: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
-            Section("Data") {
-                LabeledContent("Positions", value: "adsb.lol · live ADS-B / MLAT")
+            Section {
+                Toggle("Use my ADS-B receiver", isOn: $receiver.enabled)
+                if receiver.enabled {
+                    TextField("Receiver URL", text: $receiver.url, prompt: Text(verbatim: "http://raspberrypi.local/tar1090"))
+                        .autocorrectionDisabled()
+                        .onSubmit(testReceiver)
+                    HStack {
+                        Button("Test Connection", action: testReceiver)
+                            .disabled(!receiver.hasURL || testingReceiver)
+                        if testingReceiver { ProgressView().controlSize(.small) }
+                    }
+                    if let r = receiverTest {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label(r.message, systemImage: r.ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(r.ok ? .green : .orange)
+                            if let detail = r.detail {
+                                Text(detail).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                            }
+                        }
+                        .font(.callout)
+                    }
+                    Toggle("Only use my receiver", isOn: $receiver.useAsOnlySource)
+                }
+                LabeledContent("Positions", value: positionsSummary)
                 LabeledContent("Routes & aircraft", value: "adsbdb · verified against live position")
+                if let served {
+                    LabeledContent("Last data from") {
+                        Text("\(served.source.title) · \(Text(served.time, style: .relative)) ago")
+                    }
+                }
+            } header: {
+                Text("Data")
+            } footer: {
+                Text("Reads aircraft.json from dump1090-fa, readsb, tar1090, PiAware (SkyAware) or ultrafeeder on your network. Enter the address of its map page. With “Only use my receiver”, positions never come from the internet; route and aircraft details still come from adsbdb.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .onChange(of: receiver) { old, new in
+                new.save()
+                if old.url != new.url { receiverTest = nil } else { refreshData() }
+            }
+            .task {
+                while !Task.isCancelled {
+                    served = await FeedHealth.shared.lastServed
+                    try? await Task.sleep(for: .seconds(3))
+                }
             }
 
             Section("System") {
@@ -83,6 +131,34 @@ struct GeneralSettings: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var positionsSummary: String {
+        guard receiver.isActive else { return "adsb.fi, adsb.lol fallback · live ADS-B / MLAT" }
+        return receiver.useAsOnlySource ? "Your receiver only" : "Your receiver, then adsb.fi / adsb.lol"
+    }
+
+    private func testReceiver() {
+        guard receiver.hasURL, !testingReceiver else { return }
+        let base = receiver.url
+        let observer = Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) }
+        let radius = store.settings.radius.nm
+        testingReceiver = true
+        Task {
+            let result = await ReceiverFeed.test(base, observer: observer, radiusNM: radius)
+            guard base == receiver.url else { testingReceiver = false; return }   // edited meanwhile
+            receiverTest = result
+            testingReceiver = false
+            if result.ok { refreshData() }
+        }
+    }
+
+    /// Fetches again so a source change shows up right away in the panel and widgets.
+    private func refreshData() {
+        Task {
+            await store.refresh()
+            store.reloadWidgets()
+        }
     }
 
     private func search() {

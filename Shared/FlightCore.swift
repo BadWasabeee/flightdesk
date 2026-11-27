@@ -193,6 +193,8 @@ struct Flight: Identifiable, Equatable, Codable {
     var bearing: Double     // degrees from you to the aircraft
     var route: RouteInfo?
     var aircraft: AircraftInfo?
+    /// Transponder code, when the feed reports one (7500/7600/7700 are emergencies).
+    var squawk: String? = nil
 
     var airlineName: String { route?.airline ?? aircraft?.owner ?? "" }
     var airlineCode: String? { route?.airlineCode }
@@ -247,6 +249,7 @@ struct Flight: Identifiable, Equatable, Codable {
         self.lon = lon
         distance = dst
         bearing = a.dir ?? 0
+        squawk = a.squawk
     }
 }
 
@@ -296,6 +299,7 @@ struct ADSBAircraft: Decodable {
     let dir: Double?
     let baro_rate: Double?
     let geom_rate: Double?
+    let squawk: String?
 }
 
 private struct DBRouteResponse: Decodable { let response: Inner
@@ -354,24 +358,37 @@ enum FlightService {
         return list
     }
 
-    /// Every aircraft within the radius, nearest first. Shared between the app and the widget for
+    /// Every aircraft within the radius, nearest first: from the user's own receiver when enabled,
+    /// otherwise (or as fallback) the internet feeds. Shared between the app and the widget for
     /// a few seconds so they don't download the same thing twice.
     static func allNearby(lat: Double, lon: Double, radiusNM: Int) async throws -> [Flight] {
-        // Privacy: only a coarse position (2 decimals ≈ 1 km) ever leaves the Mac.
-        let key = String(format: "%.2f,%.2f,%d", lat, lon, radiusNM)
-        if let cached = NearbyCache.read(key: key, maxAge: 20) { return cached }
-        let data: Data
+        let receiver = ReceiverSettings.current
+        // Privacy: only a coarse position (2 decimals ≈ 1 km) ever leaves the Mac; the receiver gets none.
+        // The source mode is part of the key so a source switch takes effect at once and
+        // "receiver only" never shows a list from the internet.
+        let key = String(format: "%.2f,%.2f,%d", lat, lon, radiusNM) + receiver.cacheTag
+        if let cached = NearbyCache.read(key: key, maxAge: 20) {
+            if let source = cached.source { await FeedHealth.shared.served(source, at: cached.time) }
+            return cached.flights
+        }
+        var source = DataSource.receiver
+        let list: [Flight]
         do {
-            data = try await LiveFeed.fetch { $0.pointURL(lat: lat, lon: lon, radiusNM: radiusNM) }
+            list = try await ReceiverFeed.route(receiver, local: {
+                try await ReceiverFeed.nearby(lat: lat, lon: lon, radiusNM: radiusNM, settings: receiver)
+            }, internet: {
+                let (data, feed) = try await LiveFeed.fetchWithSource { $0.pointURL(lat: lat, lon: lon, radiusNM: radiusNM) }
+                source = .feed(feed)
+                return (try JSONDecoder().decode(ADSBResponse.self, from: data).ac ?? [])
+                    .compactMap(Flight.init(adsb:))
+                    .sorted { $0.distance < $1.distance }
+            }) ?? []
         } catch {
-            // Every feed failed: keep showing recent data rather than an empty board.
-            if let stale = NearbyCache.read(key: key, maxAge: 600) { return stale }
+            // Every source failed: keep showing recent data rather than an empty board.
+            if let stale = NearbyCache.read(key: key, maxAge: 600) { return stale.flights }
             throw error
         }
-        let list = (try JSONDecoder().decode(ADSBResponse.self, from: data).ac ?? [])
-            .compactMap(Flight.init(adsb:))
-            .sorted { $0.distance < $1.distance }
-        NearbyCache.write(list, key: key)
+        NearbyCache.write(list, key: key, source: source)
         return list
     }
 
@@ -870,13 +887,40 @@ enum FlightLink {
 
 // MARK: - Live ADS-B feeds
 
+/// Where a list of aircraft came from.
+enum DataSource: Hashable, Codable, Sendable {
+    /// The user's own ADS-B receiver (see `ReceiverFeed`).
+    case receiver
+    case feed(LiveFeed)
+
+    var title: String {
+        switch self {
+        case .receiver: "Your receiver"
+        case .feed(let f): f.title
+        }
+    }
+}
+
+/// The source that served the most recent data, and when.
+struct ServedSource: Equatable, Sendable {
+    var source: DataSource
+    var time: Date
+}
+
 /// Community ADS-B aggregators with the same readsb JSON format. Requests go to the first healthy
 /// feed and fall back to the next, so a rate limit or outage on one doesn't blank the widget.
-enum LiveFeed: String, CaseIterable, Sendable {
+enum LiveFeed: String, CaseIterable, Codable, Sendable {
     /// adsb.fi open data: about one request per second, no daily cap.
     case adsbFi
     /// adsb.lol: 500 requests per day per address.
     case adsbLol
+
+    var title: String {
+        switch self {
+        case .adsbFi: "adsb.fi"
+        case .adsbLol: "adsb.lol"
+        }
+    }
 
     func pointURL(lat: Double, lon: Double, radiusNM: Int) -> URL {
         switch self {
@@ -895,6 +939,11 @@ enum LiveFeed: String, CaseIterable, Sendable {
 
     /// Fetches from the first feed that answers 200, skipping feeds that recently failed.
     static func fetch(_ url: (LiveFeed) -> URL?) async throws -> Data {
+        try await fetchWithSource(url).data
+    }
+
+    /// Like `fetch`, also returning the feed that answered.
+    static func fetchWithSource(_ url: (LiveFeed) -> URL?) async throws -> (data: Data, feed: LiveFeed) {
         var lastError: Error = URLError(.cannotFindHost)
         let order = await FeedHealth.shared.order()
         for feed in order {
@@ -904,7 +953,8 @@ enum LiveFeed: String, CaseIterable, Sendable {
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 if code == 200 {
                     await FeedHealth.shared.succeeded(feed)
-                    return data
+                    await FeedHealth.shared.served(.feed(feed))
+                    return (data, feed)
                 }
                 // 429 = rate limited: back off this feed for longer.
                 await FeedHealth.shared.failed(feed, for: code == 429 ? 1_800 : 120)
@@ -919,10 +969,13 @@ enum LiveFeed: String, CaseIterable, Sendable {
     }
 }
 
-/// Remembers (per process) which feeds failed recently so requests go straight to a working one.
+/// Remembers (per process) which feeds failed recently so requests go straight to a working one,
+/// and which source served the latest data.
 actor FeedHealth {
     static let shared = FeedHealth()
     private var benchedUntil: [LiveFeed: Date] = [:]
+    private var receiverBenchedUntil = Date.distantPast
+    private(set) var lastServed: ServedSource?
 
     func order() -> [LiveFeed] {
         let now = Date()
@@ -932,22 +985,37 @@ actor FeedHealth {
     }
     func failed(_ feed: LiveFeed, for seconds: TimeInterval) { benchedUntil[feed] = Date().addingTimeInterval(seconds) }
     func succeeded(_ feed: LiveFeed) { benchedUntil[feed] = nil }
+
+    func receiverIsHealthy() -> Bool { receiverBenchedUntil <= Date() }
+    func receiverFailed(for seconds: TimeInterval) { receiverBenchedUntil = Date().addingTimeInterval(seconds) }
+    func receiverSucceeded() { receiverBenchedUntil = .distantPast }
+
+    func served(_ source: DataSource, at time: Date = Date()) {
+        if let last = lastServed, last.time > time { return }
+        lastServed = ServedSource(source: source, time: time)
+    }
 }
 
 /// The latest nearby-aircraft list in the shared container, so the app and widget can reuse it.
 enum NearbyCache {
-    private struct Entry: Codable { var key: String; var time: Date; var flights: [Flight] }
+    struct Entry: Codable {
+        var key: String
+        var time: Date
+        var flights: [Flight]
+        /// Absent in entries written by older versions.
+        var source: DataSource?
+    }
     private static var url: URL { Shared.containerURL.appendingPathComponent("nearby-cache.json") }
 
-    static func read(key: String, maxAge: TimeInterval) -> [Flight]? {
+    static func read(key: String, maxAge: TimeInterval) -> Entry? {
         guard let data = try? Data(contentsOf: url),
               let e = try? JSONDecoder().decode(Entry.self, from: data),
               e.key == key, -e.time.timeIntervalSinceNow < maxAge else { return nil }
-        return e.flights
+        return e
     }
 
-    static func write(_ flights: [Flight], key: String) {
-        guard let data = try? JSONEncoder().encode(Entry(key: key, time: Date(), flights: flights)) else { return }
+    static func write(_ flights: [Flight], key: String, source: DataSource? = nil) {
+        guard let data = try? JSONEncoder().encode(Entry(key: key, time: Date(), flights: flights, source: source)) else { return }
         try? data.write(to: url, options: .atomic)
     }
 }

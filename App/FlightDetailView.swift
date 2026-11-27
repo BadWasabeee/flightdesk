@@ -28,6 +28,19 @@ final class FlightDetailModel: ObservableObject {
     @Published private(set) var routeNote: String?
     /// Other aircraft within the user's search radius.
     @Published private(set) var nearby: [Flight] = []
+    /// The airframe photo, while loading and once found.
+    @Published private(set) var photo: PhotoState = .loading(aspectRatio: 1.5)
+    /// Year the airframe was built, when the live feed knows it.
+    @Published private(set) var buildYear: Int?
+
+    /// Progress of the airframe photo lookup.
+    enum PhotoState {
+        /// Still looking; space is reserved at this width ÷ height.
+        case loading(aspectRatio: Double)
+        case loaded(AircraftPhoto, NSImage)
+        /// No photo exists or it couldn't be loaded; nothing is shown.
+        case unavailable
+    }
     /// The user's search radius, drawn around their location.
     let radiusNM: Int
     private let includeGA: Bool
@@ -46,6 +59,7 @@ final class FlightDetailModel: ObservableObject {
     private var poller: Task<Void, Never>?
     private var nearbyPoller: Task<Void, Never>?
     private var historyPoller: Task<Void, Never>?
+    private var photoTask: Task<Void, Never>?
 
     /// `nearby` seeds the map's other aircraft (when switching planes) until the next refresh.
     init(hex: String, snapshot: Flight?, nearby: [Flight] = []) {
@@ -69,6 +83,7 @@ final class FlightDetailModel: ObservableObject {
         poller?.cancel()
         nearbyPoller?.cancel()
         historyPoller?.cancel()
+        photoTask?.cancel()
     }
 
     func start() {
@@ -92,11 +107,33 @@ final class FlightDetailModel: ObservableObject {
                 try? await Task.sleep(for: Self.historyInterval)
             }
         }
+        if case .loading = photo {
+            photoTask = Task { [weak self] in await self?.loadPhoto() }
+        }
     }
 
     func stop() {
-        [poller, nearbyPoller, historyPoller].forEach { $0?.cancel() }
-        poller = nil; nearbyPoller = nil; historyPoller = nil
+        [poller, nearbyPoller, historyPoller, photoTask].forEach { $0?.cancel() }
+        poller = nil; nearbyPoller = nil; historyPoller = nil; photoTask = nil
+    }
+
+    /// Looks up the airframe photo (by hex, then registration) and downloads the image.
+    private func loadPhoto() async {
+        // Give the first live poll a moment to supply the registration for the fallback lookup.
+        if flight == nil || flight?.reg == hex.uppercased() { try? await Task.sleep(for: .seconds(1)) }
+        guard !Task.isCancelled else { return }
+        guard let found = await AircraftPhotos.shared.photo(hex: hex, registration: flight?.reg) else {
+            if !Task.isCancelled { photo = .unavailable }
+            return
+        }
+        guard !Task.isCancelled else { return }
+        photo = .loading(aspectRatio: found.aspectRatio)
+        if let data = await AircraftPhotos.shared.imageData(for: found), let image = NSImage(data: data) {
+            if !Task.isCancelled { photo = .loaded(found, image) }
+        } else if !Task.isCancelled {
+            photo = .unavailable
+        }
+        photoTask = nil
     }
 
     private func pollNearby() async {
@@ -182,6 +219,7 @@ final class FlightDetailModel: ObservableObject {
         squawk = report.squawk
         onGround = report.onGround
         lastSeen = report.positionTime
+        buildYear = report.year ?? buildYear
         isLive = -report.positionTime.timeIntervalSinceNow < Self.staleAfter
     }
 
@@ -231,6 +269,12 @@ final class FlightDetailModel: ObservableObject {
     }
 
     var adsbLolURL: URL? { URL(string: "https://adsb.lol/?icao=\(hex)") }
+
+    /// Where to look for the aircraft from the user's location, while it's airborne.
+    var skyPosition: SkyPosition? {
+        guard let f = flight, !onGround, let loc = Shared.location else { return nil }
+        return SkyPosition(observer: GeoPoint(lat: loc.lat, lon: loc.lon), aircraft: f.geoPoint, altitudeFt: Double(f.altitude))
+    }
 }
 
 private extension GeoPoint {
@@ -418,6 +462,7 @@ private struct FlightDetailSidebar: View {
                     .padding(.horizontal, 20)
                     .padding(.top, 16)
                 Form {
+                    photoSection
                     if let r = f.route {
                         routeSection(f, from: r.from, to: r.to)
                     } else if let origin = model.departedFrom {
@@ -425,6 +470,9 @@ private struct FlightDetailSidebar: View {
                     }
                     flightSection(f)
                     aircraftSection(f)
+                    if let sky = model.skyPosition {
+                        lookUpSection(sky)
+                    }
                     if Shared.location != nil {
                         Section("From you") {
                             LabeledContent("Distance", value: o.distance(f.distance))
@@ -565,7 +613,106 @@ private struct FlightDetailSidebar: View {
             LabeledContent("Registration", value: f.reg)
             LabeledContent("ICAO hex", value: f.id.uppercased())
             if let owner = f.aircraft?.owner, owner != f.airlineName { LabeledContent("Operator", value: owner) }
+            if let year = model.buildYear {
+                let age = Calendar.current.component(.year, from: Date()) - year
+                LabeledContent("Built", value: age > 0 ? "\(String(year)) (\(age) yr)" : String(year))
+            }
         }
+    }
+
+    /// The airframe photo with its required credit; both open the photo's page.
+    /// Hidden entirely when there's no photo.
+    @ViewBuilder private var photoSection: some View {
+        switch model.photo {
+        case .loading(let ratio):
+            Section {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(.quaternary)
+                    .aspectRatio(ratio, contentMode: .fit)
+                    .overlay { ProgressView().controlSize(.small) }
+                    .accessibilityLabel("Loading aircraft photo")
+            }
+        case .loaded(let photo, let image):
+            Section {
+                Link(destination: photo.pageURL) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .aspectRatio(photo.aspectRatio, contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .help("Open this photo on Planespotters.net")
+                .accessibilityLabel("Photo of \(model.flight?.reg ?? model.hex.uppercased()), \(photo.credit)")
+            } footer: {
+                Link(photo.credit, destination: photo.pageURL)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        case .unavailable:
+            EmptyView()
+        }
+    }
+
+    private func lookUpSection(_ sky: SkyPosition) -> some View {
+        Section("Look up") {
+            HStack(spacing: 12) {
+                SkyDome(position: sky)
+                    .frame(width: 52, height: 52)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(Self.pointing(sky))
+                    Text("Slant range \(o.distance(sky.slantRangeNM))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    /// "32° up · NE (45°)", or "Below the horizon · NE (45°)".
+    static func pointing(_ sky: SkyPosition) -> String {
+        let direction = "\(sky.compassPoint) (\(Int(sky.azimuth.rounded()) % 360)°)"
+        guard sky.isAboveHorizon else { return "Below the horizon · \(direction)" }
+        let up = sky.elevation < 1 ? "<1°" : "\(Int(sky.elevation.rounded()))°"
+        return "\(up) up · \(direction)"
+    }
+}
+
+/// A small sky chart: the outer circle is the horizon, the centre is straight up, north at the
+/// top (as if lying on your back with your head to the south). The dot marks the aircraft.
+private struct SkyDome: View {
+    let position: SkyPosition
+
+    var body: some View {
+        GeometryReader { geo in
+            let size = min(geo.size.width, geo.size.height)
+            let r = size / 2 - 3
+            let centre = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
+            // Distance from the centre: 0 at the zenith, r at the horizon (clamped for below it).
+            let d = r * (1 - max(0, min(90, position.elevation)) / 90)
+            let az = position.azimuth * .pi / 180
+            let dot = CGPoint(x: centre.x + d * sin(az), y: centre.y - d * cos(az))
+            ZStack {
+                Circle().fill(.quaternary.opacity(0.5))
+                Circle().stroke(.secondary, lineWidth: 1)
+                Circle().stroke(.tertiary, lineWidth: 0.5).padding(r / 3)       // 30° up
+                Circle().stroke(.tertiary, lineWidth: 0.5).padding(r * 2 / 3)   // 60° up
+                Text("N")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .position(x: centre.x, y: centre.y - r + 6)
+                Circle()
+                    .fill(position.isAboveHorizon ? Color.accentColor : Color.clear)
+                    .overlay(Circle().stroke(position.isAboveHorizon ? Color.clear : Color.secondary, lineWidth: 1.5))
+                    .frame(width: 8, height: 8)
+                    .position(dot)
+            }
+            .frame(width: size, height: size)
+            .position(centre)
+        }
+        .accessibilityHidden(true)
     }
 }
 

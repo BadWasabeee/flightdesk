@@ -8,7 +8,7 @@ enum FlightDeskMain {
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
-        app.setActivationPolicy(.accessory)
+        app.setActivationPolicy(.regular)
         app.run()
     }
 }
@@ -35,7 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     var settingsTab = SettingsTab.general
     var statusItem: NSStatusItem!
     let menu = NSMenu()
-    /// Settings opened by a reopen or first launch, held briefly so a deep link arriving
+    lazy var mainWindow = MainWindowController(store: store)
+    /// A window opened by a reopen or launch, held briefly so a deep link arriving
     /// around the same time (widget click) can cancel it.
     private var pendingSettings: DispatchWorkItem?
     /// When the last `flightdesk://` link was handled.
@@ -45,6 +46,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     private var didLaunch = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        let loginLaunch = LaunchContext.isLoginItem
+        MainMenu.install(for: self)
         let host = NSHostingController(rootView: PanelRoot(store: store))
         host.sizingOptions = [.preferredContentSize]
         panel = NSWindow(contentViewController: host)
@@ -69,19 +72,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         store.onSettingsChange = { [weak self] in self?.applyPanelSettings() }
         store.wantsLive = { [weak self] in
             guard let self else { return false }
-            return self.panel.isVisible || (self.settingsWindow?.isVisible ?? false)
+            return self.panel.isVisible || (self.settingsWindow?.isVisible ?? false) || self.mainWindow.isVisible
         }
         applyPanelSettings()
+        installSpotterAlerts()
         store.start()
 
         didLaunch = true
         pendingLinks.forEach { showFlight(hex: $0) }
         pendingLinks.removeAll()
 
-        // Onboarding waits for a normal launch: when launched by a deep link the detail window wins.
+        // A normal launch opens the main window, with onboarding in front the first time. Launched by
+        // a deep link the detail window wins; launched at login the app starts in the menu bar only.
         let defaultLaunch = note.userInfo?[NSApplication.launchIsDefaultUserInfoKey] as? Bool ?? true
-        if defaultLaunch, !UserDefaults.standard.bool(forKey: "onboarded.v2") {
+        if defaultLaunch, !loginLaunch {
             scheduleSettings {
+                $0.showMainWindow()
+                guard !UserDefaults.standard.bool(forKey: "onboarded.v2") else { return }
                 UserDefaults.standard.set(true, forKey: "onboarded.v2")
                 $0.openSettings(tab: .widget)
             }
@@ -89,12 +96,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         runSnapshotIfRequested()
     }
 
-    // Clicking an empty part of the widget (or relaunching the app) opens Settings.
+    // Clicking the Dock icon or an empty part of the widget opens the main window when no window
+    // is open (the desktop panel doesn't count).
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         guard Date().timeIntervalSince(lastLinkOpen) > 1 else { return true }
-        scheduleSettings { $0.openSettings(tab: $0.settingsTab) }
+        if !NSApp.windows.contains(where: { $0.isVisible && $0.styleMask.contains(.titled) }) {
+            scheduleSettings { $0.showMainWindow() }
+        }
         return true
     }
+
+    // The menu bar item, desktop panel and widget refreshes keep running without windows.
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     // MARK: Deep links
 
@@ -112,7 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         FlightDetail.show(hex: hex, snapshot: store.model.flights.first { $0.id == hex })
     }
 
-    /// Opens Settings after a short grace period, unless a deep link cancels it first.
+    /// Opens a window after a short grace period, unless a deep link cancels it first.
     /// The system's reopen and open-URL events for one widget click can arrive in either order.
     private func scheduleSettings(_ open: @escaping @MainActor (AppDelegate) -> Void) {
         pendingSettings?.cancel()
@@ -141,6 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        add("Open FlightDesk", #selector(showMainWindow))
         let place = store.placeName.isEmpty ? "No location set" : "Location: \(store.placeName)"
         menu.addItem(withTitle: place, action: nil, keyEquivalent: "").isEnabled = false
         menu.addItem(.separator())

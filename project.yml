@@ -33,7 +33,6 @@ targets:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_CFBundleDisplayName: FlightDesk
-        INFOPLIST_KEY_LSUIElement: YES
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
         INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 Simon Degnan. MIT License."
         INFOPLIST_KEY_NSLocationUsageDescription: FlightDesk uses your location to show aircraft flying near you.

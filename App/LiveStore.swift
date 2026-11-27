@@ -26,6 +26,10 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     var onSettingsChange: (() -> Void)?
     /// True while something visible (panel or settings preview) wants live updates.
     var wantsLive: () -> Bool = { false }
+    /// Receives each fetched flight list (spotter alerts, menu-bar readout).
+    var onFlights: (([Flight]) -> Void)?
+    /// True when `onFlights` needs data even while nothing is visible.
+    var wantsBackgroundFlights: () -> Bool = { false }
 
     private let locationManager = CLLocationManager()
     private var timers: [Timer] = []
@@ -59,8 +63,9 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
             m.featuredIndex = flights.firstIndex { $0.id == keepID } ?? 0
             m.status = flights.isEmpty ? "Quiet skies — nothing within \(settings.display.radius(settings.radius.nm))" : ""
             model = m
+            onFlights?(flights)
         } catch {
-            model.status = "Can't reach adsb.lol — retrying"
+            model.status = "Can't reach flight data — retrying"
         }
     }
 
@@ -90,8 +95,15 @@ final class LiveStore: NSObject, ObservableObject, CLLocationManagerDelegate {
     private func scheduleWidgetPump() {
         widgetTimer?.invalidate()
         widgetTimer = Timer.scheduledTimer(withTimeInterval: Double(max(10, settings.widgetRefreshSeconds)), repeats: true) { _ in
-            Task { @MainActor in self.reloadWidgets() }
+            Task { @MainActor in self.reloadWidgets(); await self.pumpBackgroundFlights() }
         }
+    }
+
+    /// Feeds `onFlights` every aircraft in range (GA included) while hidden. Shares the widget's 20 s fetch cache.
+    private func pumpBackgroundFlights() async {
+        guard let onFlights, wantsBackgroundFlights(), let loc = Shared.location,
+              let all = try? await FlightService.allNearby(lat: loc.lat, lon: loc.lon, radiusNM: settings.radius.nm) else { return }
+        onFlights(all)
     }
 
     // MARK: Location

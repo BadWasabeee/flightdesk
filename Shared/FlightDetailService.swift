@@ -90,6 +90,8 @@ struct AircraftReport: Equatable {
     var onGround: Bool
     /// When the position was received.
     var positionTime: Date
+    /// Year the airframe was built, when the feed's aircraft database knows it.
+    var year: Int? = nil
 }
 
 /// adsb.lol record for the per-aircraft endpoint. Unlike the point query it has no observer
@@ -113,6 +115,18 @@ struct DetailAircraftRecord: Decodable {
     let squawk: String?
     let seen_pos: Double?
     let lastPosition: LastPosition?
+    /// Build year; feeds send it as a string ("2019"), occasionally as a number.
+    let year: BuildYear?
+
+    /// Decodes a year from a string or number, never failing the enclosing record.
+    struct BuildYear: Decodable {
+        let value: Int?
+        init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            let raw = (try? c.decode(Int.self)) ?? (try? c.decode(String.self)).flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+            value = raw.flatMap { (1900...2100).contains($0) ? $0 : nil }
+        }
+    }
 }
 
 private struct DetailResponse: Decodable {
@@ -148,6 +162,7 @@ extension AircraftReport {
         squawk = code.isEmpty ? nil : code
         if case .ground? = a.alt_baro { onGround = true } else { onGround = false }
         positionTime = now.addingTimeInterval(-pos.age)
+        year = a.year?.value
     }
 }
 
@@ -171,12 +186,18 @@ private extension Flight {
 
 enum FlightDetailService {
     /// The latest report for one aircraft, or nil when the live feeds no longer have it.
-    /// Only the aircraft's hex is sent; the observer position is used locally.
+    /// Only the aircraft's hex is sent; the observer position is used locally. Uses the user's own
+    /// receiver first when enabled (see `ReceiverFeed.route` for the fallback order).
     static func report(hex: String) async throws -> AircraftReport? {
-        let data = try await LiveFeed.fetch { $0.hexURL(hex) }
         let observer = Shared.location.map { GeoPoint(lat: $0.lat, lon: $0.lon) }
-        let records = try JSONDecoder().decode(DetailResponse.self, from: data).ac ?? []
-        return records.lazy.compactMap { AircraftReport(record: $0, observer: observer) }.first
+        let receiver = ReceiverSettings.current
+        return try await ReceiverFeed.route(receiver, local: {
+            try await ReceiverFeed.report(hex: hex, observer: observer, settings: receiver)
+        }, internet: {
+            let data = try await LiveFeed.fetch { $0.hexURL(hex) }
+            let records = try JSONDecoder().decode(DetailResponse.self, from: data).ac ?? []
+            return records.lazy.compactMap { AircraftReport(record: $0, observer: observer) }.first
+        })
     }
 
     /// The aircraft's track for its current flight from the OpenSky Network (anonymous, rate-limited).

@@ -17,5 +17,12 @@
 			<string>Viewer</string>
 		</dict>
 	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>FlightDesk reads live aircraft positions from your own ADS-B receiver on your local network.</string>
 </dict>
 </plist>
